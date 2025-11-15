@@ -1,20 +1,19 @@
-import { Bot } from "grammy";
+/**
+ * Kyora - AI-powered Solana validator monitoring and diagnostics
+ * @packageDocumentation
+ */
 
-const bot = new Bot(process.env.BOT_TOKEN!);
-
-async function sendMessage() {
-    try {
-        await bot.api.sendMessage(
-            process.env.CHANNEL_ID!,
-            "Hello World",
-            {
-                message_thread_id: Number(process.env.TOPIC_ID)
-            }
-        );
-        console.log("Message sent successfully!");
-    } catch (error) {
-        console.error("Failed to send message:", error);
-    }
+export interface KyoraConfig {
+  // Configuration interface for future use
 }
 
-sendMessage();
+/**
+ * Initialize Kyora monitoring
+ */
+export function init(config?: KyoraConfig): void {
+  console.log("Kyora initialized");
+}
+
+export default {
+  init,
+};

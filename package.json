@@ -3,6 +3,9 @@
   "version": "0.0.2",
   "description": "AI-powered Solana validator monitoring and diagnostics",
   "type": "module",
+  "bin": {
+    "kyora": "./dist/index.js"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,7 +22,7 @@
   ],
   "scripts": {
     "dev": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target node --sourcemap=external && tsc --emitDeclarationOnly --declaration",
+    "build": "bun build src/index.ts --outdir dist --target bun --sourcemap=external && tsc --emitDeclarationOnly --declaration",
     "test": "bun test",
     "prepublishOnly": "bun run build"
   },

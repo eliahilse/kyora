@@ -29,4 +29,6 @@ npm publish
 
 ---
 
+Kyora will soon pivot to focus on providing rich context for coding agents.
+
 v0 soon!

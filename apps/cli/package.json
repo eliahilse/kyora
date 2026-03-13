@@ -1,0 +1,48 @@
+{
+  "name": "kyora",
+  "version": "0.0.3",
+  "description": "AI-powered Solana validator monitoring and diagnostics",
+  "type": "module",
+  "bin": {
+    "kyora": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun --sourcemap=external && tsc --emitDeclarationOnly --declaration",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "solana",
+    "validator",
+    "monitoring",
+    "ai",
+    "diagnostics",
+    "observability",
+    "blockchain"
+  ],
+  "author": "Hypervane",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliahilse/kyora.git"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}

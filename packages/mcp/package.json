@@ -1,0 +1,26 @@
+{
+  "name": "@kyora/mcp",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "kyora-mcp": "src/index.ts"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "check-types": "tsc --noEmit",
+    "test": "bun test",
+    "dev": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "@kyora/db": "workspace:*",
+    "@kyora/sdk": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

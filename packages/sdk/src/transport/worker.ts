@@ -1,0 +1,65 @@
+import { createDb } from "@kyora/db"
+import { events, stateSnapshots, functionCalls } from "@kyora/db/schema"
+
+declare var self: Worker
+
+interface WorkerMessage {
+  type: "event" | "state" | "function_call" | "flush" | "shutdown"
+  payload?: unknown
+}
+
+const dataDir = (self as unknown as { workerData?: { dataDir?: string } }).workerData?.dataDir
+const db = createDb(dataDir)
+
+let eventBuffer: typeof events.$inferInsert[] = []
+let stateBuffer: typeof stateSnapshots.$inferInsert[] = []
+let fnBuffer: typeof functionCalls.$inferInsert[] = []
+
+const BATCH_SIZE = 50
+
+async function flushAll() {
+  if (eventBuffer.length > 0) {
+    const batch = eventBuffer.splice(0)
+    await db.insert(events).values(batch)
+  }
+  if (stateBuffer.length > 0) {
+    const batch = stateBuffer.splice(0)
+    await db.insert(stateSnapshots).values(batch)
+  }
+  if (fnBuffer.length > 0) {
+    const batch = fnBuffer.splice(0)
+    await db.insert(functionCalls).values(batch)
+  }
+}
+
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
+  const { type, payload } = e.data
+
+  switch (type) {
+    case "event": {
+      eventBuffer.push(payload as typeof events.$inferInsert)
+      if (eventBuffer.length >= BATCH_SIZE) await flushAll()
+      break
+    }
+    case "state": {
+      stateBuffer.push(payload as typeof stateSnapshots.$inferInsert)
+      if (stateBuffer.length >= BATCH_SIZE) await flushAll()
+      break
+    }
+    case "function_call": {
+      fnBuffer.push(payload as typeof functionCalls.$inferInsert)
+      if (fnBuffer.length >= BATCH_SIZE) await flushAll()
+      break
+    }
+    case "flush": {
+      await flushAll()
+      self.postMessage({ type: "flushed" })
+      break
+    }
+    case "shutdown": {
+      await flushAll()
+      self.postMessage({ type: "shutdown_complete" })
+      process.exit(0)
+    }
+  }
+}

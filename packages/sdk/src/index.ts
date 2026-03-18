@@ -1,4 +1,3 @@
-import { createDb, type KyoraDb } from "@kyora/db"
 import { Observer } from "./observer"
 import { Transport } from "./transport"
 import { patchAll, unpatchAll } from "./patchers"
@@ -8,16 +7,11 @@ let initialized = false
 
 export const observer = new Observer()
 let transport: Transport | null = null
-let db: KyoraDb | null = null
 
 export function init(config?: Partial<KyoraConfig> & { dataDir?: string }): void {
   if (initialized) return
 
-  db = createDb(config?.dataDir)
-  transport = new Transport(
-    db,
-    config?.pruneInterval ?? DEFAULT_CONFIG.pruneInterval,
-  )
+  transport = new Transport(config?.dataDir, config?.flushMs ?? DEFAULT_CONFIG.flushMs)
   transport.connect(observer)
   patchAll(observer)
   initialized = true
@@ -28,10 +22,6 @@ export async function shutdown(): Promise<void> {
   unpatchAll()
   await transport?.stop()
   initialized = false
-}
-
-export function getDb(): KyoraDb | null {
-  return db
 }
 
 export { Observer } from "./observer"

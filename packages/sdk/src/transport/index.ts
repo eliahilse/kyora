@@ -1,45 +1,58 @@
 import type { Observer, ObserverEvent } from "../observer"
-import type { KyoraDb } from "@kyora/db"
-import { events } from "@kyora/db/schema"
 
 export class Transport {
-  private buffer: ObserverEvent[] = []
+  private worker: Worker
   private flushInterval: ReturnType<typeof setInterval> | null = null
 
-  constructor(
-    private db: KyoraDb,
-    private batchSize = 50,
-    private flushMs = 1000,
-  ) {}
+  constructor(dataDir?: string, private flushMs = 1000) {
+    this.worker = new Worker(new URL("./worker.ts", import.meta.url).href, {
+      type: "module",
+      // @ts-expect-error bun worker data
+      workerData: { dataDir },
+    })
+  }
 
   connect(observer: Observer): void {
     observer.on("*", (event) => {
-      this.buffer.push(event)
-      if (this.buffer.length >= this.batchSize) {
-        this.flush()
-      }
+      this.worker.postMessage({
+        type: "event",
+        payload: {
+          type: event.type,
+          timestamp: new Date(event.timestamp),
+          data: event.data,
+          sessionId: event.sessionId,
+          traceId: event.traceId,
+        },
+      })
     })
 
     this.flushInterval = setInterval(() => this.flush(), this.flushMs)
   }
 
-  async flush(): Promise<void> {
-    if (this.buffer.length === 0) return
-    const batch = this.buffer.splice(0)
-
-    await this.db.insert(events).values(
-      batch.map((e) => ({
-        type: e.type,
-        timestamp: new Date(e.timestamp),
-        data: e.data,
-        sessionId: e.sessionId,
-        traceId: e.traceId,
-      })),
-    )
+  flush(): Promise<void> {
+    return new Promise((resolve) => {
+      const handler = (e: MessageEvent) => {
+        if (e.data.type === "flushed") {
+          this.worker.removeEventListener("message", handler)
+          resolve()
+        }
+      }
+      this.worker.addEventListener("message", handler)
+      this.worker.postMessage({ type: "flush" })
+    })
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
     if (this.flushInterval) clearInterval(this.flushInterval)
-    await this.flush()
+    return new Promise((resolve) => {
+      const handler = (e: MessageEvent) => {
+        if (e.data.type === "shutdown_complete") {
+          this.worker.removeEventListener("message", handler)
+          resolve()
+        }
+      }
+      this.worker.addEventListener("message", handler)
+      this.worker.postMessage({ type: "shutdown" })
+    })
   }
 }

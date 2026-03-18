@@ -29,6 +29,7 @@ export interface KyoraConfig {
   maxStateSnapshots: number
   maxFunctionCalls: number
   pruneInterval: number
+  flushMs: number
 }
 
 export const DEFAULT_CONFIG: KyoraConfig = {
@@ -36,4 +37,5 @@ export const DEFAULT_CONFIG: KyoraConfig = {
   maxStateSnapshots: 5_000,
   maxFunctionCalls: 5_000,
   pruneInterval: 100,
+  flushMs: 1000,
 }

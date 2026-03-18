@@ -1,4 +1,4 @@
-import { pgTable, serial, text, integer, real, jsonb, timestamp, index } from "drizzle-orm/pg-core"
+import { pgTable, serial, text, integer, real, jsonb, timestamp, index, vector } from "drizzle-orm/pg-core"
 
 export const events = pgTable("events", {
   id: serial("id").primaryKey(),
@@ -33,4 +33,33 @@ export const functionCalls = pgTable("function_calls", {
   caller: text("caller"),
 }, (table) => ([
   index("idx_fn_name_ts").on(table.name, table.timestamp),
+]))
+
+// nora: doc indexing
+
+export const docSources = pgTable("doc_sources", {
+  id: serial("id").primaryKey(),
+  type: text("type").notNull(),
+  reference: text("reference").notNull(),
+  name: text("name").notNull(),
+  status: text("status").notNull().default("pending"),
+  chunksCount: integer("chunks_count").default(0),
+  error: text("error"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => ([
+  index("idx_doc_sources_type").on(table.type),
+  index("idx_doc_sources_status").on(table.status),
+]))
+
+export const docChunks = pgTable("doc_chunks", {
+  id: serial("id").primaryKey(),
+  sourceId: integer("source_id").notNull(),
+  content: text("content").notNull(),
+  embedding: vector("embedding", { dimensions: 384 }),
+  metadata: jsonb("metadata"),
+  chunkIndex: integer("chunk_index").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => ([
+  index("idx_doc_chunks_source").on(table.sourceId),
 ]))

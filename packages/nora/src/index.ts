@@ -1,0 +1,5 @@
+export { createLocalEmbedder, type Embedder } from "./embedder"
+export { chunkText } from "./chunker"
+export { indexSource, type SourceType, type IndexResult } from "./indexer"
+export { searchDocs, type SearchResult } from "./search"
+export { fetchNpmDocs, fetchUrl, fetchLocalFile, fetchLocalDir } from "./fetchers"

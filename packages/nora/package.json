@@ -1,23 +1,21 @@
 {
-  "name": "@kyora/mcp",
+  "name": "@kyora/nora",
   "version": "0.0.1",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
-  "bin": {
-    "kyora-mcp": "src/index.ts"
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
     "check-types": "tsc --noEmit",
-    "test": "bun test",
-    "dev": "bun --watch src/index.ts"
+    "test": "bun test"
   },
   "dependencies": {
     "@kyora/db": "workspace:*",
-    "@kyora/nora": "workspace:*",
-    "@kyora/sdk": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@huggingface/transformers": "^3.0.0",
+    "drizzle-orm": "^0.39.0"
   },
   "devDependencies": {
     "@repo/typescript-config": "workspace:*",

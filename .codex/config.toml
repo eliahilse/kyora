@@ -1,0 +1,6 @@
+[mcp_servers.kyora]
+command = "npx"
+args = ["-y", "kyora-sh"]
+
+[mcp_servers.kyora.env]
+KYORA_DATA_DIR = ".kyora/data"

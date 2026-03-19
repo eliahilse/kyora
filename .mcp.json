@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kyora": {
+      "command": "npx",
+      "args": ["-y", "kyora-sh"],
+      "env": {
+        "KYORA_DATA_DIR": "${CLAUDE_PLUGIN_DATA}/data"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "kyora",
+  "description": "Runtime observability SDK and doc indexer for AI coding agents. Auto-instruments fetch, console, errors — query runtime state via MCP. Index and search library docs with semantic embeddings.",
+  "version": "0.0.1",
+  "author": {
+    "name": "Hypervane"
+  }
+}

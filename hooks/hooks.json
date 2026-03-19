@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'kyora: mcp server connected — use /index-docs, /search-docs, /debug'"
+          }
+        ]
+      }
+    ]
+  }
+}

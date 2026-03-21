@@ -7,6 +7,10 @@ on:
     paths:
       - "packages/*/package.json"
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -16,6 +20,11 @@ jobs:
           - mcp
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -34,8 +43,12 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - run: bun publish --access public
+      - name: Build and pack
         if: steps.check.outputs.exists == 'false'
         working-directory: packages/${{ matrix.package }}
-        env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bun pm pack
+
+      - name: Publish
+        if: steps.check.outputs.exists == 'false'
+        working-directory: packages/${{ matrix.package }}
+        run: npm publish --provenance --access public *.tgz

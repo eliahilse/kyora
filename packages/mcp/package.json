@@ -1,6 +1,6 @@
 {
   "name": "@kyora-sh/mcp",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "description": "Kyora MCP server for coding agents",
   "license": "Elastic-2.0",
@@ -15,7 +15,8 @@
     "kyora-mcp": "./dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "publishConfig": {
     "access": "public"

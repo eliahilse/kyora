@@ -1,22 +1,27 @@
 {
-  "name": "@kyora/mcp",
-  "version": "0.0.1",
-  "private": true,
+  "name": "@kyora-sh/mcp",
+  "version": "0.1.0",
   "type": "module",
-  "main": "src/index.ts",
-  "bin": {
-    "kyora-mcp": "src/index.ts"
+  "description": "kyora MCP server — observability & doc indexing for AI coding agents",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliahilse/kyora",
+    "directory": "packages/mcp"
   },
+  "homepage": "https://kyora.sh",
+  "main": "./dist/index.js",
+  "bin": {
+    "kyora-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
-    "name": "kyora-sh",
-    "access": "public",
-    "bin": {
-      "kyora-sh": "./dist/index.js"
-    },
-    "main": "./dist/index.js"
+    "access": "public"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --minify",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --minify && printf '#!/usr/bin/env bun\\n' | cat - ./dist/index.js > ./dist/tmp.js && mv ./dist/tmp.js ./dist/index.js && chmod +x ./dist/index.js",
     "check-types": "tsc --noEmit",
     "test": "bun test",
     "dev": "bun --watch src/index.ts",

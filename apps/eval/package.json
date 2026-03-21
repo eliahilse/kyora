@@ -1,0 +1,12 @@
+{
+  "name": "@kyora/eval",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/server.ts"
+  },
+  "dependencies": {
+    "@kyora/sdk": "workspace:*",
+    "@kyora/db": "workspace:*"
+  }
+}

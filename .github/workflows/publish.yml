@@ -43,12 +43,18 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and pack
+      - name: Build
+        if: steps.check.outputs.exists == 'false'
+        run: bun run --filter $(jq -r .name packages/${{ matrix.package }}/package.json) build
+
+      - name: Pack
         if: steps.check.outputs.exists == 'false'
         working-directory: packages/${{ matrix.package }}
         run: bun pm pack
 
       - name: Publish
         if: steps.check.outputs.exists == 'false'
-        working-directory: packages/${{ matrix.package }}
-        run: npm publish --provenance --access public *.tgz
+        run: |
+          cp packages/${{ matrix.package }}/*.tgz /tmp/
+          cd /tmp
+          npm publish --provenance --access public *.tgz

@@ -2,8 +2,10 @@ name: Publish to npm
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+    paths:
+      - "packages/*/package.json"
 
 jobs:
   publish:
@@ -11,23 +13,43 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    strategy:
+      matrix:
+        package:
+          - mcp
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check if version is already published
+        id: check
+        run: |
+          PKG_NAME=$(jq -r .name packages/${{ matrix.package }}/package.json)
+          PKG_VERSION=$(jq -r .version packages/${{ matrix.package }}/package.json)
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: oven-sh/setup-bun@v2
+        if: steps.check.outputs.exists == 'false'
         with:
           bun-version: latest
 
       - run: bun install --frozen-lockfile
+        if: steps.check.outputs.exists == 'false'
 
-      - run: bun run --filter @kyora-sh/mcp build
+      - run: bun run --filter $(jq -r .name packages/${{ matrix.package }}/package.json) build
+        if: steps.check.outputs.exists == 'false'
 
       - uses: actions/setup-node@v4
+        if: steps.check.outputs.exists == 'false'
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
       - run: npm publish --provenance
-        working-directory: packages/mcp
+        if: steps.check.outputs.exists == 'false'
+        working-directory: packages/${{ matrix.package }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

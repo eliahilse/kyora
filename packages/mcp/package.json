@@ -1,6 +1,6 @@
 {
   "name": "@kyora-sh/mcp",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "kyora MCP server — observability & doc indexing for AI coding agents",
   "license": "Elastic-2.0",

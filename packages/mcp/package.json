@@ -9,7 +9,7 @@
     "url": "https://github.com/eliahilse/kyora",
     "directory": "packages/mcp"
   },
-  "homepage": "https://kyora.sh",
+  "homepage": "https://kyora.sh/mcp",
   "main": "./dist/index.js",
   "bin": {
     "kyora-mcp": "./dist/index.js"

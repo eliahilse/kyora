@@ -2,7 +2,7 @@
   "name": "@kyora-sh/mcp",
   "version": "0.0.1",
   "type": "module",
-  "description": "kyora MCP server — observability and doc indexing for AI coding agents",
+  "description": "kyora mcp server — observability and doc indexing for ai coding agents",
   "license": "Elastic-2.0",
   "repository": {
     "type": "git",

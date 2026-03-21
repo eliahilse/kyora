@@ -4,12 +4,11 @@ import { events, stateSnapshots, functionCalls } from "@kyora/db/schema"
 declare var self: Worker
 
 interface WorkerMessage {
-  type: "event" | "state" | "function_call" | "flush" | "shutdown"
+  type: "init" | "event" | "state" | "function_call" | "flush" | "shutdown"
   payload?: unknown
 }
 
-const dataDir = (self as unknown as { workerData?: { dataDir?: string } }).workerData?.dataDir
-const db = createDb(dataDir)
+let db: Awaited<ReturnType<typeof createDb>>
 
 let eventBuffer: typeof events.$inferInsert[] = []
 let stateBuffer: typeof stateSnapshots.$inferInsert[] = []
@@ -18,6 +17,7 @@ let fnBuffer: typeof functionCalls.$inferInsert[] = []
 const BATCH_SIZE = 50
 
 async function flushAll() {
+  if (!db) return
   if (eventBuffer.length > 0) {
     const batch = eventBuffer.splice(0)
     await db.insert(events).values(batch)
@@ -36,6 +36,12 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   const { type, payload } = e.data
 
   switch (type) {
+    case "init": {
+      const { dataDir } = payload as { dataDir?: string }
+      db = await createDb(dataDir)
+      self.postMessage({ type: "ready" })
+      break
+    }
     case "event": {
       eventBuffer.push(payload as typeof events.$inferInsert)
       if (eventBuffer.length >= BATCH_SIZE) await flushAll()

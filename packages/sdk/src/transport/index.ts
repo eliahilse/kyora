@@ -7,13 +7,28 @@ export class Transport {
   constructor(dataDir?: string, private flushMs = 1000) {
     this.worker = new Worker(new URL("./worker.ts", import.meta.url).href, {
       type: "module",
-      // @ts-expect-error bun worker data
-      workerData: { dataDir },
     })
+    this.worker.postMessage({ type: "init", payload: { dataDir } })
   }
 
   connect(observer: Observer): void {
     observer.on("*", (event) => {
+      if (event.type === "state_snapshot") {
+        this.worker.postMessage({
+          type: "state",
+          payload: { ...event.data, timestamp: new Date(event.timestamp) },
+        })
+        return
+      }
+
+      if (event.type === "function_call") {
+        this.worker.postMessage({
+          type: "function_call",
+          payload: { ...event.data, timestamp: new Date(event.timestamp) },
+        })
+        return
+      }
+
       this.worker.postMessage({
         type: "event",
         payload: {

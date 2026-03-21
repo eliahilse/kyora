@@ -1,4 +1,4 @@
-export type EventType = "http" | "console" | "error" | "timer" | "custom"
+export type EventType = "http" | "console" | "error" | "timer" | "custom" | "state_snapshot" | "function_call"
 export type ConsoleLevel = "log" | "warn" | "error" | "info" | "debug"
 
 export interface HttpEventData {

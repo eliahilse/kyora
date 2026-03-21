@@ -11,7 +11,7 @@ import { listIndexed } from "./tools/list-indexed"
 import { indexSourceHandler } from "./tools/index-source"
 import { indexStatus } from "./tools/index-status"
 
-const db = createDb(process.env.KYORA_DATA_DIR)
+const db = await createDb(process.env.KYORA_DATA_DIR)
 const embedder = createLocalEmbedder()
 
 const server = new McpServer({

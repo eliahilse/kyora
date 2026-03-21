@@ -1,11 +1,9 @@
-import { Observer } from "./observer"
 import { Transport } from "./transport"
 import { patchAll, unpatchAll } from "./patchers"
 import { DEFAULT_CONFIG, type KyoraConfig } from "./types"
+import { observer } from "./shared"
 
 let initialized = false
-
-export const observer = new Observer()
 let transport: Transport | null = null
 
 export function init(config?: Partial<KyoraConfig> & { dataDir?: string }): void {
@@ -24,7 +22,10 @@ export async function shutdown(): Promise<void> {
   initialized = false
 }
 
+export { observer } from "./shared"
 export { Observer } from "./observer"
 export { Transport } from "./transport"
 export { patchAll, unpatchAll } from "./patchers"
+export { watch } from "./watch"
+export { trace } from "./trace"
 export * from "./types"

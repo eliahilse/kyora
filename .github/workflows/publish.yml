@@ -8,7 +8,7 @@ on:
       - "packages/*/package.json"
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -16,6 +16,12 @@ jobs:
           - mcp
     steps:
       - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
 
       - name: Check if version is already published
         id: check
@@ -28,51 +34,8 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: oven-sh/setup-bun@v2
+      - run: bun publish --access public
         if: steps.check.outputs.exists == 'false'
-        with:
-          bun-version: latest
-
-      - run: bun install --frozen-lockfile
-        if: steps.check.outputs.exists == 'false'
-
-      - run: bun run --filter $(jq -r .name packages/${{ matrix.package }}/package.json) build
-        if: steps.check.outputs.exists == 'false'
-
-      - uses: actions/upload-artifact@v4
-        if: steps.check.outputs.exists == 'false'
-        with:
-          name: ${{ matrix.package }}-dist
-          path: packages/${{ matrix.package }}/dist/
-
-    outputs:
-      exists: ${{ steps.check.outputs.exists }}
-
-  publish:
-    needs: build
-    if: needs.build.outputs.exists == 'false'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      matrix:
-        package:
-          - mcp
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ matrix.package }}-dist
-          path: packages/${{ matrix.package }}/dist/
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      - run: npm publish
         working-directory: packages/${{ matrix.package }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}

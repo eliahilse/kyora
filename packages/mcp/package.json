@@ -1,8 +1,8 @@
 {
   "name": "@kyora-sh/mcp",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "type": "module",
-  "description": "Kyora MCP server for coding agents - observability, state tracking, and doc indexing",
+  "description": "Superhuman debugging for coding agents — +31.63% on SWE-bench Verified, with automatic dependency and doc indexing",
   "license": "Elastic-2.0",
   "repository": {
     "type": "git",

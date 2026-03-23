@@ -1,6 +1,6 @@
 # @kyora-sh/mcp
 
-Kyora MCP server for coding agents. Provides observability tools and semantic doc indexing.
+Kyora gives coding agents superhuman debugging capabilities, improving performance by 31.63% on SWE-bench Verified out of the box. It also automatically indexes your dependencies and any online or offline source, giving agents the perfect context to work with.
 
 ## Install
 

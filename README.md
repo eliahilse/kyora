@@ -1,159 +1,95 @@
-# Turborepo starter
+# kyora
 
-This Turborepo starter is maintained by the Turborepo core team.
+Queryable temporal runtime state for coding agents.
 
-## Using this example
+Records state mutations, function calls, HTTP traffic, and errors over time, then exposes it all via MCP so agents can query what actually happened at runtime. Also indexes dependencies and docs semantically, minimizing hallucinations.
 
-Run the following command:
+## Quick start
 
-```sh
-npx create-turbo@latest
+```bash
+bunx @kyora-sh/mcp
 ```
 
-## What's inside?
+Add to `.claude/settings.json`:
 
-This Turborepo includes the following packages/apps:
-
-### Apps and Packages
-
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `eslint-config-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
-
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+```json
+{
+  "mcpServers": {
+    "kyora": {
+      "command": "bunx",
+      "args": ["@kyora-sh/mcp"],
+      "env": { "KYORA_DATA_DIR": "/path/to/your/app/.kyora" }
+    }
+  }
+}
 ```
 
-Without global `turbo`, use your package manager:
+## Instrumentation
 
-```sh
-cd my-turborepo
-npx turbo build
-yarn dlx turbo build
-pnpm exec turbo build
+```ts
+import { init, watch, trace } from "@kyora/sdk"
+
+init({ dataDir: ".kyora" })
+
+// track state over time
+const cart = watch({ items: [], total: 0 }, "cart")
+cart.items.push({ name: "Widget", price: 9.99 })
+
+// record function calls (args, return values, errors, timing)
+const fetchUsers = trace(async function fetchUsers() {
+  return (await fetch("/api/users")).json()
+}, "fetchUsers")
 ```
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+`init()` automatically patches `fetch`, `console`, and error handlers.
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+### Auto-instrumentation (Bun plugin)
 
-```sh
-turbo build --filter=docs
+```toml
+# bunfig.toml
+preload = ["@kyora/sdk/plugin"]
 ```
 
-Without global `turbo`:
+```ts
+// @kyora.watch
+const state = { count: 0, users: [] }
 
-```sh
-npx turbo build --filter=docs
-yarn exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
+// @kyora.trace
+async function loadUsers() {
+  state.users = await (await fetch("/api/users")).json()
+}
 ```
 
-### Develop
+Transforms at load time, no manual wrapping.
 
-To develop all apps and packages, run the following command:
+## MCP tools
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+| Tool | Description |
+|------|-------------|
+| `kyora_query_state` | query state snapshots over time |
+| `kyora_get_recent_errors` | recent errors with stack traces |
+| `kyora_get_http_log` | HTTP requests and responses |
+| `kyora_search_docs` | semantic search across indexed docs |
+| `kyora_list_indexed` | list indexed documentation sources |
+| `nora_index_source` | index npm packages, URLs, or local files |
+| `kyora_index_status` | check indexing progress |
 
-```sh
-cd my-turborepo
-turbo dev
+## Packages
+
+```
+packages/mcp   @kyora-sh/mcp   MCP server (published)
+packages/sdk   @kyora/sdk      instrumentation (watch, trace, auto-patching)
+packages/nora  @kyora/nora     semantic doc indexing + search (local embeddings)
+packages/db    @kyora/db       embedded PostgreSQL (PGLite) + vector search
+apps/eval                      demo server
 ```
 
-Without global `turbo`, use your package manager:
+## Development
 
-```sh
-cd my-turborepo
-npx turbo dev
-yarn exec turbo dev
-pnpm exec turbo dev
+```bash
+bun install && bun run dev
 ```
 
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+## License
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo dev --filter=web
-yarn exec turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-```
-
-### Remote Caching
-
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
-yarn exec turbo login
-pnpm exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-yarn exec turbo link
-pnpm exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+[Elastic-2.0](LICENSE)

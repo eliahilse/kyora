@@ -1,4 +1,5 @@
 import type { EventType } from "../types"
+import { getTraceId } from "../trace-context"
 
 export interface ObserverEvent {
   type: EventType
@@ -24,6 +25,7 @@ export class Observer {
   }
 
   emit(event: ObserverEvent): void {
+    if (!event.traceId) event.traceId = getTraceId()
     this.listeners.get(event.type)?.forEach((fn) => fn(event))
     this.listeners.get("*")?.forEach((fn) => fn(event))
   }

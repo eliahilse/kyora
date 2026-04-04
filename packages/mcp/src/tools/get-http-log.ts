@@ -1,16 +1,23 @@
 import { type KyoraDb, events } from "@kyora/db"
-import { desc, eq } from "drizzle-orm"
+import { desc, eq, and } from "drizzle-orm"
 
 export interface GetHttpLogInput {
   method?: string
   limit?: number
+  traceId?: string
 }
 
 export async function getHttpLog(db: KyoraDb, input: GetHttpLogInput) {
+  const conditions = [eq(events.type, "http")]
+
+  if (input.traceId) {
+    conditions.push(eq(events.traceId, input.traceId))
+  }
+
   const rows = await db
     .select()
     .from(events)
-    .where(eq(events.type, "http"))
+    .where(and(...conditions))
     .orderBy(desc(events.timestamp))
     .limit(input.limit ?? 10)
 

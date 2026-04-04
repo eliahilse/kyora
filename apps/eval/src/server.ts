@@ -1,4 +1,4 @@
-import { init, shutdown, watch, trace } from "@kyora/sdk"
+import { init, shutdown, watch, trace, withTrace } from "@kyora/sdk"
 
 const DATA_DIR = import.meta.dir + "/../.kyora"
 init({ dataDir: DATA_DIR })
@@ -22,29 +22,29 @@ const riskyOperation = trace(function riskyOperation() {
 const server = Bun.serve({
   port: 3456,
   routes: {
-    "/": () => {
+    "/": () => withTrace(() => {
       processRequest("/")
       return new Response("kyora test app")
-    },
+    }),
 
-    "/api/users": async () => {
+    "/api/users": () => withTrace(async () => {
       processRequest("/api/users")
       const res = await fetch("https://jsonplaceholder.typicode.com/users")
       const users = await res.json()
       return Response.json(users)
-    },
+    }),
 
-    "/api/posts": async () => {
+    "/api/posts": () => withTrace(async () => {
       processRequest("/api/posts")
       const res = await fetch("https://jsonplaceholder.typicode.com/posts?_limit=5")
       const posts = await res.json()
       return Response.json(posts)
-    },
+    }),
 
-    "/api/error": () => {
+    "/api/error": () => withTrace(() => {
       try { riskyOperation() } catch {}
       return Response.json({ error: "intentional" }, { status: 500 })
-    },
+    }),
   },
 
   error(err) {

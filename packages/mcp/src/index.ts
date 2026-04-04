@@ -29,6 +29,7 @@ server.tool(
     since: z.string().optional().describe("start time (ISO string or relative like '30s ago')"),
     until: z.string().optional().describe("end time (ISO string or relative like 'now')"),
     limit: z.number().optional().describe("max results (default 20)"),
+    traceId: z.string().optional().describe("filter by trace ID to see state changes within a specific request"),
   },
   async (input) => {
     const results = await queryState(db, input)
@@ -41,6 +42,7 @@ server.tool(
   "get the most recent errors with stack traces",
   {
     limit: z.number().optional().describe("max results (default 5)"),
+    traceId: z.string().optional().describe("filter by trace ID to see errors within a specific request"),
   },
   async (input) => {
     const results = await getRecentErrors(db, input)
@@ -54,6 +56,7 @@ server.tool(
   {
     method: z.string().optional().describe("filter by HTTP method (GET, POST, etc.)"),
     limit: z.number().optional().describe("max results (default 10)"),
+    traceId: z.string().optional().describe("filter by trace ID to see HTTP calls within a specific request"),
   },
   async (input) => {
     const results = await getHttpLog(db, input)

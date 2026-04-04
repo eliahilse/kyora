@@ -13,13 +13,15 @@ const SCHEMA_SQL = `
   );
   CREATE TABLE IF NOT EXISTS state_snapshots (
     id SERIAL PRIMARY KEY, key TEXT NOT NULL,
-    value JSONB NOT NULL, diff JSONB,
-    timestamp TIMESTAMP DEFAULT NOW() NOT NULL, source TEXT
+    value JSONB, diff JSONB,
+    timestamp TIMESTAMP DEFAULT NOW() NOT NULL, source TEXT,
+    trace_id TEXT, session_id TEXT
   );
   CREATE TABLE IF NOT EXISTS function_calls (
     id SERIAL PRIMARY KEY, name TEXT NOT NULL,
     args JSONB, return_value JSONB, error TEXT, duration_ms REAL,
-    timestamp TIMESTAMP DEFAULT NOW() NOT NULL, caller TEXT
+    timestamp TIMESTAMP DEFAULT NOW() NOT NULL, caller TEXT,
+    trace_id TEXT, session_id TEXT
   );
   CREATE TABLE IF NOT EXISTS doc_sources (
     id SERIAL PRIMARY KEY, type TEXT NOT NULL,
@@ -35,9 +37,16 @@ const SCHEMA_SQL = `
     created_at TIMESTAMP DEFAULT NOW() NOT NULL
   );
 
+  ALTER TABLE state_snapshots ADD COLUMN IF NOT EXISTS trace_id TEXT;
+  ALTER TABLE state_snapshots ADD COLUMN IF NOT EXISTS session_id TEXT;
+  ALTER TABLE function_calls ADD COLUMN IF NOT EXISTS trace_id TEXT;
+  ALTER TABLE function_calls ADD COLUMN IF NOT EXISTS session_id TEXT;
+
   CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events (type, timestamp);
   CREATE INDEX IF NOT EXISTS idx_state_key_ts ON state_snapshots (key, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_state_trace ON state_snapshots (trace_id);
   CREATE INDEX IF NOT EXISTS idx_fn_name_ts ON function_calls (name, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_fn_trace ON function_calls (trace_id);
   CREATE INDEX IF NOT EXISTS idx_doc_sources_type ON doc_sources (type);
   CREATE INDEX IF NOT EXISTS idx_doc_sources_status ON doc_sources (status);
   CREATE INDEX IF NOT EXISTS idx_doc_chunks_source ON doc_chunks (source_id);

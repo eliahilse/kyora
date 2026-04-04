@@ -16,7 +16,7 @@ export class Transport {
       if (event.type === "state_snapshot") {
         this.worker.postMessage({
           type: "state",
-          payload: { ...event.data, timestamp: new Date(event.timestamp) },
+          payload: { ...event.data, timestamp: new Date(event.timestamp), traceId: event.traceId, sessionId: event.sessionId },
         })
         return
       }
@@ -24,7 +24,7 @@ export class Transport {
       if (event.type === "function_call") {
         this.worker.postMessage({
           type: "function_call",
-          payload: { ...event.data, timestamp: new Date(event.timestamp) },
+          payload: { ...event.data, timestamp: new Date(event.timestamp), traceId: event.traceId, sessionId: event.sessionId },
         })
         return
       }

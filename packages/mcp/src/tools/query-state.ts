@@ -6,6 +6,7 @@ export interface QueryStateInput {
   since?: string
   until?: string
   limit?: number
+  traceId?: string
 }
 
 export async function queryState(db: KyoraDb, input: QueryStateInput) {
@@ -16,6 +17,9 @@ export async function queryState(db: KyoraDb, input: QueryStateInput) {
   }
   if (input.until) {
     conditions.push(lte(stateSnapshots.timestamp, new Date(input.until)))
+  }
+  if (input.traceId) {
+    conditions.push(eq(stateSnapshots.traceId, input.traceId))
   }
 
   return db

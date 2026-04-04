@@ -14,12 +14,15 @@ export const events = pgTable("events", {
 export const stateSnapshots = pgTable("state_snapshots", {
   id: serial("id").primaryKey(),
   key: text("key").notNull(),
-  value: jsonb("value").notNull(),
+  value: jsonb("value"),
   diff: jsonb("diff"),
   timestamp: timestamp("timestamp").defaultNow().notNull(),
   source: text("source"),
+  traceId: text("trace_id"),
+  sessionId: text("session_id"),
 }, (table) => ([
   index("idx_state_key_ts").on(table.key, table.timestamp),
+  index("idx_state_trace").on(table.traceId),
 ]))
 
 export const functionCalls = pgTable("function_calls", {
@@ -31,8 +34,11 @@ export const functionCalls = pgTable("function_calls", {
   durationMs: real("duration_ms"),
   timestamp: timestamp("timestamp").defaultNow().notNull(),
   caller: text("caller"),
+  traceId: text("trace_id"),
+  sessionId: text("session_id"),
 }, (table) => ([
   index("idx_fn_name_ts").on(table.name, table.timestamp),
+  index("idx_fn_trace").on(table.traceId),
 ]))
 
 // nora: doc indexing

@@ -1,0 +1,13 @@
+{
+  "name": "@kyora/reckon",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun src/runner.ts",
+    "validate": "bun src/validate.ts"
+  },
+  "dependencies": {
+    "@kyora/sdk": "workspace:*",
+    "@kyora/db": "workspace:*"
+  }
+}

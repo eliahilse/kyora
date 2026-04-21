@@ -1,0 +1,34 @@
+{
+  "timestamp": "2026-04-21T17:23:56.103Z",
+  "model": "sonnet",
+  "source": "local",
+  "noCache": true,
+  "results": [
+    {
+      "task": "amm-simulator",
+      "mode": "blind",
+      "passed": 2,
+      "total": 7,
+      "timeMs": 300560,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "numTurns": 0,
+      "costUsd": 0
+    },
+    {
+      "task": "amm-simulator",
+      "mode": "kyora",
+      "passed": 2,
+      "total": 7,
+      "timeMs": 300519,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "numTurns": 0,
+      "costUsd": 0
+    }
+  ]
+}

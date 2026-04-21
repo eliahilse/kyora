@@ -34,9 +34,18 @@ const SCHEMA_SQL = `
     id SERIAL PRIMARY KEY, source_id INTEGER NOT NULL,
     content TEXT NOT NULL, embedding VECTOR(384),
     metadata JSONB, chunk_index INTEGER NOT NULL,
+    tsv TSVECTOR,
+    created_at TIMESTAMP DEFAULT NOW() NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS api_symbols (
+    id SERIAL PRIMARY KEY, source_id INTEGER NOT NULL,
+    name TEXT NOT NULL, qualified TEXT NOT NULL,
+    kind TEXT NOT NULL, signature TEXT,
+    doc_chunk_id INTEGER,
     created_at TIMESTAMP DEFAULT NOW() NOT NULL
   );
 
+  ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS tsv TSVECTOR;
   ALTER TABLE state_snapshots ADD COLUMN IF NOT EXISTS trace_id TEXT;
   ALTER TABLE state_snapshots ADD COLUMN IF NOT EXISTS session_id TEXT;
   ALTER TABLE function_calls ADD COLUMN IF NOT EXISTS trace_id TEXT;
@@ -50,6 +59,10 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_doc_sources_type ON doc_sources (type);
   CREATE INDEX IF NOT EXISTS idx_doc_sources_status ON doc_sources (status);
   CREATE INDEX IF NOT EXISTS idx_doc_chunks_source ON doc_chunks (source_id);
+  CREATE INDEX IF NOT EXISTS idx_doc_chunks_tsv ON doc_chunks USING GIN (tsv);
+  CREATE INDEX IF NOT EXISTS idx_api_symbols_name ON api_symbols (name);
+  CREATE INDEX IF NOT EXISTS idx_api_symbols_qualified ON api_symbols (qualified);
+  CREATE INDEX IF NOT EXISTS idx_api_symbols_source ON api_symbols (source_id);
 `
 
 async function initDb(client: PGlite) {
@@ -69,7 +82,7 @@ export async function createMemoryDb() {
   return initDb(client)
 }
 
-export type KyoraDb = ReturnType<typeof createDb>
+export type KyoraDb = Awaited<ReturnType<typeof createDb>>
 
 export { schema }
 export * from "./schema"

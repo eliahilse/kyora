@@ -1,0 +1,8 @@
+{
+  "name": "reckon-amm-simulator-kyora",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@kyora/sdk": "file:/Users/elia/Documents/GitHub/Elia/kyora/apps/reckon/src/../../../packages/sdk"
+  }
+}

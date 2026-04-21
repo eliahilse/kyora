@@ -1,4 +1,8 @@
-import { pgTable, serial, text, integer, real, jsonb, timestamp, index, vector } from "drizzle-orm/pg-core"
+import { pgTable, serial, text, integer, real, jsonb, timestamp, index, vector, customType } from "drizzle-orm/pg-core"
+
+const tsvector = customType<{ data: string }>({
+  dataType() { return "tsvector" },
+})
 
 export const events = pgTable("events", {
   id: serial("id").primaryKey(),
@@ -65,7 +69,23 @@ export const docChunks = pgTable("doc_chunks", {
   embedding: vector("embedding", { dimensions: 384 }),
   metadata: jsonb("metadata"),
   chunkIndex: integer("chunk_index").notNull(),
+  tsv: tsvector("tsv"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 }, (table) => ([
   index("idx_doc_chunks_source").on(table.sourceId),
+]))
+
+export const apiSymbols = pgTable("api_symbols", {
+  id: serial("id").primaryKey(),
+  sourceId: integer("source_id").notNull(),
+  name: text("name").notNull(),
+  qualified: text("qualified").notNull(),
+  kind: text("kind").notNull(),
+  signature: text("signature"),
+  docChunkId: integer("doc_chunk_id"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => ([
+  index("idx_api_symbols_name").on(table.name),
+  index("idx_api_symbols_qualified").on(table.qualified),
+  index("idx_api_symbols_source").on(table.sourceId),
 ]))

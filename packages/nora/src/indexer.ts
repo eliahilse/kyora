@@ -1,8 +1,9 @@
 import type { KyoraDb } from "@kyora/db"
-import { docSources, docChunks } from "@kyora/db/schema"
-import { eq } from "drizzle-orm"
+import { docSources, docChunks, apiSymbols } from "@kyora/db/schema"
+import { eq, sql } from "drizzle-orm"
 import type { Embedder } from "./embedder"
 import { chunkText } from "./chunker"
+import { extractSymbols } from "./extractor"
 import { fetchNpmDocs } from "./fetchers/npm"
 import { fetchUrl } from "./fetchers/url"
 import { fetchLocalFile, fetchLocalDir } from "./fetchers/local"
@@ -52,7 +53,7 @@ export async function indexSource(
       const texts = chunks.map((c) => c.content)
       const embeddings = await embedder.embed(texts)
 
-      await db.insert(docChunks).values(
+      const inserted = await db.insert(docChunks).values(
         chunks.map((chunk, i) => ({
           sourceId: source!.id,
           content: chunk.content,
@@ -60,7 +61,30 @@ export async function indexSource(
           metadata: { ...doc.metadata, ...chunk.metadata },
           chunkIndex: chunk.index,
         })),
+      ).returning({ id: docChunks.id, content: docChunks.content })
+
+      // populate tsvector
+      await db.execute(
+        sql`UPDATE doc_chunks SET tsv = to_tsvector('english', content) WHERE source_id = ${source!.id} AND tsv IS NULL`
       )
+
+      // extract and store api symbols
+      const docType = (doc.metadata as Record<string, unknown>)?.type as string | undefined
+      const packageName = (doc.metadata as Record<string, unknown>)?.package as string | undefined
+      const symbols = extractSymbols(doc.content, docType, packageName)
+
+      if (symbols.length > 0) {
+        await db.insert(apiSymbols).values(
+          symbols.map((sym) => ({
+            sourceId: source!.id,
+            name: sym.name,
+            qualified: sym.qualified,
+            kind: sym.kind,
+            signature: sym.signature,
+            docChunkId: inserted.find((c) => c.content.includes(sym.signature?.slice(0, 40) ?? sym.name))?.id ?? null,
+          })),
+        )
+      }
 
       totalChunks += chunks.length
     }

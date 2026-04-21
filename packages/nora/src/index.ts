@@ -1,5 +1,6 @@
 export { createLocalEmbedder, type Embedder } from "./embedder"
 export { chunkText } from "./chunker"
 export { indexSource, type SourceType, type IndexResult } from "./indexer"
-export { searchDocs, type SearchResult } from "./search"
+export { searchDocs, lookupSymbol, type SearchResult, type SymbolResult } from "./search"
+export { extractSymbols, type ExtractedSymbol } from "./extractor"
 export { fetchNpmDocs, fetchUrl, fetchLocalFile, fetchLocalDir } from "./fetchers"

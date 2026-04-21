@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-04-21T16:17:32.876Z",
+  "model": "sonnet",
+  "source": "local",
+  "results": [
+    {
+      "task": "amm-fee-accumulation",
+      "mode": "blind",
+      "passed": 7,
+      "total": 7,
+      "timeMs": 92405,
+      "inputTokens": 9,
+      "outputTokens": 5366,
+      "cacheReadTokens": 172768,
+      "cacheWriteTokens": 9903,
+      "numTurns": 8,
+      "costUsd": 0.16991665
+    },
+    {
+      "task": "amm-fee-accumulation",
+      "mode": "kyora",
+      "passed": 7,
+      "total": 7,
+      "timeMs": 188106,
+      "inputTokens": 8,
+      "outputTokens": 5049,
+      "cacheReadTokens": 133403,
+      "cacheWriteTokens": 16827,
+      "numTurns": 7,
+      "costUsd": 0.17936615
+    }
+  ]
+}

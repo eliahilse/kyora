@@ -10,6 +10,7 @@ import { searchDocsHandler } from "./tools/search-docs"
 import { listIndexed } from "./tools/list-indexed"
 import { indexSourceHandler } from "./tools/index-source"
 import { indexStatus } from "./tools/index-status"
+import { lookupSymbolHandler } from "./tools/lookup-symbol"
 
 const db = await createDb(process.env.KYORA_DATA_DIR)
 const embedder = createLocalEmbedder()
@@ -111,6 +112,19 @@ server.tool(
   async (input) => {
     const result = await indexStatus(db, input)
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
+  },
+)
+
+server.tool(
+  "kyora_lookup_symbol",
+  "look up API symbols (functions, classes, types) by name — use for exact API lookups like 'Bun.serve' or 'useState'",
+  {
+    name: z.string().describe("symbol name to look up, e.g., 'Bun.serve', 'useState', 'Router'"),
+    limit: z.number().optional().describe("max results (default 10)"),
+  },
+  async (input) => {
+    const results = await lookupSymbolHandler(db, input)
+    return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )
 

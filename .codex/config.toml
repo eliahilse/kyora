@@ -1,6 +1,7 @@
 [mcp_servers.kyora]
-command = "npx"
-args = ["-y", "kyora-sh"]
+command = "bunx"
+args = ["-y", "@kyora-sh/mcp"]
+startup_timeout_sec = 30
 
 [mcp_servers.kyora.env]
 KYORA_DATA_DIR = ".kyora/data"

@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
-import { createDb } from "@kyora/db"
-import { createLocalEmbedder } from "@kyora/nora"
+import { createDb, type KyoraDb } from "@kyora/db"
+import { createLocalEmbedder, type Embedder } from "@kyora/nora"
 import { queryState } from "./tools/query-state"
 import { getRecentErrors } from "./tools/get-recent-errors"
 import { getHttpLog } from "./tools/get-http-log"
@@ -12,8 +12,23 @@ import { indexSourceHandler } from "./tools/index-source"
 import { indexStatus } from "./tools/index-status"
 import { lookupSymbolHandler } from "./tools/lookup-symbol"
 
-const db = await createDb(process.env.KYORA_DATA_DIR)
-const embedder = createLocalEmbedder()
+// lazy-init: some MCP clients (codex) have tight handshake timeouts.
+// defer pglite + embedder init until the first tool call.
+let _db: KyoraDb | null = null
+let _embedder: Embedder | null = null
+let _dbInitPromise: Promise<KyoraDb> | null = null
+
+async function db(): Promise<KyoraDb> {
+  if (_db) return _db
+  if (!_dbInitPromise) _dbInitPromise = createDb(process.env.KYORA_DATA_DIR)
+  _db = await _dbInitPromise
+  return _db
+}
+
+function embedder(): Embedder {
+  if (!_embedder) _embedder = createLocalEmbedder()
+  return _embedder
+}
 
 const server = new McpServer({
   name: "kyora",
@@ -33,7 +48,7 @@ server.tool(
     traceId: z.string().optional().describe("filter by trace ID to see state changes within a specific request"),
   },
   async (input) => {
-    const results = await queryState(db, input)
+    const results = await queryState(await db(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )
@@ -46,7 +61,7 @@ server.tool(
     traceId: z.string().optional().describe("filter by trace ID to see errors within a specific request"),
   },
   async (input) => {
-    const results = await getRecentErrors(db, input)
+    const results = await getRecentErrors(await db(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )
@@ -60,7 +75,7 @@ server.tool(
     traceId: z.string().optional().describe("filter by trace ID to see HTTP calls within a specific request"),
   },
   async (input) => {
-    const results = await getHttpLog(db, input)
+    const results = await getHttpLog(await db(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )
@@ -75,7 +90,7 @@ server.tool(
     limit: z.number().optional().describe("max results (default 5)"),
   },
   async (input) => {
-    const results = await searchDocsHandler(db, embedder, input)
+    const results = await searchDocsHandler(await db(), embedder(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )
@@ -85,7 +100,7 @@ server.tool(
   "list all indexed documentation sources and their status",
   {},
   async () => {
-    const results = await listIndexed(db)
+    const results = await listIndexed(await db())
     return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )
@@ -98,7 +113,7 @@ server.tool(
     reference: z.string().describe("the npm package name, URL, or file path to index"),
   },
   async (input) => {
-    const result = await indexSourceHandler(db, embedder, input)
+    const result = await indexSourceHandler(await db(), embedder(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
   },
 )
@@ -110,7 +125,7 @@ server.tool(
     sourceId: z.number().optional().describe("specific source ID to check, or omit for overall stats"),
   },
   async (input) => {
-    const result = await indexStatus(db, input)
+    const result = await indexStatus(await db(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] }
   },
 )
@@ -123,7 +138,7 @@ server.tool(
     limit: z.number().optional().describe("max results (default 10)"),
   },
   async (input) => {
-    const results = await lookupSymbolHandler(db, input)
+    const results = await lookupSymbolHandler(await db(), input)
     return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] }
   },
 )

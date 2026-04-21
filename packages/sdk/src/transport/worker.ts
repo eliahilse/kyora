@@ -9,6 +9,7 @@ interface WorkerMessage {
 }
 
 let db: Awaited<ReturnType<typeof createDb>>
+let dbReady: Promise<Awaited<ReturnType<typeof createDb>>> | null = null
 
 let eventBuffer: typeof events.$inferInsert[] = []
 let stateBuffer: typeof stateSnapshots.$inferInsert[] = []
@@ -17,6 +18,7 @@ let fnBuffer: typeof functionCalls.$inferInsert[] = []
 const BATCH_SIZE = 50
 
 async function flushAll() {
+  if (!db && dbReady) db = await dbReady
   if (!db) return
   if (eventBuffer.length > 0) {
     const batch = eventBuffer.splice(0)
@@ -38,7 +40,8 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   switch (type) {
     case "init": {
       const { dataDir } = payload as { dataDir?: string }
-      db = await createDb(dataDir)
+      dbReady = createDb(dataDir)
+      db = await dbReady
       self.postMessage({ type: "ready" })
       break
     }

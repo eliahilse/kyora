@@ -18,6 +18,11 @@ coverage
 # Turbo
 .turbo
 
+# reckon benchmark workspaces and results
+apps/reckon/src/results/
+.kyora/
+tmp/
+
 # Vercel
 .vercel
 

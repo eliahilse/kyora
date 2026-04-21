@@ -59,8 +59,8 @@ function emitCall(
 
 function safeSerialize(val: unknown): unknown {
   try {
-    JSON.stringify(val)
-    return val
+    const serialized = JSON.stringify(val, (_key, value) => typeof value === "function" ? "[function]" : value)
+    return serialized === undefined ? undefined : JSON.parse(serialized)
   } catch {
     return "[unserializable]"
   }

@@ -11,10 +11,12 @@ const snapshotCounters = new Map<string, number>()
 
 function deepClone(obj: unknown): unknown {
   if (obj === null || typeof obj !== "object") return obj
+  if (typeof obj === "function") return "[function]"
   if (Array.isArray(obj)) return obj.map(deepClone)
   const clone: Record<string, unknown> = {}
   for (const key of Object.keys(obj as Record<string, unknown>)) {
-    clone[key] = deepClone((obj as Record<string, unknown>)[key])
+    const value = (obj as Record<string, unknown>)[key]
+    clone[key] = typeof value === "function" ? "[function]" : deepClone(value)
   }
   return clone
 }

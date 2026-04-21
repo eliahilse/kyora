@@ -7,16 +7,35 @@ plugin({
   name: "kyora",
   setup(build) {
     build.onLoad({ filter: /\.(ts|tsx|js|jsx)$/ }, async (args) => {
-      if (args.path.includes("node_modules")) return
-      if (args.path.includes("@kyora")) return
+      const passthrough = async () => ({ contents: await Bun.file(args.path).text(), loader: args.loader })
+      if (args.path.includes("node_modules")) return passthrough()
+      if (args.path.includes("@kyora")) return passthrough()
 
       const source = await Bun.file(args.path).text()
-      if (!source.includes("@kyora.")) return
+      if (!source.includes("@kyora.")) return { contents: source, loader: args.loader }
 
       const lines = source.split("\n")
       let needsWatch = false
       let needsTrace = false
       const insertions: Array<{ after: number; code: string }> = []
+      const findDeclarationEnd = (start: number) => {
+        let braceDepth = 0
+        let sawBrace = false
+        for (let j = start; j < lines.length; j++) {
+          const text = lines[j]!
+          for (const ch of text) {
+            if (ch === "{") {
+              braceDepth++
+              sawBrace = true
+            } else if (ch === "}") {
+              braceDepth--
+            }
+          }
+          if (sawBrace && braceDepth <= 0) return j
+          if (!sawBrace && text.includes(";")) return j
+        }
+        return start
+      }
 
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i]!
@@ -46,7 +65,7 @@ plugin({
           if (target) {
             needsTrace = true
             insertions.push({
-              after: i + 1,
+              after: findDeclarationEnd(i + 1),
               code: `${target} = __kyora_trace(${target}, "${target}");`,
             })
           }
@@ -54,7 +73,6 @@ plugin({
       }
 
       if (!needsWatch && !needsTrace) return
-
       // insert in reverse so indices stay valid
       for (const ins of insertions.sort((a, b) => b.after - a.after)) {
         // for let/var declarations, insert reassignment on next line

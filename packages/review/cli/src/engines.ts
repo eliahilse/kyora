@@ -20,6 +20,16 @@ export interface EngineDef {
   authHint: string
 }
 
+function bailianKey(): string | undefined {
+  if (process.env.QWEN_API_KEY) return process.env.QWEN_API_KEY
+  try {
+    const config = JSON.parse(readFileSync(join(homedir(), ".config/opencode/opencode.json"), "utf8"))
+    return config.provider?.["bailian-cli"]?.options?.apiKey ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
 function zaiKey(): string | undefined {
   if (process.env.ZAI_API_KEY) return process.env.ZAI_API_KEY
   try {
@@ -108,10 +118,18 @@ export const ENGINES: EngineDef[] = [
   },
   {
     id: "qwen",
-    label: "Qwen Code (Alibaba)",
-    bin: "qwen",
-    args: ["-p", "{prompt}"],
-    authHint: "run `qwen` once to log in (Coding Plan), or configure an API key per qwen-code docs",
+    label: "Qwen (Alibaba Token Plan, via Claude Code)",
+    bin: "claude",
+    ready: () => (bailianKey() ? null : "no Token Plan key (set QWEN_API_KEY or run `bl config agent --agent opencode ...`)"),
+    args: CLAUDE_ARGS,
+    env: () => ({
+      ANTHROPIC_BASE_URL:
+        process.env.QWEN_BASE_URL ?? "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+      ANTHROPIC_AUTH_TOKEN: bailianKey(),
+      ANTHROPIC_MODEL: process.env.QWEN_MODEL ?? "qwen3.8-max-preview",
+      ANTHROPIC_API_KEY: undefined,
+    }),
+    authHint: "set QWEN_API_KEY (Token Plan key), or run `bl config agent` once — the key is picked up from there",
   },
 ]
 

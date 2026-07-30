@@ -32,7 +32,9 @@
     "@kyora/db": "workspace:*",
     "@kyora/nora": "workspace:*",
     "@kyora/sdk": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "drizzle-orm": "^0.39.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@repo/typescript-config": "workspace:*",

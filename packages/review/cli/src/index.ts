@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util"
+import { ciCoveredCommands } from "./ci"
 import { buildContext, repoRoot } from "./diff"
 import { ENGINES, engineById, engineStatus, runEngineRaw, type EngineDef } from "./engines"
 import { extractFindings, extractPayload } from "./extract"
@@ -131,7 +132,9 @@ async function review(flags: Flags): Promise<void> {
   }
   log(`reviewing ${ctx.changedFiles.length} changed file(s) with: ${selected.map((engine) => engine.id).join(", ")}`)
 
-  const prompt = reviewPrompt(ctx, config.maxFindingsPerEngine)
+  const ciCovered = await ciCoveredCommands(root)
+  if (ciCovered.length > 0) log(`execution policy: ${ciCovered.length} CI-covered command(s) off-limits to engines`)
+  const prompt = reviewPrompt(ctx, config.maxFindingsPerEngine, ciCovered)
   const runs: EngineRun[] = await Promise.all(
     selected.map(async (engine): Promise<EngineRun> => {
       log(`${engine.id}: starting`)

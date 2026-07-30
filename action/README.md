@@ -68,4 +68,4 @@ Every engine uses *your* account through *its vendor's own CLI* — that's what 
 ## Security notes
 
 - **Public repos:** Actions caches are readable by workflows in the same repo, including ones triggered from fork PRs. The `if:` guard above stops fork PRs from running this job, but if other workflows in your repo run untrusted code, set `persist-auth: "false"` and rely on the seeded secrets alone (Codex seeds then need re-seeding when the refresh token rotates out).
-- The review job needs only `contents: read` + `pull-requests: write`. Engines run with read-only sandboxes/tool allowlists — they review, they don't edit.
+- The review job needs only `contents: read` + `pull-requests: write`. Engines may execute targeted verification probes but are denied writes, installs, and the repo's CI-covered suites — they review, they don't edit.

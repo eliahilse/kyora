@@ -17,6 +17,17 @@ export interface EngineDef {
   authHint: string
 }
 
+const CLAUDE_DENIED = [
+  "Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch",
+  "Bash(bun test:*)", "Bash(bun run:*)", "Bash(bun install:*)", "Bash(bunx turbo:*)",
+  "Bash(npm test:*)", "Bash(npm run:*)", "Bash(npm install:*)", "Bash(npx turbo:*)",
+  "Bash(pnpm test:*)", "Bash(pnpm run:*)", "Bash(pnpm install:*)",
+  "Bash(yarn:*)", "Bash(turbo:*)", "Bash(tsc:*)", "Bash(next:*)",
+  "Bash(vitest:*)", "Bash(jest:*)", "Bash(pytest:*)", "Bash(go test:*)", "Bash(cargo test:*)",
+  "Bash(make:*)", "Bash(pip install:*)", "Bash(rm:*)", "Bash(mv:*)",
+  "Bash(git push:*)", "Bash(git commit:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash:*)",
+].join(",")
+
 const CLAUDE_ARGS = [
   "-p",
   "{prompt}",
@@ -25,7 +36,9 @@ const CLAUDE_ARGS = [
   "--max-turns",
   "40",
   "--allowedTools",
-  "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(ls:*)",
+  "Read,Grep,Glob,Bash",
+  "--disallowedTools",
+  CLAUDE_DENIED,
 ]
 
 export const ENGINES: EngineDef[] = [

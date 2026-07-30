@@ -48,10 +48,17 @@ export const VERDICTS_SCHEMA = {
   },
 } as const
 
-export function reviewPrompt(ctx: ReviewContext, maxFindings: number): string {
+export function reviewPrompt(ctx: ReviewContext, maxFindings: number, ciCovered: string[]): string {
+  const ciSection =
+    ciCovered.length > 0
+      ? `\nCI for this repository already runs the following — never run them or their equivalents; if a finding depends on their outcome, state the expectation instead:\n${ciCovered.map((command) => `  ${command}`).join("\n")}\n`
+      : ""
   return `You are one reviewer on a multi-model code review panel. Different models review the same change independently; findings are cross-checked afterwards, so precision matters more than volume.
 
-You are inside the repository checkout (current working directory). The change under review is the diff below. Before reporting a finding, verify it against the actual code: read the surrounding file, check callers and tests with grep, confirm the claim holds. Never report an issue you could have disproven by reading the repo. Do not modify any files.
+You are inside the repository checkout (current working directory). The change under review is the diff below. Before reporting a finding, verify it against the actual code: read the surrounding file, check callers and tests with grep, confirm the claim holds. Never report an issue you could have disproven by reading the repo.
+
+EXECUTION POLICY: You may run small, targeted probes to verify a suspicion — evaluate a snippet (\`bun -e\`, \`node -e\`, \`python3 -c\`), exercise a single function against an edge case, inspect git history. You must NOT run the project's test suites, builds, linters, or type-checkers: CI runs those already, and re-running them wastes the panel's compute without adding signal. Never modify files, install packages, or access the network.
+${ciSection}
 
 Report only issues that matter: bugs, correctness, security, data loss, races, broken error handling, API misuse, significant performance problems. No style or formatting nits unless they hide a defect. Report at most ${maxFindings} findings — fewer, well-verified findings beat many speculative ones. If the change looks correct, return an empty findings array.
 
@@ -86,7 +93,7 @@ export function verifyPrompt(claims: VerifyClaim[]): string {
     .join("\n\n")
   return `You are an adversarial verifier on a code review panel. Each claim below was reported by only ONE reviewer, so it is suspect. You are inside the repository checkout: for each claim, read the actual code and decide whether the issue is real.
 
-Actively try to refute each claim. "confirmed" only if you can point at the code path that makes it true; if the claim is speculative, already handled elsewhere, or you cannot reproduce the reasoning from the code, return "refuted". Do not modify any files.
+Actively try to refute each claim. "confirmed" only if you can point at the code path that makes it true; if the claim is speculative, already handled elsewhere, or you cannot reproduce the reasoning from the code, return "refuted". You may run small targeted probes (snippet evaluation, single-function checks) to test a claim, but never the project's test suites or builds, and never modify files.
 
 OUTPUT: respond with ONLY a JSON object, no prose, one verdict per claim index:
 {"verdicts": [{"index": 0, "verdict": "confirmed", "reason": "..."}]}

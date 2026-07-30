@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { cooldownRemainingMs, lastRunAt, loadUsage, looksRateLimited, markRun, resetHintMs } from "./usage"
+import { cooldownRemainingMs, lastRunAt, loadUsage, looksRateLimited, markRun, parseClaudeOauthUsage, parseQuotaWindows, parseTokenPlanUsage, parseZaiQuota, resetHintMs } from "./usage"
 
 beforeEach(() => {
   process.env.KYORA_REVIEW_STATE_DIR = mkdtempSync(join(tmpdir(), "kyora-usage-"))
@@ -40,6 +40,70 @@ describe("looksRateLimited", () => {
   test("ignores ordinary failures", () => {
     expect(looksRateLimited("SyntaxError: unexpected token")).toBe(false)
     expect(looksRateLimited("exit 1: command not found")).toBe(false)
+  })
+})
+
+describe("parseTokenPlanUsage", () => {
+  test("finds used/total pairs regardless of casing and nesting", () => {
+    const payload = { code: 200, data: { subscription: { UsedCredit: 250, TotalCredit: 1000 } } }
+    expect(parseTokenPlanUsage(payload)).toEqual({ remainingPct: 75, detail: "750 of 1,000 credits left" })
+  })
+
+  test("returns null for empty or zero-total payloads", () => {
+    expect(parseTokenPlanUsage({ data: { totalCount: 0 } })).toBeNull()
+    expect(parseTokenPlanUsage(null)).toBeNull()
+    expect(parseTokenPlanUsage("<html>login</html>")).toBeNull()
+  })
+})
+
+describe("parseQuotaWindows", () => {
+  test("collects windows and reports the tightest one", () => {
+    const payload = {
+      usage: { limit: 2048, used: 512, remaining: 1536, resetTime: "2026-08-03T00:00:00Z" },
+      limits: [{ window: "5h", limit: 200, used: 190, remaining: 10 }],
+    }
+    const live = parseQuotaWindows(payload)
+    expect(live!.remainingPct).toBe(5)
+    expect(live!.detail).toContain("512/2,048")
+    expect(live!.detail).toContain("190/200 5h")
+  })
+
+  test("returns null when no used/limit pairs exist", () => {
+    expect(parseQuotaWindows({ message: "ok" })).toBeNull()
+    expect(parseQuotaWindows(null)).toBeNull()
+  })
+})
+
+describe("parseZaiQuota", () => {
+  test("reads percentage windows from the live monitor shape", () => {
+    const payload = {
+      code: 200,
+      data: {
+        limits: [
+          { type: "TIME_LIMIT", unit: 5, number: 1, usage: 100, currentValue: 0, remaining: 100, percentage: 12 },
+          { type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 87 },
+        ],
+      },
+    }
+    const live = parseZaiQuota(payload)
+    expect(live!.remainingPct).toBe(13)
+    expect(live!.detail).toBe("time 12% used · tokens 87% used")
+  })
+
+  test("falls back to used/limit pairs when no percentages exist", () => {
+    expect(parseZaiQuota({ data: { used: 30, limit: 100 } })!.remainingPct).toBe(70)
+  })
+})
+
+describe("parseClaudeOauthUsage", () => {
+  test("reads window utilization in fraction or percent form", () => {
+    const live = parseClaudeOauthUsage({ five_hour: { utilization: 0.42 }, seven_day: { utilization: 61 } })
+    expect(live!.remainingPct).toBe(39)
+    expect(live!.detail).toBe("5h 42% used · 7d 61% used")
+  })
+
+  test("returns null without usable windows", () => {
+    expect(parseClaudeOauthUsage({ subscriptionType: "max" })).toBeNull()
   })
 })
 

@@ -152,6 +152,22 @@ async function review(flags: Flags): Promise<void> {
       return
     }
   }
+  const probed = await Promise.all(
+    selected.map(async (engine) => ({ engine, live: engine.usageProbe ? await engine.usageProbe() : null })),
+  )
+  for (const { engine, live } of probed) {
+    if (live) log(`${engine.id}: live quota ${live.remainingPct}% — ${live.detail}`)
+  }
+  if (!flags["ignore-quota"]) {
+    for (const { engine, live } of probed) {
+      if (live !== null && live.remainingPct <= 0) log(`${engine.id}: out of quota per live probe — skipped`)
+    }
+    selected = probed.filter(({ live }) => live === null || live.remainingPct > 0).map(({ engine }) => engine)
+    if (selected.length === 0) {
+      log("every available engine is out of quota — nothing launched (use --ignore-quota to force)")
+      return
+    }
+  }
   if (config.maxEngines > 0 && selected.length > config.maxEngines) {
     selected = [...selected]
       .sort((a, b) => lastRunAt(a.id, usage) - lastRunAt(b.id, usage))
@@ -218,19 +234,21 @@ async function review(flags: Flags): Promise<void> {
   }
 }
 
-function usageReport(): void {
+async function usageReport(): Promise<void> {
   const state = loadUsage()
   console.log("kyora-review usage\n")
   for (const engine of ENGINES) {
     const entry = state.engines[engine.id]
+    const live = engine.usageProbe ? await engine.usageProbe() : null
+    const liveNote = live ? `   live: ${live.remainingPct}% (${live.detail})` : ""
     if (!entry?.lastRun) {
-      console.log(`${engine.id.padEnd(8)} never run`)
+      console.log(`${engine.id.padEnd(8)} never run${liveNote}`)
       continue
     }
     const ago = Math.round((Date.now() - entry.lastRun) / 60_000)
     const cooldown = cooldownRemainingMs(engine.id, state)
     const status = cooldown > 0 ? `cooling down, ${Math.ceil(cooldown / 60_000)}m left` : (entry.lastOutcome ?? "ok")
-    console.log(`${engine.id.padEnd(8)} ${String(entry.runs ?? 0).padStart(3)} run(s)   last: ${ago}m ago   ${status}`)
+    console.log(`${engine.id.padEnd(8)} ${String(entry.runs ?? 0).padStart(3)} run(s)   last: ${ago}m ago   ${status}${liveNote}`)
   }
 }
 

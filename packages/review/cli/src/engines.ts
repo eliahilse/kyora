@@ -3,7 +3,68 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { EngineOverride, ReviewConfig } from "./types"
-import { looksRateLimited, markRun, resetHintMs } from "./usage"
+import {
+  looksRateLimited,
+  markRun,
+  parseClaudeOauthUsage,
+  parseQuotaWindows,
+  parseTokenPlanUsage,
+  parseZaiQuota,
+  resetHintMs,
+  type LiveUsage,
+} from "./usage"
+
+async function probeJson(url: string, headers: Record<string, string>): Promise<unknown | null> {
+  try {
+    const response = await fetch(url, { headers, redirect: "error", signal: AbortSignal.timeout(5000) })
+    if (!response.ok) return null
+    return await response.json()
+  } catch {
+    return null
+  }
+}
+
+async function claudeToken(): Promise<string | undefined> {
+  try {
+    const creds = JSON.parse(readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf8"))
+    if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth.accessToken
+  } catch {}
+  if (process.platform === "darwin") {
+    const result = await Bun.$`security find-generic-password -s "Claude Code-credentials" -w`.quiet().nothrow()
+    if (result.exitCode === 0) {
+      try {
+        return JSON.parse(result.text().trim())?.claudeAiOauth?.accessToken ?? undefined
+      } catch {}
+    }
+  }
+  return undefined
+}
+
+async function claudeUsageProbe(): Promise<LiveUsage | null> {
+  const token = await claudeToken()
+  if (!token) return null
+  const payload = await probeJson("https://api.anthropic.com/api/oauth/usage", {
+    authorization: `Bearer ${token}`,
+    "anthropic-beta": "oauth-2025-04-20",
+  })
+  return payload ? parseClaudeOauthUsage(payload) : null
+}
+
+async function kimiUsageProbe(): Promise<LiveUsage | null> {
+  const key = process.env.KIMI_API_KEY
+  if (!key) return null
+  const url = process.env.KIMI_USAGE_URL ?? "https://api.kimi.com/coding/v1/usages"
+  const payload = await probeJson(url, { authorization: `Bearer ${key}` })
+  return payload ? parseQuotaWindows(payload) : null
+}
+
+async function glmUsageProbe(): Promise<LiveUsage | null> {
+  const key = zaiKey()
+  if (!key) return null
+  const url = process.env.ZAI_USAGE_URL ?? "https://api.z.ai/api/monitor/usage/quota/limit"
+  const payload = await probeJson(url, { authorization: `Bearer ${key}` })
+  return payload ? parseZaiQuota(payload) : null
+}
 
 export interface EngineDef {
   id: string
@@ -18,7 +79,26 @@ export interface EngineDef {
   env?: () => Record<string, string | undefined>
   /** engine writes its final message to the {out} file instead of stdout */
   readsOutFile?: boolean
+  /** live remaining-quota query where the vendor exposes one; null = unavailable */
+  usageProbe?: () => Promise<LiveUsage | null>
   authHint: string
+}
+
+async function qwenUsageProbe(): Promise<LiveUsage | null> {
+  const cookie = process.env.QWEN_USAGE_COOKIE
+  if (!cookie) return null
+  const host = process.env.QWEN_CONSOLE_HOST ?? "bailian-singapore-cs.alibabacloud.com"
+  try {
+    const response = await fetch(`https://${host}/tokenplan/personal/api/v2/usage`, {
+      headers: { cookie, accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) return null
+    return parseTokenPlanUsage(await response.json())
+  } catch {
+    return null
+  }
 }
 
 function bailianKey(): string | undefined {
@@ -80,6 +160,7 @@ export const ENGINES: EngineDef[] = [
     label: "Claude Code (Anthropic)",
     bin: "claude",
     args: CLAUDE_ARGS,
+    usageProbe: claudeUsageProbe,
     authHint: "log in once via `claude`, or set CLAUDE_CODE_OAUTH_TOKEN (created with `claude setup-token`)",
   },
   {
@@ -94,6 +175,7 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_MODEL: process.env.KIMI_MODEL ?? "kimi-k3",
       ANTHROPIC_API_KEY: undefined,
     }),
+    usageProbe: kimiUsageProbe,
     authHint: "set KIMI_API_KEY (Kimi membership / platform.kimi.ai); optional KIMI_BASE_URL, KIMI_MODEL",
   },
   {
@@ -108,6 +190,7 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_MODEL: process.env.ZAI_MODEL ?? "glm-5.2",
       ANTHROPIC_API_KEY: undefined,
     }),
+    usageProbe: glmUsageProbe,
     authHint: "set ZAI_API_KEY (GLM Coding Plan), or log in once via `opencode auth login` — the key is picked up from there",
   },
   {
@@ -130,6 +213,7 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_MODEL: process.env.QWEN_MODEL ?? "qwen3.8-max-preview",
       ANTHROPIC_API_KEY: undefined,
     }),
+    usageProbe: qwenUsageProbe,
     authHint: "set QWEN_API_KEY (Token Plan key), or run `bl config agent` once — the key is picked up from there",
   },
 ]

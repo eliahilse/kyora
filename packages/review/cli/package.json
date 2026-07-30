@@ -14,8 +14,16 @@
   "bin": {
     "kyora-review": "./dist/index.js"
   },
+  "exports": {
+    ".": "./dist/index.js",
+    "./engines": "./src/engines.ts",
+    "./usage": "./src/usage.ts",
+    "./extract": "./src/extract.ts",
+    "./types": "./src/types.ts"
+  },
   "files": [
     "dist",
+    "src",
     "README.md"
   ],
   "publishConfig": {

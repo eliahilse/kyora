@@ -76,6 +76,8 @@ export interface EngineDef {
   ready?: () => string | null
   /** tokens {prompt} {schema} {out} are substituted; first element is replaced by the resolved bin */
   args: string[]
+  /** args for delegated work that may edit files; absent = engine is read-only */
+  argsWrite?: string[]
   env?: () => Record<string, string | undefined>
   /** engine writes its final message to the {out} file instead of stdout */
   readsOutFile?: boolean
@@ -146,12 +148,33 @@ const CLAUDE_ARGS = [
   CLAUDE_DENIED,
 ]
 
+/** same CI/destructive denials, but file edits permitted for delegated work */
+const CLAUDE_WRITE_DENIED = CLAUDE_DENIED.split(",")
+  .filter((rule) => !["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(rule))
+  .join(",")
+
+const CLAUDE_WRITE_ARGS = [
+  "-p",
+  "{prompt}",
+  "--output-format",
+  "json",
+  "--max-turns",
+  "60",
+  "--allowedTools",
+  "Read,Grep,Glob,Bash,Write,Edit,MultiEdit",
+  "--disallowedTools",
+  CLAUDE_WRITE_DENIED,
+]
+
+export type EngineMode = "read" | "write"
+
 export const ENGINES: EngineDef[] = [
   {
     id: "codex",
     label: "Codex (OpenAI)",
     bin: "codex",
     args: ["exec", "--sandbox", "read-only", "--output-schema", "{schema}", "-o", "{out}", "{prompt}"],
+    argsWrite: ["exec", "--sandbox", "workspace-write", "--full-auto", "{prompt}"],
     readsOutFile: true,
     authHint: "run `codex login` (ChatGPT subscription) or set OPENAI_API_KEY — CI: seed the CODEX_AUTH_JSON secret",
   },
@@ -160,6 +183,7 @@ export const ENGINES: EngineDef[] = [
     label: "Claude Code (Anthropic)",
     bin: "claude",
     args: CLAUDE_ARGS,
+    argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: claudeUsageProbe,
     authHint: "log in once via `claude`, or set CLAUDE_CODE_OAUTH_TOKEN (created with `claude setup-token`)",
   },
@@ -175,6 +199,7 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_MODEL: process.env.KIMI_MODEL ?? "kimi-k3",
       ANTHROPIC_API_KEY: undefined,
     }),
+    argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: kimiUsageProbe,
     authHint: "set KIMI_API_KEY (Kimi membership / platform.kimi.ai); optional KIMI_BASE_URL, KIMI_MODEL",
   },
@@ -190,6 +215,7 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_MODEL: process.env.ZAI_MODEL ?? "glm-5.2",
       ANTHROPIC_API_KEY: undefined,
     }),
+    argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: glmUsageProbe,
     authHint: "set ZAI_API_KEY (GLM Coding Plan), or log in once via `opencode auth login` — the key is picked up from there",
   },
@@ -198,6 +224,7 @@ export const ENGINES: EngineDef[] = [
     label: "Grok Build (xAI)",
     bin: "grok",
     args: ["--verbatim", "--reasoning-effort", "high", "--output-format", "json", "--json-schema", "{schemaJson}", "-p", "{prompt}"],
+    argsWrite: ["--verbatim", "--reasoning-effort", "high", "--always-approve", "-p", "{prompt}"],
     authHint: "log in via `grok login`, or set GROK_API_KEY / XAI_API_KEY (console.x.ai)",
   },
   {
@@ -213,6 +240,7 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_MODEL: process.env.QWEN_MODEL ?? "qwen3.8-max-preview",
       ANTHROPIC_API_KEY: undefined,
     }),
+    argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: qwenUsageProbe,
     authHint: "set QWEN_API_KEY (Token Plan key), or run `bl config agent` once — the key is picked up from there",
   },
@@ -258,6 +286,7 @@ export async function runEngineRaw(
   schema: unknown,
   cwd: string,
   config: ReviewConfig,
+  mode: EngineMode = "read",
 ): Promise<RawRun> {
   const override = config.overrides[engine.id]
   const started = Date.now()
@@ -268,7 +297,8 @@ export async function runEngineRaw(
     await Bun.write(schemaPath, JSON.stringify(schema))
 
     const bin = override?.bin ?? engine.bin
-    const argTemplate = override?.args ?? engine.args
+    const argTemplate =
+      mode === "write" ? (engine.argsWrite ?? override?.args ?? engine.args) : (override?.args ?? engine.args)
     const args = argTemplate.map((arg) =>
       arg
         .replace("{schemaJson}", () => JSON.stringify(schema))

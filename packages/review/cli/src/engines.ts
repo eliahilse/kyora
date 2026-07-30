@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { EngineOverride, ReviewConfig } from "./types"
 
@@ -9,12 +10,35 @@ export interface EngineDef {
   bin: string
   /** env vars that must all be present for this engine to be selectable */
   requiresEnv?: string[]
+  /** extra readiness check; returns a reason when unavailable, null when ready */
+  ready?: () => string | null
   /** tokens {prompt} {schema} {out} are substituted; first element is replaced by the resolved bin */
   args: string[]
   env?: () => Record<string, string | undefined>
   /** engine writes its final message to the {out} file instead of stdout */
   readsOutFile?: boolean
   authHint: string
+}
+
+function bailianKey(): string | undefined {
+  if (process.env.QWEN_API_KEY) return process.env.QWEN_API_KEY
+  try {
+    const config = JSON.parse(readFileSync(join(homedir(), ".config/opencode/opencode.json"), "utf8"))
+    return config.provider?.["bailian-cli"]?.options?.apiKey ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+function zaiKey(): string | undefined {
+  if (process.env.ZAI_API_KEY) return process.env.ZAI_API_KEY
+  try {
+    const auth = JSON.parse(readFileSync(join(homedir(), ".local/share/opencode/auth.json"), "utf8"))
+    const entry = auth["zai-coding-plan"]
+    return entry?.key ?? entry?.apiKey ?? undefined
+  } catch {
+    return undefined
+  }
 }
 
 const CLAUDE_DENIED = [
@@ -72,6 +96,20 @@ export const ENGINES: EngineDef[] = [
     authHint: "set KIMI_API_KEY (Kimi membership / platform.kimi.ai); optional KIMI_BASE_URL, KIMI_MODEL",
   },
   {
+    id: "glm",
+    label: "GLM 5.2 (Z.ai, via Claude Code)",
+    bin: "claude",
+    ready: () => (zaiKey() ? null : "no Z.ai key (set ZAI_API_KEY or run `opencode auth login` → Z.AI Coding Plan)"),
+    args: CLAUDE_ARGS,
+    env: () => ({
+      ANTHROPIC_BASE_URL: process.env.ZAI_BASE_URL ?? "https://api.z.ai/api/anthropic",
+      ANTHROPIC_AUTH_TOKEN: zaiKey(),
+      ANTHROPIC_MODEL: process.env.ZAI_MODEL ?? "glm-5.2",
+      ANTHROPIC_API_KEY: undefined,
+    }),
+    authHint: "set ZAI_API_KEY (GLM Coding Plan), or log in once via `opencode auth login` — the key is picked up from there",
+  },
+  {
     id: "grok",
     label: "Grok Build (xAI)",
     bin: "grok",
@@ -80,10 +118,18 @@ export const ENGINES: EngineDef[] = [
   },
   {
     id: "qwen",
-    label: "Qwen Code (Alibaba)",
-    bin: "qwen",
-    args: ["-p", "{prompt}"],
-    authHint: "run `qwen` once to log in (Coding Plan), or configure an API key per qwen-code docs",
+    label: "Qwen (Alibaba Token Plan, via Claude Code)",
+    bin: "claude",
+    ready: () => (bailianKey() ? null : "no Token Plan key (set QWEN_API_KEY or run `bl config agent --agent opencode ...`)"),
+    args: CLAUDE_ARGS,
+    env: () => ({
+      ANTHROPIC_BASE_URL:
+        process.env.QWEN_BASE_URL ?? "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+      ANTHROPIC_AUTH_TOKEN: bailianKey(),
+      ANTHROPIC_MODEL: process.env.QWEN_MODEL ?? "qwen3.8-max-preview",
+      ANTHROPIC_API_KEY: undefined,
+    }),
+    authHint: "set QWEN_API_KEY (Token Plan key), or run `bl config agent` once — the key is picked up from there",
   },
 ]
 
@@ -107,6 +153,8 @@ export function engineStatus(engine: EngineDef, override: EngineOverride | undef
       return { engine, available: false, reason: `${name} not set` }
     }
   }
+  const notReady = engine.ready?.()
+  if (notReady) return { engine, available: false, reason: notReady }
   return { engine, available: true, reason: "ready" }
 }
 

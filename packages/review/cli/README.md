@@ -30,8 +30,9 @@ bunx @kyora-sh/review review --pr 123 --post --verify
 | `codex` | `codex exec` (read-only sandbox) | `codex login` (ChatGPT sub) or `OPENAI_API_KEY` |
 | `claude` | `claude -p` (probes allowed, writes and CI suites denied) | `claude` login or `CLAUDE_CODE_OAUTH_TOKEN` |
 | `kimi` | Claude Code against Kimi's Anthropic-compatible endpoint | `KIMI_API_KEY` (+ optional `KIMI_BASE_URL`, `KIMI_MODEL`) |
+| `glm` | GLM-5.2 via Claude Code against Z.ai's Anthropic-compatible endpoint | `ZAI_API_KEY` or `opencode auth login` |
 | `grok` | `grok -p` | `grok` login or `GROK_API_KEY` / `XAI_API_KEY` |
-| `qwen` | `qwen -p` | `qwen` login (Coding Plan) or API key |
+| `qwen` | Qwen (default qwen3.8-max-preview) via Claude Code against the Token Plan Anthropic endpoint | `QWEN_API_KEY` or `bl config agent` |
 
 By default every available engine runs; pick explicitly with `--engines codex,kimi`. An engine that's rate-limited or fails just drops out — the review still lands with the rest.
 

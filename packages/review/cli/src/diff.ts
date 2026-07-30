@@ -86,7 +86,6 @@ export function parseCommentableLines(diff: string): Map<string, Set<number>> {
       lines.add(newLine)
       newLine++
     }
-    // "-" lines belong to the old side and don't advance the new-side counter
   }
   return result
 }

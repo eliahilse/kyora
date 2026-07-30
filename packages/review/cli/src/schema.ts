@@ -9,8 +9,6 @@ export const FINDINGS_SCHEMA = {
     findings: {
       type: "array",
       items: {
-        // OpenAI strict structured outputs (codex --output-schema) reject any
-        // property missing from `required`, so optional fields are nullable
         type: "object",
         additionalProperties: false,
         required: ["file", "line", "endLine", "severity", "category", "title", "body", "suggestion"],

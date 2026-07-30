@@ -49,6 +49,10 @@ function fromParsed(parsed: unknown, key: string): Record<string, unknown> | nul
   if (Array.isArray(obj[key])) return obj
   // claude -p --output-format json envelope: { type: "result", result: "<text>" }
   if (typeof obj.result === "string") return extractPayload(obj.result, key)
+  if (obj.structuredOutput !== null && typeof obj.structuredOutput === "object") {
+    const found = fromParsed(obj.structuredOutput, key)
+    if (found) return found
+  }
   // codex/grok event stream items sometimes nest under message/text/content
   for (const nested of ["message", "text", "content", "last_message"]) {
     if (typeof obj[nested] === "string") {

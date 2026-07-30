@@ -61,8 +61,6 @@ runs:
 
         has() { case ",$engines," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
-        # Codex auth is a file; seed from the secret only when the cache didn't
-        # bring a fresher copy (the CLI rotates the tokens inside it on each run)
         if has codex; then
           if [ ! -f "$HOME/.codex/auth.json" ] && [ -n "$CODEX_AUTH_JSON" ]; then
             mkdir -p "$HOME/.codex"

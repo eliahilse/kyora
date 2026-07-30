@@ -17,6 +17,11 @@ describe("extractPayload", () => {
     expect(extractPayload(envelope, "findings")).toEqual(payload)
   })
 
+  test("unwraps the grok structuredOutput envelope", () => {
+    const envelope = JSON.stringify({ status: "done", structuredOutput: payload })
+    expect(extractPayload(envelope, "findings")).toEqual(payload)
+  })
+
   test("finds fenced json in prose", () => {
     const raw = `Here is my review:\n\`\`\`json\n${JSON.stringify(payload)}\n\`\`\`\nDone.`
     expect(extractPayload(raw, "findings")).toEqual(payload)

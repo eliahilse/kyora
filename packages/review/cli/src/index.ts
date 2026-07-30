@@ -15,8 +15,6 @@ const DEFAULTS: ReviewConfig = {
   post: false,
   base: "main",
   failOn: "none",
-  // Linux caps a single execve argument at 128 KiB and the prompt travels as
-  // one argv element, so the diff must stay comfortably below that
   maxDiffBytes: 100_000,
   timeoutMs: 900_000,
   maxFindingsPerEngine: 20,

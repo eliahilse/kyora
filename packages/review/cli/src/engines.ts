@@ -54,7 +54,6 @@ export const ENGINES: EngineDef[] = [
       ANTHROPIC_BASE_URL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.ai/anthropic",
       ANTHROPIC_AUTH_TOKEN: process.env.KIMI_API_KEY,
       ANTHROPIC_MODEL: process.env.KIMI_MODEL ?? "kimi-k3",
-      // a stray ANTHROPIC_API_KEY conflicts with ANTHROPIC_AUTH_TOKEN and breaks the connection
       ANTHROPIC_API_KEY: undefined,
     }),
     authHint: "set KIMI_API_KEY (Kimi membership / platform.kimi.ai); optional KIMI_BASE_URL, KIMI_MODEL",
@@ -63,8 +62,8 @@ export const ENGINES: EngineDef[] = [
     id: "grok",
     label: "Grok Build (xAI)",
     bin: "grok",
-    args: ["-p", "{prompt}", "--output-format", "json", "--json-schema", "{schema}"],
-    authHint: "log in via the `grok` TUI, or set GROK_API_KEY / XAI_API_KEY (console.x.ai)",
+    args: ["--verbatim", "--reasoning-effort", "high", "--output-format", "json", "--json-schema", "{schemaJson}", "-p", "{prompt}"],
+    authHint: "log in via `grok login`, or set GROK_API_KEY / XAI_API_KEY (console.x.ai)",
   },
   {
     id: "qwen",
@@ -123,10 +122,9 @@ export async function runEngineRaw(
 
     const bin = override?.bin ?? engine.bin
     const argTemplate = override?.args ?? engine.args
-    // replacer functions disable $-pattern interpretation, and {prompt} goes
-    // last so diff content is never rescanned for the other tokens
     const args = argTemplate.map((arg) =>
       arg
+        .replace("{schemaJson}", () => JSON.stringify(schema))
         .replace("{schema}", () => schemaPath)
         .replace("{out}", () => outPath)
         .replace("{prompt}", () => prompt),

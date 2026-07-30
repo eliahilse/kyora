@@ -74,5 +74,7 @@ export interface ReviewConfig {
   maxDiffBytes: number
   timeoutMs: number
   maxFindingsPerEngine: number
+  cooldownMinutes: number
+  maxEngines: number
   overrides: Record<string, EngineOverride>
 }

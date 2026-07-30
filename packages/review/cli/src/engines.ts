@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { EngineOverride, ReviewConfig } from "./types"
+import { looksRateLimited, markRun, resetHintMs } from "./usage"
 
 export interface EngineDef {
   id: string
@@ -162,6 +163,7 @@ export interface RawRun {
   ok: boolean
   raw: string
   error?: string
+  rateLimited?: boolean
   durationMs: number
 }
 
@@ -219,14 +221,26 @@ export async function runEngineRaw(
     }
 
     const durationMs = Date.now() - started
+    const failureContext = timedOut || exitCode !== 0 || raw.includes('"is_error":true')
+    const rateLimited =
+      failureContext && looksRateLimited(`${stderr.slice(-2000)}\n${raw.slice(-2000)}`)
+    const cooldownMs = resetHintMs(`${stderr}\n${raw}`.slice(-3000)) ?? config.cooldownMinutes * 60_000
+    markRun(engine.id, rateLimited ? "rate_limited" : failureContext ? "error" : "ok", cooldownMs)
+
     if (timedOut) {
-      return { ok: false, raw, error: `timed out after ${Math.round(config.timeoutMs / 1000)}s`, durationMs }
+      return { ok: false, raw, error: `timed out after ${Math.round(config.timeoutMs / 1000)}s`, rateLimited, durationMs }
     }
     if (exitCode !== 0 && !raw.trim()) {
       const tail = stderr.trim().split("\n").slice(-4).join("\n")
-      return { ok: false, raw, error: `exit ${exitCode}: ${tail || "no output"}`, durationMs }
+      return {
+        ok: false,
+        raw,
+        error: `${rateLimited ? "rate-limited: " : ""}exit ${exitCode}: ${tail || "no output"}`,
+        rateLimited,
+        durationMs,
+      }
     }
-    return { ok: true, raw, durationMs }
+    return { ok: true, raw, rateLimited, durationMs }
   } catch (error) {
     return { ok: false, raw: "", error: String(error), durationMs: Date.now() - started }
   } finally {

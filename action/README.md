@@ -36,6 +36,8 @@ jobs:
           CODEX_AUTH_JSON: ${{ secrets.KYORA_CODEX_AUTH }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.KYORA_CLAUDE_TOKEN }}
           KIMI_API_KEY: ${{ secrets.KYORA_KIMI_KEY }}
+          ZAI_API_KEY: ${{ secrets.KYORA_ZAI_KEY }}
+          QWEN_API_KEY: ${{ secrets.KYORA_QWEN_KEY }}
           GROK_API_KEY: ${{ secrets.KYORA_GROK_KEY }}
 ```
 
@@ -48,6 +50,8 @@ Seed whichever engines you pay for — the action auto-detects which credentials
 | codex | `KYORA_CODEX_AUTH` | log in locally, then `gh secret set KYORA_CODEX_AUTH < ~/.codex/auth.json` |
 | claude | `KYORA_CLAUDE_TOKEN` | `claude setup-token`, paste into `gh secret set KYORA_CLAUDE_TOKEN` |
 | kimi | `KYORA_KIMI_KEY` | API key from your Kimi membership (platform.kimi.ai) |
+| glm | `KYORA_ZAI_KEY` | GLM Coding Plan key from z.ai |
+| qwen | `KYORA_QWEN_KEY` | Alibaba Token Plan key (Model Studio console) |
 | grok | `KYORA_GROK_KEY` | API key from console.x.ai |
 
 Codex is subscription-OAuth: `auth.json` holds a refresh token, and the CLI rotates the access token on every run. With `persist-auth: true` (default) the refreshed file is cached between runs and preferred over the seeded secret, so you seed **once** and it keeps itself alive. Claude's `setup-token` output is long-lived; Kimi and Grok keys don't rotate.

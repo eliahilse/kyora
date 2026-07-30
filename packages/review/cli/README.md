@@ -51,6 +51,12 @@ By default every available engine runs; pick explicitly with `--engines codex,ki
 
 `kyora-review.config.json` at the repo root can set the same keys permanently, plus per-engine overrides (`bin`, `args` with `{prompt}`/`{schema}`/`{out}` tokens, `env`) if a vendor CLI changes its flags.
 
+## Quota awareness
+
+Every engine run records its outcome in local state (`~/.local/state/kyora-review/usage.json`). An engine that hits a usage limit is put on cooldown — vendor "try again in N hours" hints are parsed when present, otherwise `cooldownMinutes` (default 60) applies — and skipped on subsequent runs until it expires (`--ignore-quota` forces it). `kyora-review usage` shows the state.
+
+`--max-engines <n>` (or `maxEngines` in config) runs only the n least-recently-used healthy engines per review, rotating load across your subscriptions instead of burning all of them on every PR. In CI the state persists between runs via the action's cache.
+
 ## CI
 
 Use the GitHub Action — install once, seed each subscription's token as a repo secret, and tokens that rotate (Codex) are auto-refreshed via cache: see [`action/README.md`](https://github.com/eliahilse/kyora/tree/main/action).

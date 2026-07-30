@@ -35,7 +35,9 @@ runs:
       if: inputs.persist-auth == 'true'
       uses: actions/cache/restore@v4
       with:
-        path: ~/.codex
+        path: |
+          ~/.codex
+          ~/.local/state/kyora-review
         key: kyora-review-auth-${{ runner.os }}-${{ github.run_id }}
         restore-keys: |
           kyora-review-auth-${{ runner.os }}-
@@ -50,6 +52,8 @@ runs:
           { [ -n "$CODEX_AUTH_JSON" ] || [ -f "$HOME/.codex/auth.json" ]; } && engines="codex"
           [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] && engines="$engines,claude"
           [ -n "$KIMI_API_KEY" ] && engines="$engines,kimi"
+          [ -n "$ZAI_API_KEY" ] && engines="$engines,glm"
+          [ -n "$QWEN_API_KEY" ] && engines="$engines,qwen"
           { [ -n "$GROK_API_KEY" ] || [ -n "$XAI_API_KEY" ]; } && engines="$engines,grok"
           engines="${engines#,}"
         fi
@@ -69,14 +73,11 @@ runs:
           fi
           command -v codex >/dev/null 2>&1 || npm install -g @openai/codex
         fi
-        if has claude || has kimi; then
+        if has claude || has kimi || has glm || has qwen; then
           command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
         fi
         if has grok; then
           command -v grok >/dev/null 2>&1 || npm install -g @xai-official/grok
-        fi
-        if has qwen; then
-          command -v qwen >/dev/null 2>&1 || npm install -g @qwen-code/qwen-code
         fi
 
     - name: Run review
@@ -101,5 +102,7 @@ runs:
       if: always() && inputs.persist-auth == 'true' && steps.setup.outputs.engines != ''
       uses: actions/cache/save@v4
       with:
-        path: ~/.codex
+        path: |
+          ~/.codex
+          ~/.local/state/kyora-review
         key: kyora-review-auth-${{ runner.os }}-${{ github.run_id }}

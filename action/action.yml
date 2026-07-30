@@ -1,0 +1,101 @@
+name: "kyora review"
+description: "Multi-engine AI code review on your own coding-agent subscriptions (Codex, Claude, Kimi, Grok, Qwen)"
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  engines:
+    description: "Comma-separated engine ids (codex,claude,kimi,grok,qwen), or 'auto' to use every engine whose credentials are present"
+    default: "auto"
+  verify:
+    description: "Cross-examine single-engine findings with a second engine before reporting"
+    default: "false"
+  post:
+    description: "Post results as a PR review with inline comments"
+    default: "true"
+  fail-on:
+    description: "Fail the job if findings at/above this severity exist (critical|major|minor|nit|none)"
+    default: "none"
+  persist-auth:
+    description: "Cache refreshed engine credentials between runs so seeded tokens keep working after they rotate (see README for the public-repo caveat)"
+    default: "true"
+  version:
+    description: "@kyora-sh/review version to run"
+    default: "latest"
+
+runs:
+  using: "composite"
+  steps:
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Restore engine credentials
+      if: inputs.persist-auth == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.codex
+        key: kyora-review-auth-${{ runner.os }}-${{ github.run_id }}
+        restore-keys: |
+          kyora-review-auth-${{ runner.os }}-
+
+    - name: Resolve engines and seed credentials
+      id: setup
+      shell: bash
+      run: |
+        engines="${{ inputs.engines }}"
+        if [ "$engines" = "auto" ]; then
+          engines=""
+          { [ -n "$CODEX_AUTH_JSON" ] || [ -f "$HOME/.codex/auth.json" ]; } && engines="codex"
+          [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] && engines="$engines,claude"
+          [ -n "$KIMI_API_KEY" ] && engines="$engines,kimi"
+          { [ -n "$GROK_API_KEY" ] || [ -n "$XAI_API_KEY" ]; } && engines="$engines,grok"
+          engines="${engines#,}"
+        fi
+        echo "engines=$engines" >> "$GITHUB_OUTPUT"
+        if [ -z "$engines" ]; then
+          echo "::notice::kyora review: no engine credentials found — seed at least one secret (see action README); skipping review"
+          exit 0
+        fi
+
+        has() { case ",$engines," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+        if has codex; then
+          if [ ! -f "$HOME/.codex/auth.json" ] && [ -n "$CODEX_AUTH_JSON" ]; then
+            mkdir -p "$HOME/.codex"
+            printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+            chmod 600 "$HOME/.codex/auth.json"
+          fi
+          command -v codex >/dev/null 2>&1 || npm install -g @openai/codex
+        fi
+        if has claude || has kimi; then
+          command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
+        fi
+        if has grok; then
+          command -v grok >/dev/null 2>&1 || npm install -g @xai-official/grok
+        fi
+        if has qwen; then
+          command -v qwen >/dev/null 2>&1 || npm install -g @qwen-code/qwen-code
+        fi
+
+    - name: Run review
+      if: steps.setup.outputs.engines != ''
+      shell: bash
+      run: |
+        export GITHUB_TOKEN="${GITHUB_TOKEN:-${{ github.token }}}"
+        args=(review --engines "${{ steps.setup.outputs.engines }}" --fail-on "${{ inputs.fail-on }}")
+        pr="${{ github.event.pull_request.number }}"
+        if [ -n "$pr" ]; then
+          args+=(--pr "$pr")
+          [ "${{ inputs.post }}" = "true" ] && args+=(--post)
+        fi
+        [ "${{ inputs.verify }}" = "true" ] && args+=(--verify)
+        bunx "@kyora-sh/review@${{ inputs.version }}" "${args[@]}"
+
+    - name: Persist refreshed credentials
+      if: always() && inputs.persist-auth == 'true' && steps.setup.outputs.engines != ''
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.codex
+        key: kyora-review-auth-${{ runner.os }}-${{ github.run_id }}

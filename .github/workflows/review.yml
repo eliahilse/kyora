@@ -1,0 +1,29 @@
+name: kyora review
+
+on: pull_request
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: kyora-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./action
+        with:
+          verify: "true"
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.KYORA_CODEX_AUTH }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.KYORA_CLAUDE_TOKEN }}
+          KIMI_API_KEY: ${{ secrets.KYORA_KIMI_KEY }}
+          GROK_API_KEY: ${{ secrets.KYORA_GROK_KEY }}

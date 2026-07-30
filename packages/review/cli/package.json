@@ -1,18 +1,18 @@
 {
-  "name": "@kyora-sh/mcp",
-  "version": "0.0.5",
+  "name": "@kyora-sh/review",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Superhuman debugging for coding agents — +31.63% on SWE-bench Verified, with automatic dependency and doc indexing",
+  "description": "Multi-engine AI code review — your own coding-agent subscriptions (Codex, Claude, Kimi, Grok, Qwen) reviewing PRs together, with consensus filtering and adversarial verification",
   "license": "Elastic-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/eliahilse/kyora",
-    "directory": "packages/mcp"
+    "directory": "packages/review/cli"
   },
   "homepage": "https://kyora.sh",
   "main": "./dist/index.js",
   "bin": {
-    "kyora-mcp": "./dist/index.js"
+    "kyora-review": "./dist/index.js"
   },
   "files": [
     "dist",
@@ -27,12 +27,6 @@
     "test": "bun test",
     "dev": "bun --watch src/index.ts",
     "prepublishOnly": "bun run build"
-  },
-  "dependencies": {
-    "@kyora/db": "workspace:*",
-    "@kyora/nora": "workspace:*",
-    "@kyora/sdk": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
     "@repo/typescript-config": "workspace:*",

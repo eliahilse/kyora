@@ -1,0 +1,42 @@
+{
+  "name": "@kyora-sh/council",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Summon councils of other model families from inside your coding agent — fan out a decision to Codex, Claude, GLM, Grok, Kimi and Qwen, or ask/delegate to one, over MCP",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliahilse/kyora",
+    "directory": "packages/council/mcp"
+  },
+  "homepage": "https://kyora.sh",
+  "main": "./dist/index.js",
+  "bin": {
+    "kyora-council": "./dist/index.js",
+    "kyora-stakes-hook": "./dist/hook.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --minify && bun build ./src/hook.ts --outdir ./dist --target bun --minify && for f in index hook; do printf '#!/usr/bin/env bun\\n' | cat - ./dist/$f.js > ./dist/$f.tmp && mv ./dist/$f.tmp ./dist/$f.js && chmod +x ./dist/$f.js; done",
+    "check-types": "tsc --noEmit",
+    "test": "bun test",
+    "dev": "bun --watch src/index.ts",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@kyora-sh/review": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

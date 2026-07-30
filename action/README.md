@@ -63,7 +63,7 @@ Every engine uses *your* account through *its vendor's own CLI* — that's what 
 | `post` | `true` | post as PR review (inline comments where the finding anchors to the diff) |
 | `fail-on` | `none` | fail the job at/above a severity: `critical`, `major`, `minor`, `nit` |
 | `persist-auth` | `true` | cache rotated credentials between runs |
-| `version` | `latest` | `@kyora-sh/review` version |
+| `version` | `bundled` | run the source shipped with the action (pinned by your `@ref`), or an npm version |
 
 ## Security notes
 

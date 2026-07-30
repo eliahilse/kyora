@@ -21,8 +21,8 @@ inputs:
     description: "Cache refreshed engine credentials between runs so seeded tokens keep working after they rotate (see README for the public-repo caveat)"
     default: "true"
   version:
-    description: "@kyora-sh/review version to run"
-    default: "latest"
+    description: "Which @kyora-sh/review to run: 'bundled' uses the source shipped with the action (pinned by your uses: @ref), or an npm version/tag"
+    default: "bundled"
 
 runs:
   using: "composite"
@@ -91,7 +91,11 @@ runs:
           [ "${{ inputs.post }}" = "true" ] && args+=(--post)
         fi
         [ "${{ inputs.verify }}" = "true" ] && args+=(--verify)
-        bunx "@kyora-sh/review@${{ inputs.version }}" "${args[@]}"
+        if [ "${{ inputs.version }}" = "bundled" ]; then
+          bun "${GITHUB_ACTION_PATH}/../packages/review/cli/src/index.ts" "${args[@]}"
+        else
+          bunx "@kyora-sh/review@${{ inputs.version }}" "${args[@]}"
+        fi
 
     - name: Persist refreshed credentials
       if: always() && inputs.persist-auth == 'true' && steps.setup.outputs.engines != ''

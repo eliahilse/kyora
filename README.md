@@ -131,7 +131,7 @@ Findings cluster by file, overlapping lines, and description similarity, so five
 | `kimi` | Claude Code against Kimi's Anthropic-compatible endpoint | `KIMI_API_KEY` |
 | `glm` | GLM-5.2 via Claude Code against Z.ai's Anthropic-compatible endpoint | `ZAI_API_KEY`, or picked up from `opencode auth login` |
 | `grok` | `grok -p` (grok-4.5, high reasoning effort) | `grok login` (SuperGrok / X Premium+) or `GROK_API_KEY` |
-| `qwen` | `qwen -p` | `qwen` login (Coding Plan) or API key |
+| `qwen` | Qwen (default qwen3.8-max-preview) via Claude Code against the Token Plan Anthropic endpoint | `QWEN_API_KEY` or picked up from `bl config agent` |
 
 Every available engine runs by default; pick explicitly with `--engines codex,kimi`. An engine that's missing, rate-limited, or failing drops out and the review still lands with the rest. If *every* engine fails, the run exits non-zero instead of reporting a clean review.
 

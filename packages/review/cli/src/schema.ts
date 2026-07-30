@@ -9,18 +9,20 @@ export const FINDINGS_SCHEMA = {
     findings: {
       type: "array",
       items: {
+        // OpenAI strict structured outputs (codex --output-schema) reject any
+        // property missing from `required`, so optional fields are nullable
         type: "object",
         additionalProperties: false,
-        required: ["file", "line", "severity", "title", "body"],
+        required: ["file", "line", "endLine", "severity", "category", "title", "body", "suggestion"],
         properties: {
           file: { type: "string", description: "repo-relative path" },
           line: { type: "integer", description: "line number in the NEW version of the file" },
-          endLine: { type: "integer" },
+          endLine: { type: ["integer", "null"] },
           severity: { type: "string", enum: ["critical", "major", "minor", "nit"] },
-          category: { type: "string" },
+          category: { type: ["string", "null"] },
           title: { type: "string", description: "one-line summary of the issue" },
           body: { type: "string", description: "explanation: what breaks, when, and why" },
-          suggestion: { type: "string", description: "replacement code for the flagged lines, if applicable" },
+          suggestion: { type: ["string", "null"], description: "replacement code for the flagged lines, if applicable" },
         },
       },
     },

@@ -15,7 +15,9 @@ const DEFAULTS: ReviewConfig = {
   post: false,
   base: "main",
   failOn: "none",
-  maxDiffBytes: 300_000,
+  // Linux caps a single execve argument at 128 KiB and the prompt travels as
+  // one argv element, so the diff must stay comfortably below that
+  maxDiffBytes: 100_000,
   timeoutMs: 900_000,
   maxFindingsPerEngine: 20,
   overrides: {},
@@ -149,6 +151,13 @@ async function review(flags: Flags): Promise<void> {
       return { engine: engine.id, ok: true, findings, durationMs: raw.durationMs }
     }),
   )
+
+  if (runs.every((run) => !run.ok)) {
+    log("every engine failed — refusing to report a clean review")
+    for (const run of runs) log(`  ${run.engine}: ${run.error}`)
+    process.exitCode = 2
+    return
+  }
 
   let merged = mergeFindings(runs.flatMap((run) => run.findings))
   if (config.verify && selected.length > 1 && merged.some((finding) => finding.tier === "single")) {

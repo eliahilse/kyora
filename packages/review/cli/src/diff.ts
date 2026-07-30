@@ -77,7 +77,7 @@ export function parseCommentableLines(diff: string): Map<string, Set<number>> {
       inHunk = false
       continue
     }
-    if (line.startsWith("+") || line.startsWith(" ") || line === "") {
+    if (line.startsWith("+") || line.startsWith(" ")) {
       let lines = result.get(file)
       if (!lines) {
         lines = new Set()

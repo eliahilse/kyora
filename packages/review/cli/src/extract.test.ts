@@ -55,6 +55,16 @@ describe("extractFindings", () => {
     expect(findings[0]!.severity).toBe("critical")
   })
 
+  test("treats null optional fields as absent", () => {
+    const raw = JSON.stringify({
+      findings: [{ file: "a.ts", line: 3, endLine: null, severity: "major", category: null, title: "T", body: "B", suggestion: null }],
+    })
+    const findings = extractFindings(raw, "codex", 20)
+    expect(findings).toHaveLength(1)
+    expect(findings[0]!).not.toHaveProperty("endLine")
+    expect(findings[0]!).not.toHaveProperty("suggestion")
+  })
+
   test("drops malformed findings and honors the limit", () => {
     const raw = JSON.stringify({
       findings: [

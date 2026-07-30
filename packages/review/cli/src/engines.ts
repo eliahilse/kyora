@@ -123,8 +123,13 @@ export async function runEngineRaw(
 
     const bin = override?.bin ?? engine.bin
     const argTemplate = override?.args ?? engine.args
+    // replacer functions disable $-pattern interpretation, and {prompt} goes
+    // last so diff content is never rescanned for the other tokens
     const args = argTemplate.map((arg) =>
-      arg.replace("{prompt}", prompt).replace("{schema}", schemaPath).replace("{out}", outPath),
+      arg
+        .replace("{schema}", () => schemaPath)
+        .replace("{out}", () => outPath)
+        .replace("{prompt}", () => prompt),
     )
 
     const env: Record<string, string> = {}

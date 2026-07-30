@@ -32,7 +32,8 @@ describe("parseCommentableLines", () => {
     const lines = parseCommentableLines(DIFF)
     // context @8, added @9, added @10, context @11 — removed line has no new-side number
     expect([...lines.get("src/a.ts")!].sort((a, b) => a - b)).toEqual([8, 9, 10, 11])
-    expect(lines.get("src/b.ts")!.has(2)).toBe(true)
+    // exact set: no phantom anchor past the last line (trailing "" from split)
+    expect([...lines.get("src/b.ts")!].sort((a, b) => a - b)).toEqual([1, 2, 3])
   })
 
   test("ignores deleted files", () => {

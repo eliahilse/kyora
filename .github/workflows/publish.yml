@@ -18,7 +18,6 @@ jobs:
       matrix:
         package:
           - state/mcp
-          - review/cli
     steps:
       - uses: actions/checkout@v4
 

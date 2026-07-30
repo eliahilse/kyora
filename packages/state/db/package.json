@@ -15,7 +15,7 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "check-types": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test --pass-with-no-tests"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.2.0",

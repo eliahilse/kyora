@@ -1,16 +1,16 @@
 # kyora
 
-Queryable temporal runtime state for coding agents.
+Tools that make coding agents trustworthy — by grounding them in what actually happens: at runtime, and in review.
+
+Two products, one repo:
+
+## kyora state — queryable temporal runtime state
 
 Records state mutations, function calls, HTTP traffic, and errors over time, then exposes it all via MCP so agents can query what actually happened at runtime. Also indexes dependencies and docs semantically, minimizing hallucinations.
-
-## Quick start
 
 ```bash
 bunx @kyora-sh/mcp
 ```
-
-Add to `.claude/settings.json`:
 
 ```json
 {
@@ -24,64 +24,31 @@ Add to `.claude/settings.json`:
 }
 ```
 
-## Instrumentation
+Instrument with `@kyora/sdk` (`watch`, `trace`, auto-patching of fetch/console/errors, Bun plugin for annotation-driven instrumentation) and query it back through MCP tools (`kyora_query_state`, `kyora_get_recent_errors`, `kyora_get_http_log`, semantic doc search). Full docs: [`packages/state`](packages/state).
 
-```ts
-import { init, watch, trace } from "@kyora/sdk"
+## kyora review — multi-engine code review on your own subscriptions
 
-init({ dataDir: ".kyora" })
+Codex, Claude Code, Kimi, Grok, and Qwen reviewing the same PR together — each vendor's own CLI, headless, under your login, inside the checkout so it can verify claims against real code. Findings merge with consensus ranking; single-engine findings can be adversarially cross-verified by another engine before they reach you.
 
-// track state over time
-const cart = watch({ items: [], total: 0 }, "cart")
-cart.items.push({ name: "Widget", price: 9.99 })
-
-// record function calls (args, return values, errors, timing)
-const fetchUsers = trace(async function fetchUsers() {
-  return (await fetch("/api/users")).json()
-}, "fetchUsers")
+```bash
+bunx @kyora-sh/review doctor          # which engines are ready
+bunx @kyora-sh/review --pr 123 --post # panel-review a PR
 ```
 
-`init()` automatically patches `fetch`, `console`, and error handlers.
+CI: one workflow + your subscription tokens as repo secrets, auto-refreshed. See [`action/README.md`](action/README.md) and [`packages/review/cli`](packages/review/cli).
 
-### Auto-instrumentation (Bun plugin)
-
-```toml
-# bunfig.toml
-preload = ["@kyora/sdk/plugin"]
-```
-
-```ts
-// @kyora.watch
-const state = { count: 0, users: [] }
-
-// @kyora.trace
-async function loadUsers() {
-  state.users = await (await fetch("/api/users")).json()
-}
-```
-
-Transforms at load time, no manual wrapping.
-
-## MCP tools
-
-| Tool | Description |
-|------|-------------|
-| `kyora_query_state` | query state snapshots over time |
-| `kyora_get_recent_errors` | recent errors with stack traces |
-| `kyora_get_http_log` | HTTP requests and responses |
-| `kyora_search_docs` | semantic search across indexed docs |
-| `kyora_list_indexed` | list indexed documentation sources |
-| `nora_index_source` | index npm packages, URLs, or local files |
-| `kyora_index_status` | check indexing progress |
-
-## Packages
+## Layout
 
 ```
-packages/mcp   @kyora-sh/mcp   MCP server (published)
-packages/sdk   @kyora/sdk      instrumentation (watch, trace, auto-patching)
-packages/nora  @kyora/nora     semantic doc indexing + search (local embeddings)
-packages/db    @kyora/db       embedded PostgreSQL (PGLite) + vector search
-apps/eval                      demo server
+packages/state/sdk      @kyora/sdk        instrumentation (watch, trace, auto-patching)
+packages/state/mcp      @kyora-sh/mcp     MCP server (published)
+packages/state/nora     @kyora/nora       semantic doc indexing + search (local embeddings)
+packages/state/db       @kyora/db         embedded PostgreSQL (PGLite) + vector search
+packages/review/cli     @kyora-sh/review  multi-engine review CLI (published)
+packages/tooling/*                        shared eslint/tsconfig
+action/                                   GitHub Action for kyora review
+apps/reckon                               SWE-bench-style eval harness
+apps/test                                 demo server
 ```
 
 ## Development

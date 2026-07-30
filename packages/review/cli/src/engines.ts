@@ -1,0 +1,171 @@
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { EngineOverride, ReviewConfig } from "./types"
+
+export interface EngineDef {
+  id: string
+  label: string
+  bin: string
+  /** env vars that must all be present for this engine to be selectable */
+  requiresEnv?: string[]
+  /** tokens {prompt} {schema} {out} are substituted; first element is replaced by the resolved bin */
+  args: string[]
+  env?: () => Record<string, string | undefined>
+  /** engine writes its final message to the {out} file instead of stdout */
+  readsOutFile?: boolean
+  authHint: string
+}
+
+const CLAUDE_ARGS = [
+  "-p",
+  "{prompt}",
+  "--output-format",
+  "json",
+  "--max-turns",
+  "40",
+  "--allowedTools",
+  "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(ls:*)",
+]
+
+export const ENGINES: EngineDef[] = [
+  {
+    id: "codex",
+    label: "Codex (OpenAI)",
+    bin: "codex",
+    args: ["exec", "--sandbox", "read-only", "--output-schema", "{schema}", "-o", "{out}", "{prompt}"],
+    readsOutFile: true,
+    authHint: "run `codex login` (ChatGPT subscription) or set OPENAI_API_KEY — CI: seed the CODEX_AUTH_JSON secret",
+  },
+  {
+    id: "claude",
+    label: "Claude Code (Anthropic)",
+    bin: "claude",
+    args: CLAUDE_ARGS,
+    authHint: "log in once via `claude`, or set CLAUDE_CODE_OAUTH_TOKEN (created with `claude setup-token`)",
+  },
+  {
+    id: "kimi",
+    label: "Kimi (Moonshot, via Claude Code)",
+    bin: "claude",
+    requiresEnv: ["KIMI_API_KEY"],
+    args: CLAUDE_ARGS,
+    env: () => ({
+      ANTHROPIC_BASE_URL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.ai/anthropic",
+      ANTHROPIC_AUTH_TOKEN: process.env.KIMI_API_KEY,
+      ANTHROPIC_MODEL: process.env.KIMI_MODEL ?? "kimi-k3",
+      // a stray ANTHROPIC_API_KEY conflicts with ANTHROPIC_AUTH_TOKEN and breaks the connection
+      ANTHROPIC_API_KEY: undefined,
+    }),
+    authHint: "set KIMI_API_KEY (Kimi membership / platform.kimi.ai); optional KIMI_BASE_URL, KIMI_MODEL",
+  },
+  {
+    id: "grok",
+    label: "Grok Build (xAI)",
+    bin: "grok",
+    args: ["-p", "{prompt}", "--output-format", "json", "--json-schema", "{schema}"],
+    authHint: "log in via the `grok` TUI, or set GROK_API_KEY / XAI_API_KEY (console.x.ai)",
+  },
+  {
+    id: "qwen",
+    label: "Qwen Code (Alibaba)",
+    bin: "qwen",
+    args: ["-p", "{prompt}"],
+    authHint: "run `qwen` once to log in (Coding Plan), or configure an API key per qwen-code docs",
+  },
+]
+
+export function engineById(id: string): EngineDef | undefined {
+  return ENGINES.find((engine) => engine.id === id)
+}
+
+export interface EngineStatus {
+  engine: EngineDef
+  available: boolean
+  reason: string
+}
+
+export function engineStatus(engine: EngineDef, override: EngineOverride | undefined): EngineStatus {
+  const bin = override?.bin ?? engine.bin
+  if (!Bun.which(bin)) {
+    return { engine, available: false, reason: `\`${bin}\` not on PATH` }
+  }
+  for (const name of engine.requiresEnv ?? []) {
+    if (!process.env[name]) {
+      return { engine, available: false, reason: `${name} not set` }
+    }
+  }
+  return { engine, available: true, reason: "ready" }
+}
+
+export interface RawRun {
+  ok: boolean
+  raw: string
+  error?: string
+  durationMs: number
+}
+
+/** Run an engine CLI headless in the repo checkout and capture whatever it printed. */
+export async function runEngineRaw(
+  engine: EngineDef,
+  prompt: string,
+  schema: unknown,
+  cwd: string,
+  config: ReviewConfig,
+): Promise<RawRun> {
+  const override = config.overrides[engine.id]
+  const started = Date.now()
+  const workDir = await mkdtemp(join(tmpdir(), `kyora-review-${engine.id}-`))
+  try {
+    const schemaPath = join(workDir, "schema.json")
+    const outPath = join(workDir, "out.json")
+    await Bun.write(schemaPath, JSON.stringify(schema))
+
+    const bin = override?.bin ?? engine.bin
+    const argTemplate = override?.args ?? engine.args
+    const args = argTemplate.map((arg) =>
+      arg.replace("{prompt}", prompt).replace("{schema}", schemaPath).replace("{out}", outPath),
+    )
+
+    const env: Record<string, string> = {}
+    for (const [key, value] of Object.entries({ ...process.env, ...engine.env?.(), ...override?.env })) {
+      if (value !== undefined) env[key] = value
+    }
+
+    const proc = Bun.spawn({ cmd: [bin, ...args], cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      proc.kill()
+    }, config.timeoutMs)
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    clearTimeout(timer)
+
+    let raw = stdout
+    if (engine.readsOutFile) {
+      const outFile = Bun.file(outPath)
+      if (await outFile.exists()) {
+        const content = (await outFile.text()).trim()
+        if (content) raw = `${content}\n${stdout}`
+      }
+    }
+
+    const durationMs = Date.now() - started
+    if (timedOut) {
+      return { ok: false, raw, error: `timed out after ${Math.round(config.timeoutMs / 1000)}s`, durationMs }
+    }
+    if (exitCode !== 0 && !raw.trim()) {
+      const tail = stderr.trim().split("\n").slice(-4).join("\n")
+      return { ok: false, raw, error: `exit ${exitCode}: ${tail || "no output"}`, durationMs }
+    }
+    return { ok: true, raw, durationMs }
+  } catch (error) {
+    return { ok: false, raw: "", error: String(error), durationMs: Date.now() - started }
+  } finally {
+    await rm(workDir, { recursive: true, force: true })
+  }
+}

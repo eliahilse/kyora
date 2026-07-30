@@ -1,5 +1,6 @@
 {
   "lockfileVersion": 1,
+  "configVersion": 0,
   "workspaces": {
     "": {
       "name": "kyora-turbo",
@@ -23,7 +24,19 @@
         "@kyora/sdk": "workspace:*",
       },
     },
-    "packages/db": {
+    "packages/review/cli": {
+      "name": "@kyora-sh/review",
+      "version": "0.1.0",
+      "bin": {
+        "kyora-review": "./dist/index.js",
+      },
+      "devDependencies": {
+        "@repo/typescript-config": "workspace:*",
+        "@types/bun": "latest",
+        "typescript": "^5.9.2",
+      },
+    },
+    "packages/state/db": {
       "name": "@kyora/db",
       "version": "0.0.1",
       "dependencies": {
@@ -37,24 +50,7 @@
         "typescript": "^5.9.2",
       },
     },
-    "packages/eslint-config": {
-      "name": "@repo/eslint-config",
-      "version": "0.0.0",
-      "devDependencies": {
-        "@eslint/js": "^9.39.1",
-        "@next/eslint-plugin-next": "^15.5.0",
-        "eslint": "^9.39.1",
-        "eslint-config-prettier": "^10.1.1",
-        "eslint-plugin-only-warn": "^1.1.0",
-        "eslint-plugin-react": "^7.37.5",
-        "eslint-plugin-react-hooks": "^5.2.0",
-        "eslint-plugin-turbo": "^2.7.1",
-        "globals": "^16.5.0",
-        "typescript": "^5.9.2",
-        "typescript-eslint": "^8.50.0",
-      },
-    },
-    "packages/mcp": {
+    "packages/state/mcp": {
       "name": "@kyora-sh/mcp",
       "version": "0.0.5",
       "bin": {
@@ -72,7 +68,7 @@
         "typescript": "^5.9.2",
       },
     },
-    "packages/nora": {
+    "packages/state/nora": {
       "name": "@kyora/nora",
       "version": "0.0.1",
       "dependencies": {
@@ -86,7 +82,7 @@
         "typescript": "^5.9.2",
       },
     },
-    "packages/sdk": {
+    "packages/state/sdk": {
       "name": "@kyora/sdk",
       "version": "0.0.1",
       "dependencies": {
@@ -98,7 +94,24 @@
         "typescript": "^5.9.2",
       },
     },
-    "packages/typescript-config": {
+    "packages/tooling/eslint-config": {
+      "name": "@repo/eslint-config",
+      "version": "0.0.0",
+      "devDependencies": {
+        "@eslint/js": "^9.39.1",
+        "@next/eslint-plugin-next": "^15.5.0",
+        "eslint": "^9.39.1",
+        "eslint-config-prettier": "^10.1.1",
+        "eslint-plugin-only-warn": "^1.1.0",
+        "eslint-plugin-react": "^7.37.5",
+        "eslint-plugin-react-hooks": "^5.2.0",
+        "eslint-plugin-turbo": "^2.7.1",
+        "globals": "^16.5.0",
+        "typescript": "^5.9.2",
+        "typescript-eslint": "^8.50.0",
+      },
+    },
+    "packages/tooling/typescript-config": {
       "name": "@repo/typescript-config",
       "version": "0.0.0",
     },
@@ -244,15 +257,17 @@
 
     "@isaacs/fs-minipass": ["@isaacs/fs-minipass@4.0.1", "", { "dependencies": { "minipass": "^7.0.4" } }, "sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w=="],
 
-    "@kyora-sh/mcp": ["@kyora-sh/mcp@workspace:packages/mcp"],
+    "@kyora-sh/mcp": ["@kyora-sh/mcp@workspace:packages/state/mcp"],
 
-    "@kyora/db": ["@kyora/db@workspace:packages/db"],
+    "@kyora-sh/review": ["@kyora-sh/review@workspace:packages/review/cli"],
 
-    "@kyora/nora": ["@kyora/nora@workspace:packages/nora"],
+    "@kyora/db": ["@kyora/db@workspace:packages/state/db"],
+
+    "@kyora/nora": ["@kyora/nora@workspace:packages/state/nora"],
 
     "@kyora/reckon": ["@kyora/reckon@workspace:apps/reckon"],
 
-    "@kyora/sdk": ["@kyora/sdk@workspace:packages/sdk"],
+    "@kyora/sdk": ["@kyora/sdk@workspace:packages/state/sdk"],
 
     "@kyora/test": ["@kyora/test@workspace:apps/test"],
 
@@ -288,11 +303,11 @@
 
     "@protobufjs/utf8": ["@protobufjs/utf8@1.1.0", "", {}, "sha512-Vvn3zZrhQZkkBE8LSuW3em98c0FwgO4nxzv6OdSxPKJIEKY2bGbHn+mhGIPerzI4twdxaP8/0+06HBpwf345Lw=="],
 
-    "@repo/eslint-config": ["@repo/eslint-config@workspace:packages/eslint-config"],
+    "@repo/eslint-config": ["@repo/eslint-config@workspace:packages/tooling/eslint-config"],
 
-    "@repo/typescript-config": ["@repo/typescript-config@workspace:packages/typescript-config"],
+    "@repo/typescript-config": ["@repo/typescript-config@workspace:packages/tooling/typescript-config"],
 
-    "@types/bun": ["@types/bun@1.3.11", "", { "dependencies": { "bun-types": "1.3.11" } }, "sha512-5vPne5QvtpjGpsGYXiFyycfpDF2ECyPcTSsFBMa0fraoxiQyMJ3SmuQIGhzPg2WJuWxVBoxWJ2kClYTcw/4fAg=="],
+    "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 
     "@types/estree": ["@types/estree@1.0.8", "", {}, "sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w=="],
 
@@ -364,7 +379,7 @@
 
     "buffer-from": ["buffer-from@1.1.2", "", {}, "sha512-E+XQCRwSbaaiChtv6k6Dwgc+bx+Bs6vuKJHHl5kox/BaKbhiXzqQOwK4cO22yElGp2OCmjwVhT3HmxgyPGnJfQ=="],
 
-    "bun-types": ["bun-types@1.3.11", "", { "dependencies": { "@types/node": "*" } }, "sha512-1KGPpoxQWl9f6wcZh57LvrPIInQMn2TQ7jsgxqpRzg+l0QPOFvJVH7HmvHo/AiPgwXy+/Thf6Ov3EdVn1vOabg=="],
+    "bun-types": ["bun-types@1.3.14", "", { "dependencies": { "@types/node": "*" } }, "sha512-4N0ig0fEomHt5R0KCFWjovxow98rIoRwKolrYdCcknNwMekCXRnWEUvgu5soYV8QXtVsrUD8B95MBOZGPvr6KQ=="],
 
     "bytes": ["bytes@3.1.2", "", {}, "sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg=="],
 
@@ -960,10 +975,6 @@
 
     "@eslint/eslintrc/globals": ["globals@14.0.0", "", {}, "sha512-oahGvuMGQlPw/ivIYBjVSrWAfWLBeku5tpPE2fOPLi+WHffIWbuh2tCjhyQhTBPMf5E9jDEH4FOmTYgYwbKwtQ=="],
 
-    "@kyora/db/@types/bun": ["@types/bun@1.3.12", "", { "dependencies": { "bun-types": "1.3.12" } }, "sha512-DBv81elK+/VSwXHDlnH3Qduw+KxkTIWi7TXkAeh24zpi5l0B2kUg9Ga3tb4nJaPcOFswflgi/yAvMVBPrxMB+A=="],
-
-    "@kyora/sdk/@types/bun": ["@types/bun@1.3.12", "", { "dependencies": { "bun-types": "1.3.12" } }, "sha512-DBv81elK+/VSwXHDlnH3Qduw+KxkTIWi7TXkAeh24zpi5l0B2kUg9Ga3tb4nJaPcOFswflgi/yAvMVBPrxMB+A=="],
-
     "@typescript-eslint/eslint-plugin/ignore": ["ignore@7.0.5", "", {}, "sha512-Hs59xBNfUIunMFgWAbGX5cq6893IbWg4KnrjbYwX3tx0ztorVgTDA6B2sxf8ejHJ4wz8BqGUMYlnzNBer5NvGg=="],
 
     "@typescript-eslint/typescript-estree/minimatch": ["minimatch@10.2.4", "", { "dependencies": { "brace-expansion": "^5.0.2" } }, "sha512-oRjTw/97aTBN0RHbYCdtF1MQfvusSIBQM0IZEgzl6426+8jSC0nF1a/GmnVLpfB9yyr6g6FTqWqiZVbxrtaCIg=="],
@@ -1033,10 +1044,6 @@
     "@esbuild-kit/core-utils/esbuild/@esbuild/win32-x64": ["@esbuild/win32-x64@0.18.20", "", { "os": "win32", "cpu": "x64" }, "sha512-kTdfRcSiDfQca/y9QIkng02avJ+NCaQvrMejlsB3RRv5sE9rRoeBPISaZpKxHELzRxZyLvNts1P27W3wV+8geQ=="],
 
     "@eslint/eslintrc/ajv/json-schema-traverse": ["json-schema-traverse@0.4.1", "", {}, "sha512-xbbCH5dCYU5T8LcEhhuh7HJ88HXuW3qsI3Y0zOZFKfZEHcpWiHU/Jxzk629Brsab/mMiHQti9wMP+845RPe3Vg=="],
-
-    "@kyora/db/@types/bun/bun-types": ["bun-types@1.3.12", "", { "dependencies": { "@types/node": "*" } }, "sha512-HqOLj5PoFajAQciOMRiIZGNoKxDJSr6qigAttOX40vJuSp6DN/CxWp9s3C1Xwm4oH7ybueITwiaOcWXoYVoRkA=="],
-
-    "@kyora/sdk/@types/bun/bun-types": ["bun-types@1.3.12", "", { "dependencies": { "@types/node": "*" } }, "sha512-HqOLj5PoFajAQciOMRiIZGNoKxDJSr6qigAttOX40vJuSp6DN/CxWp9s3C1Xwm4oH7ybueITwiaOcWXoYVoRkA=="],
 
     "@typescript-eslint/typescript-estree/minimatch/brace-expansion": ["brace-expansion@5.0.4", "", { "dependencies": { "balanced-match": "^4.0.2" } }, "sha512-h+DEnpVvxmfVefa4jFbCf5HdH5YMDXRsmKflpf1pILZWRFlTbJpxeU55nJl4Smt5HQaGzg1o6RHFPJaOqnmBDg=="],
 

@@ -85,7 +85,7 @@ async function runTask(name: string, dir: string, mode: "kyora" | "blind"): Prom
   }
   if (mode === "kyora") {
     pkgJson.dependencies = source === "local"
-      ? { "@kyora/sdk": `file:${import.meta.dir}/../../../packages/sdk` }
+      ? { "@kyora/sdk": `file:${import.meta.dir}/../../../packages/state/sdk` }
       : { "@kyora-sh/sdk": "latest" }
   }
   await Bun.write(`${tmpDir}/package.json`, JSON.stringify(pkgJson, null, 2))
@@ -118,7 +118,7 @@ Tests are hidden. Reading code alone WILL NOT reveal all bugs.`
     : `Fix the MULTIPLE bugs in code.ts. Read README.md for symptoms. Tests are hidden — run \`bun code.ts\` to see program output and iterate.`
 
   const kyoraServer = source === "local"
-    ? { command: "bun", args: [`${import.meta.dir}/../../../packages/mcp/src/index.ts`], env: { KYORA_DATA_DIR: `${tmpDir}/.kyora` } }
+    ? { command: "bun", args: [`${import.meta.dir}/../../../packages/state/mcp/src/index.ts`], env: { KYORA_DATA_DIR: `${tmpDir}/.kyora` } }
     : { command: "bunx", args: ["@kyora-sh/mcp"], env: { KYORA_DATA_DIR: `${tmpDir}/.kyora` } }
 
   let execCmd: string[]
@@ -146,7 +146,7 @@ Tests are hidden. Reading code alone WILL NOT reveal all bugs.`
     await Bun.$`cp ${userCodexHome}/auth.json ${codexHome}/auth.json`.quiet().nothrow()
     const bunPath = (await Bun.$`which bun`.text()).trim() || "bun"
     const kyoraServerFast = source === "local"
-      ? { command: bunPath, args: [`${import.meta.dir}/../../../packages/mcp/src/index.ts`], env: { KYORA_DATA_DIR: `${tmpDir}/.kyora` } }
+      ? { command: bunPath, args: [`${import.meta.dir}/../../../packages/state/mcp/src/index.ts`], env: { KYORA_DATA_DIR: `${tmpDir}/.kyora` } }
       : { command: bunPath, args: ["x", "@kyora-sh/mcp"], env: { KYORA_DATA_DIR: `${tmpDir}/.kyora` } }
     const configToml = [
       `sandbox_mode = "danger-full-access"`,

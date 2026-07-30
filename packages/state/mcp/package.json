@@ -1,0 +1,42 @@
+{
+  "name": "@kyora-sh/mcp",
+  "version": "0.0.5",
+  "type": "module",
+  "description": "Superhuman debugging for coding agents — +31.63% on SWE-bench Verified, with automatic dependency and doc indexing",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliahilse/kyora",
+    "directory": "packages/state/mcp"
+  },
+  "homepage": "https://kyora.sh",
+  "main": "./dist/index.js",
+  "bin": {
+    "kyora-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --minify && printf '#!/usr/bin/env bun\\n' | cat - ./dist/index.js > ./dist/tmp.js && mv ./dist/tmp.js ./dist/index.js && chmod +x ./dist/index.js",
+    "check-types": "tsc --noEmit",
+    "test": "bun test --pass-with-no-tests",
+    "dev": "bun --watch src/index.ts",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@kyora/db": "workspace:*",
+    "@kyora/nora": "workspace:*",
+    "@kyora/sdk": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

@@ -13,7 +13,14 @@ Your agent is one lineage with one set of blind spots. This gives it a way to as
 | `council_ask` | one specific family's perspective, read-only |
 | `council_task` | delegate concrete work to one family (`write: true` lets it edit files) |
 | `council_result` | collect a background council or task by job id |
+| `agent_spawn` | spawn a subagent from another family — you don't pick who, the least-spent capable family is chosen |
+| `agent_fanout` | several *different* tasks in parallel, one per family |
+| `council_models` | which families are summonable, and the models and efforts each accepts |
 | `council_status` | who can be summoned right now, with remaining quota |
+
+`agent_spawn` is the plain subagent shape: hand it a task, get a worker from a different lineage on a separate subscription. `council_*` is for opinions on one question; `agent_*` is for work.
+
+Every delegation tool takes optional `model` and `effort`. Models are passed straight through to the vendor CLI, so newer ids work before this package knows about them — `council_models` lists what each family is known to accept (for Codex, whatever your own `~/.codex/config.toml` is set to).
 
 Councils are quota-aware: members are seated highest-remaining-quota first, engines that are cooling down or exhausted are never summoned, and `size` caps a council so one question doesn't spend every subscription.
 

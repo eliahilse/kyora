@@ -33,15 +33,16 @@ export const metadata: Metadata = {
     siteName: "Kyora",
     title,
     description,
-    images: [{ url: "/og", width: 1200, height: 630, alt: title }],
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: title }],
   },
   twitter: {
     card: "summary_large_image",
     title,
     description,
     creator: "@eliahilse",
-    images: ["/og"],
+    images: ["/og.png"],
   },
+  icons: { icon: "/icon.svg" },
   robots: {
     index: true,
     follow: true,

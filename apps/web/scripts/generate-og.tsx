@@ -2,8 +2,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ImageResponse } from "@takumi-rs/image-response";
 
-export const dynamic = "force-static";
-export const revalidate = false;
 
 const GLYPHS = " .·:-=+*ox#%@";
 const COLS = 50;
@@ -62,6 +60,7 @@ function fieldAt(col: number, row: number): number {
 }
 
 const FONT_PATH = "geist/dist/fonts/geist-pixel/GeistPixel-Square.woff2";
+const OUT = join(import.meta.dir, "..", "public", "og.png");
 
 /** geist's exports map blocks deep paths under Node, so read the file directly. */
 function pixelFont(): Uint8Array | null {
@@ -72,7 +71,7 @@ function pixelFont(): Uint8Array | null {
   return null;
 }
 
-export function GET() {
+function card() {
   const cells = [];
   for (let row = 0; row < ROWS; row++) {
     for (let col = 0; col < COLS; col++) {
@@ -161,3 +160,10 @@ export function GET() {
     },
   );
 }
+
+const response = card();
+const bytes = new Uint8Array(await response.arrayBuffer());
+if (bytes.length < 1000) throw new Error(`og render produced ${bytes.length} bytes`);
+if (!pixelFont()) throw new Error("pixel font not found — og would render in a fallback face");
+await Bun.write(OUT, bytes);
+console.log(`wrote ${OUT} (${bytes.length} bytes)`);

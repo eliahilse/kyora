@@ -129,20 +129,20 @@ export function GET() {
             gap: 24,
           }}
         >
-          <div style={{ fontSize: 96, color: "#fff", letterSpacing: -1 }}>Kyora</div>
-          <div style={{ fontSize: 26, color: "rgba(255,255,255,0.6)" }}>
+          <div style={{ fontSize: 132, color: "#fff", letterSpacing: -1 }}>Kyora</div>
+          <div style={{ fontSize: 37, color: "rgba(255,255,255,0.68)" }}>
             Unlocking the full potential of coding agents.
           </div>
-          <div style={{ display: "flex", gap: 12, marginTop: 30 }}>
+          <div style={{ display: "flex", gap: 14, marginTop: 34 }}>
             {["state", "review", "council"].map((name) => (
               <div
                 key={name}
                 style={{
                   display: "flex",
-                  fontSize: 17,
-                  color: "rgba(255,255,255,0.72)",
+                  fontSize: 24,
+                  color: "rgba(255,255,255,0.78)",
                   letterSpacing: 3,
-                  padding: "9px 20px",
+                  padding: "12px 26px",
                   border: "1px solid rgba(255,255,255,0.16)",
                 }}
               >

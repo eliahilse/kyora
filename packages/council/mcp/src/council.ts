@@ -8,9 +8,13 @@ import {
   runEngineRaw,
   type EngineDef,
   type EngineMode,
+  type RunOptions,
 } from "@kyora-sh/review/engines"
 import { cooldownRemainingMs, lastRunAt, loadUsage } from "@kyora-sh/review/usage"
 import type { ReviewConfig } from "@kyora-sh/review/types"
+import { assignTasks, type DelegatedTask } from "./assign"
+
+export type { DelegatedTask }
 
 export const RUN_CONFIG: ReviewConfig = {
   engines: ["auto"],
@@ -36,6 +40,28 @@ export interface EngineHealth {
   writeCapable: boolean
 }
 
+export interface EngineCatalogEntry {
+  id: string
+  label: string
+  available: boolean
+  models: string[]
+  defaultModel: string | null
+  supportsEffort: boolean
+  writeCapable: boolean
+}
+
+export function engineCatalog(): EngineCatalogEntry[] {
+  return ENGINES.map((engine) => ({
+    id: engine.id,
+    label: engine.label,
+    available: engineStatus(engine, undefined).available,
+    models: engine.models ?? [],
+    defaultModel: engine.models?.[0] ?? null,
+    supportsEffort: Boolean(engine.effortArgs),
+    writeCapable: Boolean(engine.argsWrite),
+  }))
+}
+
 export async function councilStatus(): Promise<EngineHealth[]> {
   const usage = loadUsage()
   return Promise.all(
@@ -56,7 +82,7 @@ export async function councilStatus(): Promise<EngineHealth[]> {
 }
 
 /** Engines that can actually be spent right now, cheapest-to-quota first. */
-export async function healthyEngines(requested?: string[], mode: EngineMode = "read"): Promise<EngineDef[]> {
+export async function healthyEngines(requested?: string[], mode: EngineMode = "chat"): Promise<EngineDef[]> {
   const usage = loadUsage()
   const pool = requested?.length
     ? requested.map((id) => engineById(id.trim())).filter((engine): engine is EngineDef => Boolean(engine))
@@ -101,6 +127,7 @@ ${task}`
 
 export interface EngineReply {
   engine: string
+  model?: string
   ok: boolean
   text: string
   durationMs: number
@@ -138,11 +165,12 @@ export async function askEngine(
   engine: EngineDef,
   prompt: string,
   cwd: string,
-  mode: EngineMode = "read",
+  options: RunOptions = {},
 ): Promise<EngineReply> {
-  const run = await runEngineRaw(engine, prompt, {}, cwd, RUN_CONFIG, mode)
+  const run = await runEngineRaw(engine, prompt, {}, cwd, RUN_CONFIG, { mode: "chat", ...options })
   return {
     engine: engine.id,
+    ...(options.model ? { model: options.model } : {}),
     ok: run.ok,
     text: run.ok ? cleanText(run.raw) : (run.error ?? "failed"),
     durationMs: run.durationMs,
@@ -156,6 +184,7 @@ export async function convene(opts: {
   engines?: string[]
   size?: number
   cwd: string
+  effort?: string
 }): Promise<{ replies: EngineReply[]; skipped: string[] }> {
   const available = await healthyEngines(opts.engines)
   const size = opts.size && opts.size > 0 ? opts.size : available.length
@@ -165,12 +194,63 @@ export async function convene(opts: {
   )
   if (seated.length === 0) return { replies: [], skipped }
   const prompt = ASK_PROMPT(opts.question, opts.context)
-  const replies = await Promise.all(seated.map((engine) => askEngine(engine, prompt, opts.cwd)))
+  const replies = await Promise.all(
+    seated.map((engine) =>
+      askEngine(engine, prompt, opts.cwd, { mode: "chat", ...(opts.effort ? { effort: opts.effort } : {}) }),
+    ),
+  )
   return { replies, skipped }
 }
 
 export function askPrompt(question: string, context?: string): string {
   return ASK_PROMPT(question, context)
+}
+
+/**
+ * Pick a delegate without the caller naming one: honor a preference when that
+ * engine is actually spendable, otherwise take whoever has the most headroom.
+ */
+export async function pickEngine(prefer: string | undefined, mode: EngineMode): Promise<EngineDef | null> {
+  if (prefer) {
+    const preferred = await healthyEngines([prefer], mode)
+    if (preferred.length > 0) return preferred[0]!
+  }
+  const pool = await healthyEngines(undefined, mode)
+  return pool[0] ?? null
+}
+
+export interface FanoutResult extends EngineReply {
+  task: string
+}
+
+/**
+ * Distinct tasks in parallel across distinct families — a worker pool rather
+ * than a council. Each task goes to a different engine where supply allows, so
+ * one subscription does not absorb the whole batch.
+ */
+export async function fanout(opts: {
+  tasks: DelegatedTask[]
+  write?: boolean
+  cwd: string
+}): Promise<{ results: FanoutResult[]; unassigned: string[] }> {
+  const mode: EngineMode = opts.write ? "write" : "chat"
+  const pool = await healthyEngines(undefined, mode)
+  const { assignments, unassigned } = assignTasks(
+    opts.tasks,
+    pool.map((engine) => engine.id),
+  )
+  const results = await Promise.all(
+    assignments.map(async ({ task, engine }) => ({
+      task: task.task,
+      ...(await askEngine(
+        pool.find((candidate) => candidate.id === engine)!,
+        TASK_PROMPT(task.task, task.context, Boolean(opts.write)),
+        opts.cwd,
+        { mode, ...(task.model ? { model: task.model } : {}), ...(task.effort ? { effort: task.effort } : {}) },
+      )),
+    })),
+  )
+  return { results, unassigned }
 }
 
 export function taskPrompt(task: string, context: string | undefined, write: boolean): string {

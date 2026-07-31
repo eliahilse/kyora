@@ -7,9 +7,12 @@ import {
   askPrompt,
   convene,
   councilStatus,
+  engineCatalog,
+  fanout,
   healthyEngines,
   loadJob,
   newJobId,
+  pickEngine,
   saveJob,
   summarizeReplies,
   taskPrompt,
@@ -32,10 +35,11 @@ server.tool(
     context: z.string().optional().describe("your current reasoning, constraints, and what you are about to do"),
     engines: z.array(z.string()).optional().describe("engine ids to seat (default: all with quota)"),
     size: z.number().optional().describe("cap the council to N members, highest remaining quota first"),
+    effort: z.string().optional().describe("reasoning effort for members that support it"),
     cwd: z.string().optional().describe("repository path the council should reason inside"),
   },
-  async ({ question, context, engines, size, cwd }) => {
-    const result = await convene({ question, context, engines, size, cwd: cwdOf(cwd) })
+  async ({ question, context, engines, size, effort, cwd }) => {
+    const result = await convene({ question, context, engines, size, effort, cwd: cwdOf(cwd) })
     if (result.replies.length === 0) {
       return text(
         `No council member could be seated — every engine is unavailable, cooling down, or out of quota. Skipped: ${result.skipped.join(", ")}. Proceed on your own judgment, and say so.`,
@@ -105,14 +109,19 @@ server.tool(
     engine: z.string().describe("engine id: codex, claude, kimi, glm, grok, qwen"),
     question: z.string(),
     context: z.string().optional(),
+    model: z.string().optional().describe("specific model for that family (see council_models)"),
+    effort: z.string().optional().describe("reasoning effort where supported"),
     cwd: z.string().optional(),
   },
-  async ({ engine, question, context, cwd }) => {
+  async ({ engine, question, context, model, effort, cwd }) => {
     const def = engineById(engine)
     if (!def) return text(`Unknown engine "${engine}". Run council_status to see who is available.`)
     const seated = await healthyEngines([engine])
     if (seated.length === 0) return text(`${engine} is unavailable, cooling down, or out of quota right now.`)
-    const reply = await askEngine(seated[0]!, askPrompt(question, context), cwdOf(cwd))
+    const reply = await askEngine(seated[0]!, askPrompt(question, context), cwdOf(cwd), {
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+    })
     return text(reply.ok ? reply.text : `${engine} failed: ${reply.text}`)
   },
 )
@@ -124,12 +133,14 @@ server.tool(
     engine: z.string(),
     task: z.string().describe("what to do, stated completely — the delegate has none of your conversation"),
     context: z.string().optional(),
+    model: z.string().optional(),
+    effort: z.string().optional(),
     write: z.boolean().optional().describe("allow file edits (default false)"),
     background: z.boolean().optional().describe("return a job id immediately instead of waiting"),
     cwd: z.string().optional(),
   },
-  async ({ engine, task, context, write, background, cwd }) => {
-    const mode = write ? ("write" as const) : ("read" as const)
+  async ({ engine, task, context, model, effort, write, background, cwd }) => {
+    const mode = write ? ("write" as const) : ("chat" as const)
     const seated = await healthyEngines([engine], mode)
     if (seated.length === 0) {
       const def = engineById(engine)
@@ -137,18 +148,114 @@ server.tool(
       return text(`${engine} is unavailable, cooling down, or out of quota right now.`)
     }
     const prompt = taskPrompt(task, context, Boolean(write))
+    const runOptions = { mode, ...(model ? { model } : {}), ...(effort ? { effort } : {}) }
     if (!background) {
-      const reply = await askEngine(seated[0]!, prompt, cwdOf(cwd), mode)
+      const reply = await askEngine(seated[0]!, prompt, cwdOf(cwd), runOptions)
       return text(reply.ok ? reply.text : `${engine} failed: ${reply.text}`)
     }
     const started = Date.now()
     const id = newJobId("task", started)
     const job: Job = { id, kind: "task", status: "running", question: task, engines: [engine], startedAt: started }
     saveJob(job)
-    void askEngine(seated[0]!, prompt, cwdOf(cwd), mode)
+    void askEngine(seated[0]!, prompt, cwdOf(cwd), runOptions)
       .then((reply) => saveJob({ ...job, status: "done", finishedAt: Date.now(), replies: [reply] }))
       .catch((error: unknown) => saveJob({ ...job, status: "failed", finishedAt: Date.now(), error: String(error) }))
     return text(`Task ${id} delegated to ${engine} in the background. Collect it with council_result.`)
+  },
+)
+
+server.tool(
+  "agent_spawn",
+  "Spawn a subagent from another model family to do a piece of work for you — like your own subagents, but a different lineage, on a separate subscription. You do not have to pick who: the least-spent capable family is chosen automatically. Read-only unless write is set. Use for independent workstreams, second implementations, or work better suited to another family.",
+  {
+    task: z.string().describe("what to do, stated completely — the subagent has none of your conversation"),
+    context: z.string().optional().describe("background it needs: constraints, prior decisions, file pointers"),
+    prefer: z.string().optional().describe("preferred engine id; ignored if that family has no quota"),
+    model: z.string().optional().describe("specific model for that family (see council_models)"),
+    effort: z.string().optional().describe("reasoning effort where supported: low, medium, high, max"),
+    write: z.boolean().optional().describe("allow file edits (default false)"),
+    background: z.boolean().optional().describe("return a job id immediately instead of waiting"),
+    cwd: z.string().optional(),
+  },
+  async ({ task, context, prefer, model, effort, write, background, cwd }) => {
+    const mode = write ? ("write" as const) : ("chat" as const)
+    const engine = await pickEngine(prefer, mode)
+    if (!engine) {
+      return text(
+        `No model family can be spawned right now — all are unavailable, cooling down, or out of quota${
+          mode === "write" ? " (write-capable)" : ""
+        }. Do the work yourself, or retry later.`,
+      )
+    }
+    const prompt = taskPrompt(task, context, Boolean(write))
+    const runOptions = { mode, ...(model ? { model } : {}), ...(effort ? { effort } : {}) }
+    const tag = model ? `${engine.id}/${model}` : engine.id
+    if (!background) {
+      const reply = await askEngine(engine, prompt, cwdOf(cwd), runOptions)
+      return text(reply.ok ? `[${tag}]\n\n${reply.text}` : `${tag} failed: ${reply.text}`)
+    }
+    const started = Date.now()
+    const id = newJobId("agent", started)
+    const job: Job = { id, kind: "task", status: "running", question: task, engines: [engine.id], startedAt: started }
+    saveJob(job)
+    void askEngine(engine, prompt, cwdOf(cwd), runOptions)
+      .then((reply) => saveJob({ ...job, status: "done", finishedAt: Date.now(), replies: [reply] }))
+      .catch((error: unknown) => saveJob({ ...job, status: "failed", finishedAt: Date.now(), error: String(error) }))
+    return text(`Spawned ${tag} as subagent ${id} in the background. Collect it with council_result.`)
+  },
+)
+
+server.tool(
+  "agent_fanout",
+  "Run several DIFFERENT tasks in parallel, each on a different model family. Use to parallelize independent workstreams across subscriptions — not to ask one question many ways (that is council_convene).",
+  {
+    tasks: z
+      .array(
+        z.object({
+          task: z.string(),
+          engine: z.string().optional().describe("pin this task to a family; otherwise assigned automatically"),
+          context: z.string().optional(),
+          model: z.string().optional(),
+          effort: z.string().optional(),
+        }),
+      )
+      .describe("independent tasks; each is handled by its own subagent"),
+    write: z.boolean().optional().describe("allow file edits — only for tasks that touch disjoint files"),
+    cwd: z.string().optional(),
+  },
+  async ({ tasks, write, cwd }) => {
+    if (tasks.length === 0) return text("No tasks given.")
+    const { results, unassigned } = await fanout({ tasks, write, cwd: cwdOf(cwd) })
+    if (results.length === 0) return text("No model family had quota to take these tasks.")
+    const blocks = results.map(
+      (result) =>
+        `### ${result.engine} — ${result.task.slice(0, 120)}\n\n${result.ok ? result.text : `failed: ${result.text}`}`,
+    )
+    if (unassigned.length > 0) {
+      blocks.push(`### unassigned\n\n${unassigned.length} task(s) pinned to a family with no quota: ${unassigned.join("; ")}`)
+    }
+    return text(blocks.join("\n\n---\n\n"))
+  },
+)
+
+server.tool(
+  "council_models",
+  "List the model families that can be summoned and the specific models and reasoning efforts each one accepts. Check this before passing model or effort to agent_spawn, council_ask, or council_task.",
+  {},
+  async () => {
+    const lines = engineCatalog().map((entry) => {
+      const models = entry.models.length > 0 ? entry.models.join(", ") : "engine default only"
+      const effort = entry.supportsEffort ? " · effort: low|medium|high|max" : ""
+      const write = entry.writeCapable ? "" : " · read-only"
+      return `${entry.available ? "✓" : "✗"} ${entry.id.padEnd(6)} ${models}${effort}${write}`
+    })
+    return text(
+      [
+        ...lines,
+        "",
+        "First model listed is the default. Models are passed straight to the vendor CLI, so a newer id it accepts will work even if it is not listed here.",
+      ].join("\n"),
+    )
   },
 )
 

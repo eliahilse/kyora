@@ -78,12 +78,28 @@ export interface EngineDef {
   args: string[]
   /** args for delegated work that may edit files; absent = engine is read-only */
   argsWrite?: string[]
+  /** args for free-form prose answers, without schema-constrained output */
+  argsChat?: string[]
   env?: () => Record<string, string | undefined>
   /** engine writes its final message to the {out} file instead of stdout */
   readsOutFile?: boolean
   /** live remaining-quota query where the vendor exposes one; null = unavailable */
   usageProbe?: () => Promise<LiveUsage | null>
+  /** selectable models; first entry is the default */
+  models?: string[]
+  /** extra args to select a model, when the CLI takes it as a flag */
+  modelArgs?: (model: string) => string[]
+  /** env var carrying the model id, for engines routed through another vendor's CLI */
+  modelEnv?: string
+  /** extra args to set reasoning effort, when supported */
+  effortArgs?: (effort: string) => string[]
   authHint: string
+}
+
+export interface RunOptions {
+  mode?: EngineMode
+  model?: string
+  effort?: string
 }
 
 async function qwenUsageProbe(): Promise<LiveUsage | null> {
@@ -100,6 +116,15 @@ async function qwenUsageProbe(): Promise<LiveUsage | null> {
     return parseTokenPlanUsage(await response.json())
   } catch {
     return null
+  }
+}
+
+function codexConfiguredModel(): string | undefined {
+  try {
+    const config = readFileSync(join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "config.toml"), "utf8")
+    return /^\s*model\s*=\s*"([^"]+)"/m.exec(config)?.[1]
+  } catch {
+    return undefined
   }
 }
 
@@ -166,7 +191,7 @@ const CLAUDE_WRITE_ARGS = [
   CLAUDE_WRITE_DENIED,
 ]
 
-export type EngineMode = "read" | "write"
+export type EngineMode = "read" | "write" | "chat"
 
 export const ENGINES: EngineDef[] = [
   {
@@ -175,7 +200,11 @@ export const ENGINES: EngineDef[] = [
     bin: "codex",
     args: ["exec", "--sandbox", "read-only", "--output-schema", "{schema}", "-o", "{out}", "{prompt}"],
     argsWrite: ["exec", "--sandbox", "workspace-write", "--full-auto", "{prompt}"],
+    argsChat: ["exec", "--sandbox", "read-only", "{prompt}"],
     readsOutFile: true,
+    models: codexConfiguredModel() ? [codexConfiguredModel()!] : [],
+    modelArgs: (model) => ["-m", model],
+    effortArgs: (effort) => ["-c", `model_reasoning_effort="${effort}"`],
     authHint: "run `codex login` (ChatGPT subscription) or set OPENAI_API_KEY — CI: seed the CODEX_AUTH_JSON secret",
   },
   {
@@ -185,6 +214,8 @@ export const ENGINES: EngineDef[] = [
     args: CLAUDE_ARGS,
     argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: claudeUsageProbe,
+    models: ["sonnet", "opus", "haiku"],
+    modelArgs: (model) => ["--model", model],
     authHint: "log in once via `claude`, or set CLAUDE_CODE_OAUTH_TOKEN (created with `claude setup-token`)",
   },
   {
@@ -201,6 +232,8 @@ export const ENGINES: EngineDef[] = [
     }),
     argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: kimiUsageProbe,
+    models: ["kimi-k3"],
+    modelEnv: "ANTHROPIC_MODEL",
     authHint: "set KIMI_API_KEY (Kimi membership / platform.kimi.ai); optional KIMI_BASE_URL, KIMI_MODEL",
   },
   {
@@ -217,6 +250,8 @@ export const ENGINES: EngineDef[] = [
     }),
     argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: glmUsageProbe,
+    models: ["glm-5.2", "glm-5.2[1m]"],
+    modelEnv: "ANTHROPIC_MODEL",
     authHint: "set ZAI_API_KEY (GLM Coding Plan), or log in once via `opencode auth login` — the key is picked up from there",
   },
   {
@@ -225,6 +260,10 @@ export const ENGINES: EngineDef[] = [
     bin: "grok",
     args: ["--verbatim", "--reasoning-effort", "high", "--output-format", "json", "--json-schema", "{schemaJson}", "-p", "{prompt}"],
     argsWrite: ["--verbatim", "--reasoning-effort", "high", "--always-approve", "-p", "{prompt}"],
+    argsChat: ["--verbatim", "--reasoning-effort", "high", "-p", "{prompt}"],
+    models: ["grok-4.5"],
+    modelArgs: (model) => ["-m", model],
+    effortArgs: (effort) => ["--reasoning-effort", effort],
     authHint: "log in via `grok login`, or set GROK_API_KEY / XAI_API_KEY (console.x.ai)",
   },
   {
@@ -242,6 +281,8 @@ export const ENGINES: EngineDef[] = [
     }),
     argsWrite: CLAUDE_WRITE_ARGS,
     usageProbe: qwenUsageProbe,
+    models: ["qwen3.8-max-preview"],
+    modelEnv: "ANTHROPIC_MODEL",
     authHint: "set QWEN_API_KEY (Token Plan key), or run `bl config agent` once — the key is picked up from there",
   },
 ]
@@ -279,6 +320,22 @@ export interface RawRun {
   durationMs: number
 }
 
+/** A caller-supplied effort flag must replace the engine's built-in one, not duplicate it. */
+function dedupeEffort(selectors: string[], template: string[]): string[] {
+  if (selectors.length === 0) return template
+  const flags = new Set(selectors.filter((token) => token.startsWith("-")))
+  const kept: string[] = []
+  for (let i = 0; i < template.length; i++) {
+    const token = template[i]!
+    if (flags.has(token)) {
+      i++
+      continue
+    }
+    kept.push(token)
+  }
+  return [...selectors, ...kept]
+}
+
 /** Run an engine CLI headless in the repo checkout and capture whatever it printed. */
 export async function runEngineRaw(
   engine: EngineDef,
@@ -286,8 +343,9 @@ export async function runEngineRaw(
   schema: unknown,
   cwd: string,
   config: ReviewConfig,
-  mode: EngineMode = "read",
+  options: RunOptions = {},
 ): Promise<RawRun> {
+  const mode = options.mode ?? "read"
   const override = config.overrides[engine.id]
   const started = Date.now()
   const workDir = await mkdtemp(join(tmpdir(), `kyora-review-${engine.id}-`))
@@ -297,8 +355,16 @@ export async function runEngineRaw(
     await Bun.write(schemaPath, JSON.stringify(schema))
 
     const bin = override?.bin ?? engine.bin
-    const argTemplate =
-      mode === "write" ? (engine.argsWrite ?? override?.args ?? engine.args) : (override?.args ?? engine.args)
+    const baseTemplate =
+      mode === "write"
+        ? (engine.argsWrite ?? override?.args ?? engine.args)
+        : mode === "chat"
+          ? (engine.argsChat ?? override?.args ?? engine.args)
+          : (override?.args ?? engine.args)
+    const selectors: string[] = []
+    if (options.model && engine.modelArgs) selectors.push(...engine.modelArgs(options.model))
+    if (options.effort && engine.effortArgs) selectors.push(...engine.effortArgs(options.effort))
+    const argTemplate = dedupeEffort(selectors, baseTemplate)
     const args = argTemplate.map((arg) =>
       arg
         .replace("{schemaJson}", () => JSON.stringify(schema))
@@ -307,8 +373,15 @@ export async function runEngineRaw(
         .replace("{prompt}", () => prompt),
     )
 
+    const modelOverride =
+      options.model && engine.modelEnv ? { [engine.modelEnv]: options.model } : {}
     const env: Record<string, string> = {}
-    for (const [key, value] of Object.entries({ ...process.env, ...engine.env?.(), ...override?.env })) {
+    for (const [key, value] of Object.entries({
+      ...process.env,
+      ...engine.env?.(),
+      ...override?.env,
+      ...modelOverride,
+    })) {
       if (value !== undefined) env[key] = value
     }
 

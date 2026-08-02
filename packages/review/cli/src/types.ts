@@ -61,20 +61,32 @@ export interface ReviewContext {
 export interface EngineOverride {
   bin?: string
   args?: string[]
+  /** overrides for the delegated-work and free-form invocations the council uses */
+  argsWrite?: string[]
+  argsChat?: string[]
   env?: Record<string, string>
   model?: string
 }
 
-export interface ReviewConfig {
+/**
+ * Everything `runEngineRaw` actually needs. Kept separate from `ReviewConfig`
+ * so other consumers of the engine pool — the council MCP server — do not have
+ * to forge review-shaped fields (`base`, `failOn`, `maxDiffBytes`, …) that mean
+ * nothing to them just to spawn a vendor CLI.
+ */
+export interface RunConfig {
+  timeoutMs: number
+  cooldownMinutes: number
+  overrides: Record<string, EngineOverride>
+}
+
+export interface ReviewConfig extends RunConfig {
   engines: string[]
   verify: boolean
   post: boolean
   base: string
   failOn: Severity | "none"
   maxDiffBytes: number
-  timeoutMs: number
   maxFindingsPerEngine: number
-  cooldownMinutes: number
   maxEngines: number
-  overrides: Record<string, EngineOverride>
 }

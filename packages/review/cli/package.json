@@ -16,6 +16,7 @@
   },
   "exports": {
     ".": "./dist/index.js",
+    "./config": "./src/config.ts",
     "./engines": "./src/engines.ts",
     "./usage": "./src/usage.ts",
     "./extract": "./src/extract.ts",

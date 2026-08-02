@@ -49,7 +49,7 @@ By default every available engine runs; pick explicitly with `--engines codex,ki
 --out <file>      also write the markdown report to a file
 ```
 
-`kyora-review.config.json` at the repo root can set the same keys permanently, plus per-engine overrides (`bin`, `args` with `{prompt}`/`{schema}`/`{out}` tokens, `env`) if a vendor CLI changes its flags.
+`kyora-review.config.json` at the repo root can set the same keys permanently, plus per-engine overrides (`bin`, `args` with `{prompt}`/`{schema}`/`{out}` tokens, `env`) if a vendor CLI changes its flags. `argsChat` and `argsWrite` override the free-form and delegated-work invocations that [`@kyora-sh/council`](../../council/mcp) runs on the same engines.
 
 ## Quota awareness
 

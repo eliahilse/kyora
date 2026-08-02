@@ -1,11 +1,15 @@
 {
   "mcpServers": {
     "kyora": {
-      "command": "npx",
-      "args": ["-y", "kyora-sh"],
+      "command": "bunx",
+      "args": ["@kyora-sh/mcp"],
       "env": {
-        "KYORA_DATA_DIR": "${CLAUDE_PLUGIN_DATA}/data"
+        "KYORA_DATA_DIR": ".kyora"
       }
+    },
+    "kyora-council": {
+      "command": "bun",
+      "args": ["packages/council/mcp/src/index.ts"]
     }
   }
 }

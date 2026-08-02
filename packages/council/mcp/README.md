@@ -14,7 +14,7 @@ Your agent is one lineage with one set of blind spots. This gives it a way to as
 | `council_task` | delegate concrete work to one family (`write: true` lets it edit files) |
 | `council_result` | collect a background council or task by job id |
 | `agent_spawn` | spawn a subagent from another family — you don't pick who, the least-spent capable family is chosen |
-| `agent_fanout` | several *different* tasks in parallel, one per family |
+| `agent_fanout` | several *different* tasks at once, one per family (read-only tasks run in parallel; `write: true` runs them in turn, since they share one checkout) |
 | `council_models` | which families are summonable, and the models and efforts each accepts |
 | `council_status` | who can be summoned right now, with remaining quota |
 
@@ -34,7 +34,7 @@ Councils are quota-aware: members are seated highest-remaining-quota first, engi
 }
 ```
 
-Engine auth is shared with [`@kyora-sh/review`](../../review/cli) — run `kyora-review doctor` to see who is ready.
+Engine auth *and configuration* are shared with [`@kyora-sh/review`](../../review/cli): run `kyora-review doctor` to see who is ready, and the `overrides` block in `kyora-review.config.json` at your repo root applies to both — a vendor CLI changing its flags is one config edit, not two. Councils use the `argsChat` / `argsWrite` overrides where a review uses `args`.
 
 ## High-stakes watcher (optional)
 
@@ -45,7 +45,7 @@ A `PostToolUse` hook that watches your agent's work with a cheap model and remin
   "hooks": {
     "PostToolUse": [
       { "matcher": "Write|Edit|MultiEdit|Bash",
-        "hooks": [{ "type": "command", "command": "bunx @kyora-sh/council kyora-stakes-hook" }] }
+        "hooks": [{ "type": "command", "command": "bunx @kyora-sh/council hook" }] }
     ]
   }
 }

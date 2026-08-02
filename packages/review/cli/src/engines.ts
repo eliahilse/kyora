@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import type { EngineOverride, ReviewConfig } from "./types"
+import type { EngineOverride, RunConfig } from "./types"
 import {
   looksRateLimited,
   markRun,
@@ -320,6 +320,17 @@ export interface RawRun {
   durationMs: number
 }
 
+/**
+ * A configured override always beats the built-in template for the mode it
+ * names — otherwise a vendor CLI changing its write or chat flags could only be
+ * fixed by editing this file, which defeats the point of having a config.
+ */
+export function argsFor(engine: EngineDef, override: EngineOverride | undefined, mode: EngineMode): string[] {
+  if (mode === "write") return override?.argsWrite ?? engine.argsWrite ?? override?.args ?? engine.args
+  if (mode === "chat") return override?.argsChat ?? engine.argsChat ?? override?.args ?? engine.args
+  return override?.args ?? engine.args
+}
+
 /** A caller-supplied effort flag must replace the engine's built-in one, not duplicate it. */
 function dedupeEffort(selectors: string[], template: string[]): string[] {
   if (selectors.length === 0) return template
@@ -342,7 +353,7 @@ export async function runEngineRaw(
   prompt: string,
   schema: unknown,
   cwd: string,
-  config: ReviewConfig,
+  config: RunConfig,
   options: RunOptions = {},
 ): Promise<RawRun> {
   const mode = options.mode ?? "read"
@@ -355,12 +366,7 @@ export async function runEngineRaw(
     await Bun.write(schemaPath, JSON.stringify(schema))
 
     const bin = override?.bin ?? engine.bin
-    const baseTemplate =
-      mode === "write"
-        ? (engine.argsWrite ?? override?.args ?? engine.args)
-        : mode === "chat"
-          ? (engine.argsChat ?? override?.args ?? engine.args)
-          : (override?.args ?? engine.args)
+    const baseTemplate = argsFor(engine, override, mode)
     const selectors: string[] = []
     if (options.model && engine.modelArgs) selectors.push(...engine.modelArgs(options.model))
     if (options.effort && engine.effortArgs) selectors.push(...engine.effortArgs(options.effort))

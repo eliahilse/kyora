@@ -17,6 +17,7 @@ Tools that make coding agents trustworthy — by grounding them in what actually
   - [Engines](#engines)
   - [CI](#ci)
   - [Configuration](#configuration)
+- [kyora council — summon other model families](#kyora-council)
 - [Repo layout](#repo-layout)
 - [Development](#development)
 - [License](#license)
@@ -155,7 +156,23 @@ Full setup, secret-seeding commands, and security notes: [`action/README.md`](ac
 
 ### Configuration
 
-`kyora-review.config.json` at the repo root sets defaults (`engines`, `verify`, `post`, `base`, `failOn`, `maxDiffBytes`, `timeoutMs`), plus per-engine overrides — `bin`, `args` (with `{prompt}`/`{schema}`/`{schemaJson}`/`{out}` tokens), and `env` — so a vendor CLI changing its flags is a config edit, not a code change. CLI reference: [`packages/review/cli`](packages/review/cli).
+`kyora-review.config.json` at the repo root sets defaults (`engines`, `verify`, `post`, `base`, `failOn`, `maxDiffBytes`, `timeoutMs`), plus per-engine overrides — `bin`, `args` (with `{prompt}`/`{schema}`/`{schemaJson}`/`{out}` tokens), `argsChat`, `argsWrite`, and `env` — so a vendor CLI changing its flags is a config edit, not a code change. The same overrides apply to [kyora council](#kyora-council), which spawns the same CLIs. CLI reference: [`packages/review/cli`](packages/review/cli).
+
+## kyora council
+
+The same engine pool, pointed at your own work instead of a diff. Your agent is one lineage with one set of blind spots; the council MCP server lets it ask the others — before it commits to something expensive to undo — and delegate work to them on separate subscriptions.
+
+```json
+{
+  "mcpServers": {
+    "kyora-council": { "command": "bunx", "args": ["@kyora-sh/council"] }
+  }
+}
+```
+
+`council_convene` puts the same question to several families at once and returns their independent takes; `agent_spawn` hands a task to whichever capable family has the most quota left; `agent_fanout` runs different tasks across different families at once. Engine auth and `kyora-review.config.json` overrides are shared with kyora review, so both halves see the same engines configured the same way.
+
+There is also an optional `PostToolUse` hook that watches for genuinely high-stakes moments — migrations, auth changes, irreversible operations — with a cheap model, and reminds the agent that a second lineage is available. Details: [`packages/council/mcp`](packages/council/mcp).
 
 ## Repo layout
 
@@ -165,6 +182,7 @@ packages/state/mcp      @kyora-sh/mcp     MCP server (published)
 packages/state/nora     @kyora/nora       semantic doc indexing + search (local embeddings)
 packages/state/db       @kyora/db         embedded PostgreSQL (PGLite) + vector search
 packages/review/cli     @kyora-sh/review  multi-engine review CLI (published)
+packages/council/mcp    @kyora-sh/council cross-family council + subagents over MCP
 packages/tooling/*                        shared eslint/tsconfig
 action/                                   GitHub Action for kyora review
 apps/reckon                               SWE-bench-style eval harness

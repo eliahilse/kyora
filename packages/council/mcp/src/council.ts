@@ -10,24 +10,45 @@ import {
   type EngineMode,
   type RunOptions,
 } from "@kyora-sh/review/engines"
+import { configForCwd } from "@kyora-sh/review/config"
 import { cooldownRemainingMs, lastRunAt, loadUsage } from "@kyora-sh/review/usage"
-import type { ReviewConfig } from "@kyora-sh/review/types"
+import type { RunConfig } from "@kyora-sh/review/types"
 import { assignTasks, type DelegatedTask } from "./assign"
 
 export type { DelegatedTask }
 
-export const RUN_CONFIG: ReviewConfig = {
-  engines: ["auto"],
-  verify: false,
-  post: false,
-  base: "main",
-  failOn: "none",
-  maxDiffBytes: 100_000,
-  timeoutMs: Number(process.env.KYORA_COUNCIL_TIMEOUT_MS ?? 600_000),
-  maxFindingsPerEngine: 20,
-  cooldownMinutes: 60,
-  maxEngines: 0,
-  overrides: {},
+export const DEFAULT_TIMEOUT_MS = 600_000
+export const DEFAULT_COOLDOWN_MINUTES = 60
+
+/** An explicit env override beats the checked-in config; both beat the default. */
+function envTimeoutMs(): number | undefined {
+  const raw = Number(process.env.KYORA_COUNCIL_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : undefined
+}
+
+export function cwdOf(dir?: string): string {
+  return dir ?? process.env.KYORA_COUNCIL_CWD ?? process.cwd()
+}
+
+const configs = new Map<string, Promise<RunConfig>>()
+
+/**
+ * The council spawns the same vendor CLIs as `kyora-review`, so it reads the
+ * same `kyora-review.config.json`: a `bin`/`args`/`env` override has to mean the
+ * same thing to both, or fixing a vendor flag change fixes only half the repo.
+ * Resolved once per checkout — config does not change under a running server.
+ */
+export function runConfig(cwd: string): Promise<RunConfig> {
+  let pending = configs.get(cwd)
+  if (!pending) {
+    pending = configForCwd(cwd).then(({ config }) => ({
+      timeoutMs: envTimeoutMs() ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      cooldownMinutes: config.cooldownMinutes ?? DEFAULT_COOLDOWN_MINUTES,
+      overrides: config.overrides ?? {},
+    }))
+    configs.set(cwd, pending)
+  }
+  return pending
 }
 
 export interface EngineHealth {
@@ -50,11 +71,12 @@ export interface EngineCatalogEntry {
   writeCapable: boolean
 }
 
-export function engineCatalog(): EngineCatalogEntry[] {
+export async function engineCatalog(cwd: string): Promise<EngineCatalogEntry[]> {
+  const config = await runConfig(cwd)
   return ENGINES.map((engine) => ({
     id: engine.id,
     label: engine.label,
-    available: engineStatus(engine, undefined).available,
+    available: engineStatus(engine, config.overrides[engine.id]).available,
     models: engine.models ?? [],
     defaultModel: engine.models?.[0] ?? null,
     supportsEffort: Boolean(engine.effortArgs),
@@ -62,11 +84,12 @@ export function engineCatalog(): EngineCatalogEntry[] {
   }))
 }
 
-export async function councilStatus(): Promise<EngineHealth[]> {
+export async function councilStatus(cwd: string): Promise<EngineHealth[]> {
   const usage = loadUsage()
+  const config = await runConfig(cwd)
   return Promise.all(
     ENGINES.map(async (engine) => {
-      const status = engineStatus(engine, undefined)
+      const status = engineStatus(engine, config.overrides[engine.id])
       const live = status.available && engine.usageProbe ? await engine.usageProbe() : null
       return {
         id: engine.id,
@@ -82,14 +105,19 @@ export async function councilStatus(): Promise<EngineHealth[]> {
 }
 
 /** Engines that can actually be spent right now, cheapest-to-quota first. */
-export async function healthyEngines(requested?: string[], mode: EngineMode = "chat"): Promise<EngineDef[]> {
+export async function healthyEngines(
+  requested: string[] | undefined,
+  cwd: string,
+  mode: EngineMode = "chat",
+): Promise<EngineDef[]> {
   const usage = loadUsage()
+  const config = await runConfig(cwd)
   const pool = requested?.length
     ? requested.map((id) => engineById(id.trim())).filter((engine): engine is EngineDef => Boolean(engine))
     : ENGINES
   const checked = await Promise.all(
     pool.map(async (engine) => {
-      if (!engineStatus(engine, undefined).available) return null
+      if (!engineStatus(engine, config.overrides[engine.id]).available) return null
       if (mode === "write" && !engine.argsWrite) return null
       if (cooldownRemainingMs(engine.id, usage) > 0) return null
       const live = engine.usageProbe ? await engine.usageProbe() : null
@@ -104,7 +132,7 @@ export async function healthyEngines(requested?: string[], mode: EngineMode = "c
 }
 
 const ASK_PROMPT = (question: string, context: string | undefined) =>
-  `You are consulted as an independent expert from a different model family than the agent asking. Give your own honest assessment — do not defer to the framing of the question, and say so plainly if you think the premise is wrong.
+  `You are consulted as an independent expert, seated alongside models from other families. Give your own honest assessment — do not defer to the framing of the question, and say so plainly if you think the premise is wrong.
 
 You are inside the repository checkout and may read files and run small read-only probes to ground your answer. Do not modify files. Do not run the project's test suites or builds.
 
@@ -167,7 +195,7 @@ export async function askEngine(
   cwd: string,
   options: RunOptions = {},
 ): Promise<EngineReply> {
-  const run = await runEngineRaw(engine, prompt, {}, cwd, RUN_CONFIG, { mode: "chat", ...options })
+  const run = await runEngineRaw(engine, prompt, {}, cwd, await runConfig(cwd), { mode: "chat", ...options })
   return {
     engine: engine.id,
     ...(options.model ? { model: options.model } : {}),
@@ -178,28 +206,39 @@ export async function askEngine(
   }
 }
 
+export interface Seating {
+  seated: EngineDef[]
+  skipped: string[]
+}
+
+/**
+ * Seating is a separate step from asking so the async path can report who was
+ * actually seated without probing live quota a second time — two independent
+ * selections could name one set of engines and run another.
+ */
+export async function seatCouncil(opts: { engines?: string[]; size?: number; cwd: string }): Promise<Seating> {
+  const available = await healthyEngines(opts.engines, opts.cwd)
+  const size = opts.size && opts.size > 0 ? opts.size : available.length
+  const seated = available.slice(0, size)
+  return {
+    seated,
+    skipped: ENGINES.filter((engine) => !seated.some((chosen) => chosen.id === engine.id)).map((engine) => engine.id),
+  }
+}
+
 export async function convene(opts: {
   question: string
   context?: string
-  engines?: string[]
-  size?: number
+  seated: EngineDef[]
   cwd: string
   effort?: string
-}): Promise<{ replies: EngineReply[]; skipped: string[] }> {
-  const available = await healthyEngines(opts.engines)
-  const size = opts.size && opts.size > 0 ? opts.size : available.length
-  const seated = available.slice(0, size)
-  const skipped = ENGINES.filter((engine) => !seated.some((chosen) => chosen.id === engine.id)).map(
-    (engine) => engine.id,
-  )
-  if (seated.length === 0) return { replies: [], skipped }
+}): Promise<EngineReply[]> {
   const prompt = ASK_PROMPT(opts.question, opts.context)
-  const replies = await Promise.all(
-    seated.map((engine) =>
+  return Promise.all(
+    opts.seated.map((engine) =>
       askEngine(engine, prompt, opts.cwd, { mode: "chat", ...(opts.effort ? { effort: opts.effort } : {}) }),
     ),
   )
-  return { replies, skipped }
 }
 
 export function askPrompt(question: string, context?: string): string {
@@ -210,12 +249,12 @@ export function askPrompt(question: string, context?: string): string {
  * Pick a delegate without the caller naming one: honor a preference when that
  * engine is actually spendable, otherwise take whoever has the most headroom.
  */
-export async function pickEngine(prefer: string | undefined, mode: EngineMode): Promise<EngineDef | null> {
+export async function pickEngine(prefer: string | undefined, mode: EngineMode, cwd: string): Promise<EngineDef | null> {
   if (prefer) {
-    const preferred = await healthyEngines([prefer], mode)
+    const preferred = await healthyEngines([prefer], cwd, mode)
     if (preferred.length > 0) return preferred[0]!
   }
-  const pool = await healthyEngines(undefined, mode)
+  const pool = await healthyEngines(undefined, cwd, mode)
   return pool[0] ?? null
 }
 
@@ -232,25 +271,29 @@ export async function fanout(opts: {
   tasks: DelegatedTask[]
   write?: boolean
   cwd: string
-}): Promise<{ results: FanoutResult[]; unassigned: string[] }> {
+}): Promise<{ results: FanoutResult[]; unassigned: string[]; serialized: boolean }> {
   const mode: EngineMode = opts.write ? "write" : "chat"
-  const pool = await healthyEngines(undefined, mode)
+  const pool = await healthyEngines(undefined, opts.cwd, mode)
   const { assignments, unassigned } = assignTasks(
     opts.tasks,
     pool.map((engine) => engine.id),
   )
-  const results = await Promise.all(
-    assignments.map(async ({ task, engine }) => ({
-      task: task.task,
-      ...(await askEngine(
-        pool.find((candidate) => candidate.id === engine)!,
-        TASK_PROMPT(task.task, task.context, Boolean(opts.write)),
-        opts.cwd,
-        { mode, ...(task.model ? { model: task.model } : {}), ...(task.effort ? { effort: task.effort } : {}) },
-      )),
-    })),
-  )
-  return { results, unassigned }
+  const run = ({ task, engine }: (typeof assignments)[number]) =>
+    askEngine(
+      pool.find((candidate) => candidate.id === engine)!,
+      TASK_PROMPT(task.task, task.context, Boolean(opts.write)),
+      opts.cwd,
+      { mode, ...(task.model ? { model: task.model } : {}), ...(task.effort ? { effort: task.effort } : {}) },
+    ).then((reply) => ({ task: task.task, ...reply }))
+
+  // Read-only delegates cannot interfere, so they run together. Write-capable
+  // ones share a single working tree with no locking or isolation between them,
+  // so a parallel fanout is a silent clobber waiting to happen: run them in turn
+  // until each task can be given its own checkout.
+  if (!opts.write) return { results: await Promise.all(assignments.map(run)), unassigned, serialized: false }
+  const results: FanoutResult[] = []
+  for (const assignment of assignments) results.push(await run(assignment))
+  return { results, unassigned, serialized: assignments.length > 1 }
 }
 
 export function taskPrompt(task: string, context: string | undefined, write: boolean): string {
@@ -264,6 +307,8 @@ export interface Job {
   question: string
   engines: string[]
   startedAt: number
+  /** past this, a job still marked running cannot be in flight — see `loadJob` */
+  deadlineAt: number
   finishedAt?: number
   replies?: EngineReply[]
   error?: string
@@ -285,14 +330,33 @@ export function saveJob(job: Job): void {
 
 export function loadJob(id: string): Job | null {
   try {
-    return JSON.parse(readFileSync(join(jobsDir(), `${id.replace(/[^\w-]/g, "")}.json`), "utf8")) as Job
+    const job = JSON.parse(readFileSync(join(jobsDir(), `${id.replace(/[^\w-]/g, "")}.json`), "utf8")) as Job
+    return reconcile(job)
   } catch {
     return null
   }
 }
 
-export function newJobId(kind: string, seed: number): string {
-  return `${kind}-${seed.toString(36)}`
+/**
+ * A background job is a promise owned by this process, not a durable unit of
+ * work: if the server is restarted or killed mid-flight, nothing will ever move
+ * the record off "running". Past its deadline, say so instead of reporting a
+ * job that no longer exists as still in progress.
+ */
+export function reconcile(job: Job): Job {
+  if (job.status !== "running" || !job.deadlineAt || Date.now() <= job.deadlineAt) return job
+  return {
+    ...job,
+    status: "failed",
+    error: "no result was recorded before the deadline — the server was most likely restarted mid-run; re-run it",
+  }
+}
+
+let sequence = 0
+
+/** Ids are minted per start; a bare timestamp collides when two jobs begin in the same millisecond. */
+export function newJobId(kind: string, seed: number = Date.now()): string {
+  return `${kind}-${seed.toString(36)}-${(sequence++).toString(36)}`
 }
 
 /** Points where replies disagree matter more than where they agree. */

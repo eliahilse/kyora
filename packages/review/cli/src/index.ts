@@ -1,5 +1,6 @@
 import { parseArgs } from "node:util"
 import { ciCoveredCommands } from "./ci"
+import { loadConfigFile } from "./config"
 import { buildContext, repoRoot } from "./diff"
 import { ENGINES, engineById, engineStatus, runEngineRaw, type EngineDef } from "./engines"
 import { extractFindings, extractPayload } from "./extract"
@@ -55,13 +56,9 @@ options:
 config: kyora-review.config.json at the repo root (same keys, plus per-engine overrides).`
 
 async function loadConfig(root: string): Promise<Partial<ReviewConfig>> {
-  const file = Bun.file(`${root}/kyora-review.config.json`)
-  if (!(await file.exists())) return {}
-  try {
-    return (await file.json()) as Partial<ReviewConfig>
-  } catch {
-    die(`kyora-review.config.json exists but is not valid JSON`)
-  }
+  const loaded = await loadConfigFile(root)
+  if (loaded.error) die(loaded.error)
+  return loaded.config
 }
 
 interface Flags {

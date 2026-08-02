@@ -60,7 +60,7 @@ function nudge(reason: string, suggested: string[]): never {
 const MIN_GAP_MS = Number(process.env.KYORA_WATCHER_MIN_GAP_MS ?? 120_000)
 const NUDGE_GAP_MS = Number(process.env.KYORA_WATCHER_NUDGE_GAP_MS ?? 900_000)
 
-async function main(): Promise<void> {
+export async function runHook(): Promise<void> {
   const raw = await Bun.stdin.text().catch(() => "")
   if (!raw.trim()) pass()
   let input: HookInput
@@ -100,6 +100,3 @@ async function main(): Promise<void> {
   writeState(path, { ...readState(path), lastNudge: now })
   nudge(verdict.reason, verdict.suggested)
 }
-
-await main()
-pass()

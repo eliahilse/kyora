@@ -1,7 +1,9 @@
 import type { PrInfo, ReviewContext } from "./types"
 
-export async function repoRoot(): Promise<string | null> {
-  const result = await Bun.$`git rev-parse --show-toplevel`.quiet().nothrow()
+export async function repoRoot(cwd?: string): Promise<string | null> {
+  const result = cwd
+    ? await Bun.$`git -C ${cwd} rev-parse --show-toplevel`.quiet().nothrow()
+    : await Bun.$`git rev-parse --show-toplevel`.quiet().nothrow()
   if (result.exitCode !== 0) return null
   return result.text().trim()
 }

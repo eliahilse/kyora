@@ -18,6 +18,7 @@ Tools that make coding agents trustworthy — by grounding them in what actually
   - [CI](#ci)
   - [Configuration](#configuration)
 - [kyora council — summon other model families](#kyora-council)
+- [kyora switch — hot-swap Claude and Codex logins](#kyora-switch)
 - [Repo layout](#repo-layout)
 - [Development](#development)
 - [License](#license)
@@ -174,6 +175,24 @@ The same engine pool, pointed at your own work instead of a diff. Your agent is 
 
 There is also an optional `PostToolUse` hook that watches for genuinely high-stakes moments — migrations, auth changes, irreversible operations — with a cheap model, and reminds the agent that a second lineage is available. Details: [`packages/council/mcp`](packages/council/mcp).
 
+## kyora switch
+
+Two subscriptions, one laptop. `kyora switch` stores the account a CLI is logged into as a named slot and loads it back later, so moving between a work and a personal login is one command instead of a logout and a browser round trip.
+
+```bash
+claude                            # /login as account 1
+kyora-switch claude save work
+
+claude                            # /login as account 2
+kyora-switch claude save private
+
+kyora-switch claude load work     # switch, instantly, from here on
+```
+
+Codex takes the same verbs — `kyora-switch codex save|load <slot>` — with its own slots. Only credentials and the account they belong to move: Claude Code's OAuth blob (macOS keychain or `~/.claude/.credentials.json`) plus the `oauthAccount` key of `~/.claude.json`, and `~/.codex/auth.json`. Project history, settings, and MCP config stay put, and every load backs the outgoing login up first.
+
+The keychain read and write paths are the ones read out of the shipped `claude` binary, not guessed at. Details: [`apps/switch`](apps/switch).
+
 ## Repo layout
 
 ```
@@ -185,6 +204,7 @@ packages/review/cli     @kyora-sh/review  multi-engine review CLI (published)
 packages/council/mcp    @kyora-sh/council cross-family council + subagents over MCP
 packages/tooling/*                        shared eslint/tsconfig
 action/                                   GitHub Action for kyora review
+apps/switch                               hot-swap Claude Code and Codex logins
 apps/reckon                               SWE-bench-style eval harness
 apps/test                                 demo server
 ```

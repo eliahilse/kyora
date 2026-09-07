@@ -1,0 +1,19 @@
+{
+  "name": "@kyora/switch",
+  "private": true,
+  "type": "module",
+  "description": "Hot-swap Claude Code and Codex logins between accounts",
+  "bin": {
+    "kyora-switch": "./src/index.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "bun test",
+    "switch": "bun src/index.ts"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

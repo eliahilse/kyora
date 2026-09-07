@@ -1,0 +1,34 @@
+{
+  "name": "@kyora-sh/usage",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Engine quota state and live usage probing shared by kyora review, council and switch",
+  "license": "Elastic-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliahilse/kyora",
+    "directory": "packages/shared/usage"
+  },
+  "homepage": "https://kyora.sh",
+  "exports": {
+    ".": "./src/index.ts",
+    "./state": "./src/state.ts",
+    "./quota": "./src/quota.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

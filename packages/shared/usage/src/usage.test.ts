@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { cooldownRemainingMs, lastRunAt, loadUsage, looksRateLimited, markRun, parseClaudeOauthUsage, parseQuotaWindows, parseTokenPlanUsage, parseZaiQuota, resetHintMs } from "./usage"
+import { cooldownRemainingMs, lastRunAt, loadUsage, looksRateLimited, markRun, resetHintMs } from "./state"
+import { parseClaudeOauthUsage, parseQuotaWindows, parseTokenPlanUsage, parseZaiQuota } from "./quota"
 
 beforeEach(() => {
   process.env.KYORA_REVIEW_STATE_DIR = mkdtempSync(join(tmpdir(), "kyora-usage-"))
@@ -117,5 +118,36 @@ describe("resetHintMs", () => {
   test("returns null without a parseable duration", () => {
     expect(resetHintMs("limit resets at 7pm")).toBeNull()
     expect(resetHintMs("try again later")).toBeNull()
+  })
+})
+
+describe("parseClaudeOauthUsage windows", () => {
+  test("reports each window with its reset time", () => {
+    const parsed = parseClaudeOauthUsage({
+      five_hour: { utilization: 32, resets_at: "2026-09-08T03:39:59.660912+00:00" },
+      seven_day: { utilization: 30, resets_at: "2026-09-12T08:59:59.660934+00:00" },
+    })
+    expect(parsed?.remainingPct).toBe(68)
+    expect(parsed?.windows).toEqual([
+      { label: "5h", usedPct: 32, resetsAt: Date.parse("2026-09-08T03:39:59.660912+00:00") },
+      { label: "7d", usedPct: 30, resetsAt: Date.parse("2026-09-12T08:59:59.660934+00:00") },
+    ])
+  })
+
+  test("omits resetsAt when the payload has none or it is unparseable", () => {
+    const parsed = parseClaudeOauthUsage({
+      five_hour: { utilization: 10 },
+      seven_day: { utilization: 20, resets_at: "not a date" },
+    })
+    expect(parsed?.windows).toEqual([
+      { label: "5h", usedPct: 10, resetsAt: undefined },
+      { label: "7d", usedPct: 20, resetsAt: undefined },
+    ])
+  })
+
+  test("skips windows the payload leaves null", () => {
+    const parsed = parseClaudeOauthUsage({ five_hour: { utilization: 45 }, seven_day: null })
+    expect(parsed?.windows).toHaveLength(1)
+    expect(parsed?.remainingPct).toBe(55)
   })
 })

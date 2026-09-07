@@ -191,6 +191,8 @@ kyora-switch claude load work     # switch, instantly, from here on
 
 Codex takes the same verbs — `kyora-switch codex save|load <slot>` — with its own slots. Only credentials and the account they belong to move: Claude Code's OAuth blob (macOS keychain or `~/.claude/.credentials.json`) plus the `oauthAccount` key of `~/.claude.json`, and `~/.codex/auth.json`. Project history, settings, and MCP config stay put, and every load backs the outgoing login up first.
 
+`kyora-switch usage` probes every stored account with its own token and reports what is left on each — so you can see which login has room before you switch into it. That probing is shared with review and council as [`@kyora-sh/usage`](packages/shared/usage).
+
 The keychain read and write paths are the ones read out of the shipped `claude` binary, not guessed at. Details: [`apps/switch`](apps/switch).
 
 ## Repo layout
@@ -202,6 +204,7 @@ packages/state/nora     @kyora/nora       semantic doc indexing + search (local 
 packages/state/db       @kyora/db         embedded PostgreSQL (PGLite) + vector search
 packages/review/cli     @kyora-sh/review  multi-engine review CLI (published)
 packages/council/mcp    @kyora-sh/council cross-family council + subagents over MCP
+packages/shared/usage   @kyora-sh/usage   engine quota state + live usage probes
 packages/tooling/*                        shared eslint/tsconfig
 action/                                   GitHub Action for kyora review
 apps/switch                               hot-swap Claude Code and Codex logins

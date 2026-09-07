@@ -1,3 +1,5 @@
+import type { LiveUsage } from "@kyora-sh/usage"
+
 export const PROVIDER_IDS = ["claude", "codex"] as const
 
 export type ProviderId = (typeof PROVIDER_IDS)[number]
@@ -23,6 +25,8 @@ export interface Provider {
   locations(): string[]
   capture(): Promise<Snapshot | null>
   restore(snapshot: Snapshot): Promise<void>
+  quota?(snapshot: Snapshot): Promise<LiveUsage | null>
+  quotaHint?: string
 }
 
 export function isProviderId(value: string | undefined): value is ProviderId {

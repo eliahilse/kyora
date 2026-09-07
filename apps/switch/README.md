@@ -40,6 +40,7 @@ Every provider takes the same verbs, under `kyora-switch claude …` or `kyora-s
 | `save <slot>` | store the account that provider is logged into right now |
 | `load <slot>` | log that provider back into a stored account |
 | `list` | slots for that provider, with the live one marked |
+| `usage` | how much quota each stored account has left |
 | `rm <slot>` | delete a slot |
 | `rename <old> <new>` | rename a slot |
 
@@ -48,11 +49,32 @@ Two commands span both:
 | command | what it does |
 | --- | --- |
 | `status` | which account each CLI is logged into, and which slot it came from |
+| `usage` | remaining quota across every stored account, both providers |
 | `doctor` | where each CLI keeps its auth on this machine, and what it reads back |
 
-Options: `--json` for `list` and `status`, `-y` to skip the `rm` confirmation.
+Options: `--json` for `list`, `status` and `usage`, `-y` to skip the `rm` confirmation.
 
 Slots are namespaced per provider, so `claude/work` and `codex/work` are independent — you can save one without touching the other.
+
+## Which account has room left
+
+`usage` answers the question you actually have before switching. It probes each stored account with that slot's own token, so you see every account at once rather than only the one you are logged into:
+
+```
+$ kyora-switch claude usage
+* work     you@work.dev · Acme · max
+           68% left   5h 32% used, resets in 4h 12m · 7d 30% used, resets in 4d
+  private  you@home.dev · max
+           9% left    5h 91% used, resets in 38m · 7d 44% used, resets in 3d
+```
+
+`*` marks the account that is live. Quota comes from `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's own `/usage` reads, and the percentage is what is left on the tightest window.
+
+A slot whose access token has gone stale reports nothing until you load it and start the CLI once, which refreshes it.
+
+Codex has no equivalent: it reports limits in API response headers during a request, so there is nothing to poll, and `usage` says so rather than guessing.
+
+The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
 
 ## What actually gets swapped
 

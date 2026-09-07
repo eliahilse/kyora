@@ -19,6 +19,7 @@ export const codexProvider: Provider = {
   label: "Codex",
   processName: "codex",
   loginHint: "run `codex login`",
+  quotaHint: "Codex reports limits in API response headers only, so there is nothing to poll",
 
   locations() {
     return [authPath()]

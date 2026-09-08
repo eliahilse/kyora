@@ -72,3 +72,15 @@ test("forget leaves config.toml alone", async () => {
   await codexProvider.forget()
   expect(await Bun.file(join(dir, "config.toml")).text()).toBe('model = "gpt-5.6-luna"\n')
 })
+
+test("credentialExpiry reads exp out of the access token", async () => {
+  const payload = Buffer.from(JSON.stringify({ exp: 1789000000 })).toString("base64url")
+  await Bun.write(
+    join(dir, "auth.json"),
+    JSON.stringify({ tokens: { access_token: `h.${payload}.s`, account_id: "acct-1", id_token: "h..s" } }),
+  )
+  expect(codexProvider.credentialExpiry!((await codexProvider.capture())!)).toBe(1789000000000)
+
+  await Bun.write(join(dir, "auth.json"), JSON.stringify({ tokens: { access_token: "nope", account_id: "a" } }))
+  expect(codexProvider.credentialExpiry!((await codexProvider.capture())!)).toBeUndefined()
+})

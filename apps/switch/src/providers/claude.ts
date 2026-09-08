@@ -116,6 +116,15 @@ export const claudeProvider: Provider = {
     for (const name of SIDE_FILES) await rm(join(claudeDir(), name), { force: true })
   },
 
+  credentialExpiry(snapshot: Snapshot): number | undefined {
+    try {
+      const expiresAt = JSON.parse(snapshot.files[CREDENTIALS_FILE] ?? "{}")?.claudeAiOauth?.expiresAt
+      return typeof expiresAt === "number" ? expiresAt : undefined
+    } catch {
+      return undefined
+    }
+  },
+
   async quota(snapshot: Snapshot): Promise<LiveUsage | null> {
     const token = claudeAccessToken(snapshot.files[CREDENTIALS_FILE] ?? "")
     return token ? await claudeOauthUsage(token) : null

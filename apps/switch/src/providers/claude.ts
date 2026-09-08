@@ -4,7 +4,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { readJsonIfExists, readTextIfExists, writeFileAtomic } from "../fsx"
 import { claudeIdentity } from "../identity"
-import { KEYCHAIN_SERVICE, keychainAccount, keychainRead, keychainSupported, keychainWrite } from "../keychain"
+import { KEYCHAIN_SERVICE, keychainAccount, keychainDelete, keychainRead, keychainSupported, keychainWrite } from "../keychain"
 import type { Provider, Snapshot } from "../types"
 
 const CREDENTIALS_FILE = "credentials.json"
@@ -105,6 +105,15 @@ export const claudeProvider: Provider = {
       if (text !== null) files[name] = text
     }
     return { provider: "claude", identity: claudeIdentity(slice), files, capturedAt: Date.now() }
+  },
+
+  async forget(): Promise<void> {
+    await rm(credentialsPath(), { force: true })
+    if (keychainSupported()) await keychainDelete()
+
+    const config = await readJsonIfExists(claudeConfigPath())
+    if (config) await writeFileAtomic(claudeConfigPath(), `${JSON.stringify(mergeAccountIntoConfig(config, {}), null, 2)}\n`)
+    for (const name of SIDE_FILES) await rm(join(claudeDir(), name), { force: true })
   },
 
   async quota(snapshot: Snapshot): Promise<LiveUsage | null> {

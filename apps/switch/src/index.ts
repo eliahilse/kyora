@@ -23,6 +23,7 @@ usage:
   kyora-switch claude load <slot>       log Claude Code back into a stored account
   kyora-switch claude list              slots for Claude Code
   kyora-switch claude usage             how much quota each stored account has left
+  kyora-switch claude clear             sign out locally, without revoking the account
   kyora-switch claude rm <slot>         delete a slot
   kyora-switch claude rename <a> <b>    rename a slot
 
@@ -187,6 +188,27 @@ async function usage(providers: Provider[], json: boolean): Promise<void> {
   })
 }
 
+async function clear(provider: Provider): Promise<void> {
+  const outgoing = await provider.capture()
+  if (!outgoing) {
+    console.log(`${provider.id} is already signed out — ${provider.loginHint}`)
+    return
+  }
+
+  const backup = await writeBackup(outgoing)
+  const slots = await listSlots(provider.id)
+  if (!slots.some((slot) => slot.identity.account === outgoing.identity.account)) {
+    note(`${describeIdentity(outgoing.identity)} was in no slot — it is in ${backup}`)
+  }
+
+  await provider.forget()
+  console.log(`${provider.id} signed out locally — ${describeIdentity(outgoing.identity)}`)
+  console.log(`  the account keeps its session, so a saved slot still loads; ${provider.loginHint} for another one`)
+  if ((await runningSessions(provider)) > 0) {
+    note(`${provider.label} is running — restart it, the old token is already in memory`)
+  }
+}
+
 async function remove(provider: Provider, name: string, yes: boolean): Promise<void> {
   if (!(await readSlot(provider.id, assertName(name)))) die(`no ${provider.id} slot "${name}"`)
   if (!yes) {
@@ -262,6 +284,9 @@ async function runProvider(provider: Provider, args: string[], json: boolean, ye
       return await remove(provider, first ?? die(`rm needs a slot name`), yes)
     case "rename":
       return await rename(provider, first ?? die("rename needs the current name"), second ?? die("rename needs the new name"))
+    case "clear":
+    case "signout":
+      return await clear(provider)
     default:
       die(`unknown ${provider.id} command "${command}" — run \`kyora-switch --help\``)
   }

@@ -43,6 +43,7 @@ Every provider takes the same verbs, under `kyora-switch claude …` or `kyora-s
 | `load <slot>` | log that provider back into a stored account |
 | `list` | slots for that provider, with the live one marked |
 | `usage` | how much quota each stored account has left |
+| `clear` | sign out locally, without revoking the account |
 | `rm <slot>` | delete a slot |
 | `rename <old> <new>` | rename a slot |
 
@@ -87,6 +88,19 @@ Claude's payload carries a `limits` array covering the session window, the plan-
 A slot whose access token has gone stale reports nothing until you load it and start the CLI once, which refreshes it.
 
 The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
+
+## Signing out without losing the account
+
+`codex logout` and Claude's `/logout` end the account's session server side, which also invalidates the credentials sitting in your saved slots. That is the wrong tool when all you want is a free slot to log a second account into.
+
+```bash
+kyora-switch codex clear     # remove the local credentials, nothing else
+codex login                  # now log in as someone else
+```
+
+`clear` removes only what is on this machine: `~/.codex/auth.json` for Codex, and for Claude Code the OAuth blob plus the `oauthAccount` key. It makes no network call, so every slot you saved earlier still loads. The outgoing login is backed up first, exactly like `load` does.
+
+`config.toml`, project history, settings and MCP config are untouched.
 
 ## What actually gets swapped
 

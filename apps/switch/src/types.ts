@@ -24,6 +24,7 @@ export interface Provider {
   loginHint: string
   locations(): string[]
   capture(): Promise<Snapshot | null>
+  forget(): Promise<void>
   restore(snapshot: Snapshot): Promise<void>
   quota?(snapshot: Snapshot): Promise<LiveUsage | null>
   quotaHint?: string

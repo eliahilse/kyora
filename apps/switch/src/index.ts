@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import type { LiveUsage } from "@kyora-sh/usage"
 import { parseArgs } from "node:util"
 import { PROVIDERS, providerById, runningSessions } from "./providers"
 import {
@@ -13,7 +14,7 @@ import {
   writeBackup,
   writeSnapshot,
 } from "./store"
-import { describeIdentity, isProviderId, type Provider, type Snapshot } from "./types"
+import { describeIdentity, isProviderId, type Provider, type ProviderId, type Snapshot } from "./types"
 
 const HELP = `kyora-switch — hot-swap Claude Code and Codex logins
 
@@ -21,6 +22,7 @@ usage:
   kyora-switch claude save <slot>       store the Claude account you are logged into
   kyora-switch claude load <slot>       log Claude Code back into a stored account
   kyora-switch claude list              slots for Claude Code
+  kyora-switch claude usage             how much quota each stored account has left
   kyora-switch claude rm <slot>         delete a slot
   kyora-switch claude rename <a> <b>    rename a slot
 
@@ -28,10 +30,11 @@ usage:
   kyora-switch codex load <slot>
 
   kyora-switch status                   which account each CLI is logged into
+  kyora-switch usage                    remaining quota across every stored account
   kyora-switch doctor                   where each CLI keeps its auth on this machine
 
 options:
-  --json         machine-readable output (list, status)
+  --json         machine-readable output (list, status, usage)
   -y, --yes      skip the confirmation on rm
   -h, --help     this help
 
@@ -95,6 +98,93 @@ async function list(provider: Provider, json: boolean): Promise<void> {
     const active = live && slot.identity.account === live.identity.account ? "  (active)" : ""
     console.log(`${pad(slot.name)} ${describeIdentity(slot.identity)}${active}`)
   }
+}
+
+
+function relative(timestamp: number): string {
+  const ms = timestamp - Date.now()
+  if (ms <= 0) return "now"
+  const minutes = Math.round(ms / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return minutes % 60 === 0 ? `${hours}h` : `${hours}h ${minutes % 60}m`
+  return `${Math.round(hours / 24)}d`
+}
+
+function describeQuota(quota: LiveUsage): string {
+  const windows = quota.windows ?? []
+  if (windows.length === 0) return `${`${quota.remainingPct}% left`.padEnd(9)}  ${quota.detail}`
+  const detail = windows
+    .map((window) => `${window.label} ${window.usedPct}% used${window.resetsAt ? `, resets in ${relative(window.resetsAt)}` : ""}`)
+    .join(" · ")
+  return `${`${quota.remainingPct}% left`.padEnd(9)}  ${detail}`
+}
+
+interface UsageRow {
+  provider: ProviderId
+  slot: string | null
+  account: string
+  live: boolean
+  quota: LiveUsage | null
+  note?: string
+}
+
+async function usageRows(provider: Provider): Promise<UsageRow[]> {
+  const active = await provider.capture()
+  const slots = await listSlots(provider.id)
+  const rows: UsageRow[] = []
+
+  for (const slot of slots) {
+    const snapshot = await readSnapshot(provider.id, slot.name)
+    rows.push({
+      provider: provider.id,
+      slot: slot.name,
+      account: describeIdentity(slot.identity),
+      live: Boolean(active && active.identity.account === slot.identity.account),
+      quota: snapshot && provider.quota ? await provider.quota(snapshot) : null,
+    })
+  }
+
+  if (active && !rows.some((row) => row.live)) {
+    rows.unshift({
+      provider: provider.id,
+      slot: null,
+      account: describeIdentity(active.identity),
+      live: true,
+      quota: provider.quota ? await provider.quota(active) : null,
+      note: "not saved to a slot",
+    })
+  }
+  return rows
+}
+
+function renderUsage(provider: Provider, rows: UsageRow[]): void {
+  if (rows.length === 0) {
+    console.log(`${provider.id}: nothing logged in and no slots saved`)
+    return
+  }
+  const width = Math.max(...rows.map((row) => (row.slot ?? "live").length))
+  for (const row of rows) {
+    const name = (row.slot ?? "live").padEnd(width)
+    const marker = row.live ? "*" : " "
+    const quota = row.quota
+      ? describeQuota(row.quota)
+      : (provider.quotaHint ?? "no quota reported — load the slot and start the CLI to refresh its token")
+    console.log(`${marker} ${name}  ${row.account}`)
+    console.log(`  ${" ".repeat(width)}  ${quota}`)
+    if (row.note) console.log(`  ${" ".repeat(width)}  ${row.note}`)
+  }
+}
+
+async function usage(providers: Provider[], json: boolean): Promise<void> {
+  const collected = await Promise.all(providers.map(async (provider) => [provider, await usageRows(provider)] as const))
+  if (json) return console.log(JSON.stringify(Object.fromEntries(collected.map(([p, rows]) => [p.id, rows])), null, 2))
+
+  collected.forEach(([provider, rows], index) => {
+    if (index > 0) console.log()
+    if (providers.length > 1) console.log(`${provider.id} — ${provider.label}`)
+    renderUsage(provider, rows)
+  })
 }
 
 async function remove(provider: Provider, name: string, yes: boolean): Promise<void> {
@@ -164,6 +254,8 @@ async function runProvider(provider: Provider, args: string[], json: boolean, ye
     case "list":
     case "ls":
       return await list(provider, json)
+    case "usage":
+      return await usage([provider], json)
     case "rm":
     case "remove":
     case "delete":
@@ -201,6 +293,8 @@ async function main(): Promise<void> {
   switch (head) {
     case "status":
       return await status(Boolean(values.json))
+    case "usage":
+      return await usage(PROVIDERS, Boolean(values.json))
     case "doctor":
       return await doctor()
     case "help":

@@ -11,7 +11,7 @@ import {
   type RunOptions,
 } from "@kyora-sh/review/engines"
 import { configForCwd } from "@kyora-sh/review/config"
-import { cooldownRemainingMs, lastRunAt, loadUsage } from "@kyora-sh/review/usage"
+import { cooldownRemainingMs, lastRunAt, loadUsage } from "@kyora-sh/usage"
 import type { RunConfig } from "@kyora-sh/review/types"
 import { assignTasks, type DelegatedTask } from "./assign"
 

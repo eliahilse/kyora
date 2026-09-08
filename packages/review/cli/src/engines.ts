@@ -4,9 +4,11 @@ import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { EngineOverride, RunConfig } from "./types"
 import {
+  bearerUsage,
+  claudeAccessToken,
+  claudeOauthUsage,
   looksRateLimited,
   markRun,
-  parseClaudeOauthUsage,
   parseQuotaWindows,
   parseTokenPlanUsage,
   parseZaiQuota,
@@ -14,56 +16,36 @@ import {
   type LiveUsage,
 } from "./usage"
 
-async function probeJson(url: string, headers: Record<string, string>): Promise<unknown | null> {
-  try {
-    const response = await fetch(url, { headers, redirect: "error", signal: AbortSignal.timeout(5000) })
-    if (!response.ok) return null
-    return await response.json()
-  } catch {
-    return null
-  }
-}
-
 async function claudeToken(): Promise<string | undefined> {
   try {
-    const creds = JSON.parse(readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf8"))
-    if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth.accessToken
+    return claudeAccessToken(readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf8"))
   } catch {}
   if (process.platform === "darwin") {
     const result = await Bun.$`security find-generic-password -s "Claude Code-credentials" -w`.quiet().nothrow()
-    if (result.exitCode === 0) {
-      try {
-        return JSON.parse(result.text().trim())?.claudeAiOauth?.accessToken ?? undefined
-      } catch {}
-    }
+    if (result.exitCode === 0) return claudeAccessToken(result.text().trim())
   }
   return undefined
 }
 
 async function claudeUsageProbe(): Promise<LiveUsage | null> {
   const token = await claudeToken()
-  if (!token) return null
-  const payload = await probeJson("https://api.anthropic.com/api/oauth/usage", {
-    authorization: `Bearer ${token}`,
-    "anthropic-beta": "oauth-2025-04-20",
-  })
-  return payload ? parseClaudeOauthUsage(payload) : null
+  return token ? await claudeOauthUsage(token) : null
 }
 
 async function kimiUsageProbe(): Promise<LiveUsage | null> {
   const key = process.env.KIMI_API_KEY
   if (!key) return null
-  const url = process.env.KIMI_USAGE_URL ?? "https://api.kimi.com/coding/v1/usages"
-  const payload = await probeJson(url, { authorization: `Bearer ${key}` })
-  return payload ? parseQuotaWindows(payload) : null
+  return await bearerUsage(process.env.KIMI_USAGE_URL ?? "https://api.kimi.com/coding/v1/usages", key, parseQuotaWindows)
 }
 
 async function glmUsageProbe(): Promise<LiveUsage | null> {
   const key = zaiKey()
   if (!key) return null
-  const url = process.env.ZAI_USAGE_URL ?? "https://api.z.ai/api/monitor/usage/quota/limit"
-  const payload = await probeJson(url, { authorization: `Bearer ${key}` })
-  return payload ? parseZaiQuota(payload) : null
+  return await bearerUsage(
+    process.env.ZAI_USAGE_URL ?? "https://api.z.ai/api/monitor/usage/quota/limit",
+    key,
+    parseZaiQuota,
+  )
 }
 
 export interface EngineDef {

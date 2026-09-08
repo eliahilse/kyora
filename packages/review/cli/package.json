@@ -2,7 +2,7 @@
   "name": "@kyora-sh/review",
   "version": "0.1.0",
   "type": "module",
-  "description": "Multi-engine AI code review — your own coding-agent subscriptions (Codex, Claude, Kimi, Grok, Qwen) reviewing PRs together, with consensus filtering and adversarial verification",
+  "description": "Multi-engine AI code review \u2014 your own coding-agent subscriptions (Codex, Claude, Kimi, Grok, Qwen) reviewing PRs together, with consensus filtering and adversarial verification",
   "license": "Elastic-2.0",
   "repository": {
     "type": "git",
@@ -41,5 +41,8 @@
     "@repo/typescript-config": "workspace:*",
     "@types/bun": "latest",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@kyora-sh/usage": "workspace:*"
   }
 }

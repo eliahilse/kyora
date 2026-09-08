@@ -1,3 +1,4 @@
+import { claudeAccessToken, claudeOauthUsage, type LiveUsage } from "@kyora-sh/usage"
 import { rm } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -104,6 +105,11 @@ export const claudeProvider: Provider = {
       if (text !== null) files[name] = text
     }
     return { provider: "claude", identity: claudeIdentity(slice), files, capturedAt: Date.now() }
+  },
+
+  async quota(snapshot: Snapshot): Promise<LiveUsage | null> {
+    const token = claudeAccessToken(snapshot.files[CREDENTIALS_FILE] ?? "")
+    return token ? await claudeOauthUsage(token) : null
   },
 
   async restore(snapshot: Snapshot): Promise<void> {

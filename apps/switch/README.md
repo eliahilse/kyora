@@ -121,8 +121,8 @@ Only the credentials and the account they belong to. Session history, project se
 
 - the OAuth blob, from the macOS login keychain (service `Claude Code-credentials`) or `~/.claude/.credentials.json` where there is no keychain
 - `oauthAccount` in `~/.claude.json`, and nothing else in that file — `userID` and `machineID` identify the install, not the account, so they stay put
-- `policy-limits.json` and `remote-settings.json`
-- entitlement caches (`modelAccessCache`, `hasAvailableSubscription`, `orgModelDefaultCache` and friends) are dropped so the incoming account refetches its own plan and limits instead of showing the outgoing account's
+
+Nothing else is touched, which is the same surface `/login` changes when you sign in as a different account. In particular `policy-limits.json` and `remote-settings.json` are left alone: the second one carries your org's plugin and marketplace config, and an earlier version of this tool deleted it on every switch. The entitlement caches in `~/.claude.json` are left alone too — the CLI refetches them for whoever is logged in.
 
 **Codex**
 

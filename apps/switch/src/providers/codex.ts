@@ -1,3 +1,4 @@
+import { codexCredentials, codexUsage, type LiveUsage } from "@kyora-sh/usage"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { readTextIfExists, writeFileAtomic } from "../fsx"
@@ -19,7 +20,6 @@ export const codexProvider: Provider = {
   label: "Codex",
   processName: "codex",
   loginHint: "run `codex login`",
-  quotaHint: "Codex reports limits in API response headers only, so there is nothing to poll",
 
   locations() {
     return [authPath()]
@@ -35,6 +35,11 @@ export const codexProvider: Provider = {
       throw new Error(`${authPath()} is not valid JSON`)
     }
     return { provider: "codex", identity: codexIdentity(parsed), files: { [AUTH_FILE]: text }, capturedAt: Date.now() }
+  },
+
+  async quota(snapshot: Snapshot): Promise<LiveUsage | null> {
+    const credentials = codexCredentials(snapshot.files[AUTH_FILE] ?? "")
+    return credentials ? await codexUsage(credentials.token, credentials.account) : null
   },
 
   async restore(snapshot: Snapshot): Promise<void> {

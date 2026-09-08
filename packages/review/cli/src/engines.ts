@@ -7,6 +7,8 @@ import {
   bearerUsage,
   claudeAccessToken,
   claudeOauthUsage,
+  codexCredentials,
+  codexUsage,
   looksRateLimited,
   markRun,
   parseQuotaWindows,
@@ -30,6 +32,15 @@ async function claudeToken(): Promise<string | undefined> {
 async function claudeUsageProbe(): Promise<LiveUsage | null> {
   const token = await claudeToken()
   return token ? await claudeOauthUsage(token) : null
+}
+
+async function codexUsageProbe(): Promise<LiveUsage | null> {
+  const path = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "auth.json")
+  let credentials: ReturnType<typeof codexCredentials> = null
+  try {
+    credentials = codexCredentials(readFileSync(path, "utf8"))
+  } catch {}
+  return credentials ? await codexUsage(credentials.token, credentials.account) : null
 }
 
 async function kimiUsageProbe(): Promise<LiveUsage | null> {
@@ -185,6 +196,7 @@ export const ENGINES: EngineDef[] = [
     argsChat: ["exec", "--sandbox", "read-only", "{prompt}"],
     readsOutFile: true,
     models: codexConfiguredModel() ? [codexConfiguredModel()!] : [],
+    usageProbe: codexUsageProbe,
     modelArgs: (model) => ["-m", model],
     effortArgs: (effort) => ["-c", `model_reasoning_effort="${effort}"`],
     authHint: "run `codex login` (ChatGPT subscription) or set OPENAI_API_KEY — CI: seed the CODEX_AUTH_JSON secret",

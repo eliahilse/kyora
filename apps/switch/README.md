@@ -85,7 +85,18 @@ codex — Codex
 
 Claude's payload carries a `limits` array covering the session window, the plan-wide weekly window, and a weekly window per model — that last one is where a `weekly Fable` or `weekly Opus` limit shows up, and it is easy to be near it while the plan-wide number still looks comfortable. Codex reports its plan window plus any model-scoped limits the account has.
 
-The account that is live is always probed with its live credentials, which the CLI keeps refreshed. Other slots are probed with the access token frozen into them at save time, and Claude's expire after about eight hours — so a slot you have not loaded today reports how long ago its token expired rather than a quota. Its refresh token is still good for weeks, so loading the slot and starting the CLI once brings it back. Codex access tokens last around ten days, so its slots keep reporting for longer.
+The account that is live is always probed with its live credentials, which the CLI keeps refreshed. Other slots are probed with the access token frozen into them at save time, and Claude's expire after about eight hours, so those go quiet by the next day. `refresh` fixes that:
+
+```bash
+kyora-switch claude refresh    # renew stale slots, then show usage
+kyora-switch usage --refresh   # same, as part of a normal usage read
+```
+
+It makes the call the CLI itself makes when its token ages out: `POST /v1/oauth/token` with `grant_type=refresh_token`. The refresh token rotates, so the new credentials are written straight back into the slot — a spent token is never left behind. Only slots that are *not* live are touched: the live account belongs to the CLI, which refreshes it under its own lock.
+
+A refresh does not extend the session. The refresh token expiry is absolute, roughly four weeks from the login that created it, and comes back unchanged. Once past that, the slot needs a real login.
+
+Codex access tokens last around ten days, so its slots keep reporting without any of this.
 
 The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
 

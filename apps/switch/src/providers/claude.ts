@@ -11,6 +11,9 @@ const CREDENTIALS_FILE = "credentials.json"
 const ACCOUNT_FILE = "account.json"
 const ACCOUNT_KEY = "oauthAccount"
 
+const tokenUrl = () => process.env.KYORA_CLAUDE_TOKEN_URL ?? "https://platform.claude.com/v1/oauth/token"
+const clientId = () => process.env.KYORA_CLAUDE_CLIENT_ID ?? "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
 const STALE_KEYS = [
   "additionalModelCostsCache",
   "additionalModelOptionsCache",
@@ -74,6 +77,60 @@ export function mergeAccountIntoConfig(
   return merged
 }
 
+interface OauthBlob {
+  accessToken?: string
+  refreshToken?: string
+  expiresAt?: number
+  refreshTokenExpiresAt?: number
+  scopes?: string[]
+}
+
+/**
+ * Trades a stored refresh token for a fresh access token, the same call the CLI
+ * makes when its own token ages out. The refresh token rotates, so the caller
+ * must persist the result or the slot is left holding a spent credential.
+ */
+export async function refreshCredentials(credentials: string): Promise<string | null> {
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(credentials)
+  } catch {
+    return null
+  }
+  const oauth = parsed.claudeAiOauth as OauthBlob | undefined
+  if (!oauth?.refreshToken) return null
+
+  const response = await fetch(tokenUrl(), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      refresh_token: oauth.refreshToken,
+      client_id: clientId(),
+      scope: (oauth.scopes ?? []).join(" "),
+    }),
+    signal: AbortSignal.timeout(30_000),
+  }).catch(() => null)
+  if (!response?.ok) return null
+
+  const data = (await response.json().catch(() => null)) as Record<string, unknown> | null
+  if (typeof data?.access_token !== "string") return null
+
+  const now = Date.now()
+  const next: OauthBlob = {
+    ...oauth,
+    accessToken: data.access_token,
+    refreshToken: typeof data.refresh_token === "string" ? data.refresh_token : oauth.refreshToken,
+    expiresAt: typeof data.expires_in === "number" ? now + data.expires_in * 1000 : oauth.expiresAt,
+    refreshTokenExpiresAt:
+      typeof data.refresh_token_expires_in === "number"
+        ? now + data.refresh_token_expires_in * 1000
+        : oauth.refreshTokenExpiresAt,
+    scopes: typeof data.scope === "string" ? data.scope.split(" ") : oauth.scopes,
+  }
+  return `${JSON.stringify({ ...parsed, claudeAiOauth: next }, null, 2)}\n`
+}
+
 export function accountSlice(config: Record<string, unknown> | null): Record<string, unknown> {
   return config && ACCOUNT_KEY in config ? { [ACCOUNT_KEY]: config[ACCOUNT_KEY] } : {}
 }
@@ -123,6 +180,14 @@ export const claudeProvider: Provider = {
     } catch {
       return undefined
     }
+  },
+
+  async refresh(snapshot: Snapshot): Promise<Snapshot | null> {
+    const credentials = snapshot.files[CREDENTIALS_FILE]
+    if (credentials === undefined) return null
+    const refreshed = await refreshCredentials(credentials)
+    if (refreshed === null) return null
+    return { ...snapshot, files: { ...snapshot.files, [CREDENTIALS_FILE]: refreshed } }
   },
 
   async quota(snapshot: Snapshot): Promise<LiveUsage | null> {

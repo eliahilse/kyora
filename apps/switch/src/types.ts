@@ -28,6 +28,7 @@ export interface Provider {
   restore(snapshot: Snapshot): Promise<void>
   quota?(snapshot: Snapshot): Promise<LiveUsage | null>
   credentialExpiry?(snapshot: Snapshot): number | undefined
+  refresh?(snapshot: Snapshot): Promise<Snapshot | null>
   quotaHint?: string
 }
 

@@ -23,6 +23,7 @@ usage:
   kyora-switch claude load <slot>       log Claude Code back into a stored account
   kyora-switch claude list              slots for Claude Code
   kyora-switch claude usage             how much quota each stored account has left
+  kyora-switch claude refresh           renew the tokens of stale slots, then show usage
   kyora-switch claude clear             sign out locally, without revoking the account
   kyora-switch claude rm <slot>         delete a slot
   kyora-switch claude rename <a> <b>    rename a slot
@@ -32,10 +33,12 @@ usage:
 
   kyora-switch status                   which account each CLI is logged into
   kyora-switch usage                    remaining quota across every stored account
+  kyora-switch refresh                  renew stale slot tokens, then show usage
   kyora-switch doctor                   where each CLI keeps its auth on this machine
 
 options:
   --json         machine-readable output (list, status, usage)
+  --refresh      renew a stale slot's token before reading its quota
   -y, --yes      skip the confirmation on rm
   -h, --help     this help
 
@@ -134,7 +137,25 @@ interface UsageRow {
   note?: string
 }
 
-async function usageRows(provider: Provider): Promise<UsageRow[]> {
+/**
+ * Refreshes a slot that is not live and whose access token has lapsed, writing the
+ * rotated credentials straight back so the spent refresh token is never kept.
+ */
+async function refreshSlot(provider: Provider, name: string, snapshot: Snapshot): Promise<Snapshot> {
+  const expiry = provider.credentialExpiry?.(snapshot)
+  if (!provider.refresh || expiry === undefined || expiry > Date.now()) return snapshot
+
+  const refreshed = await provider.refresh(snapshot)
+  if (!refreshed) {
+    note(`${provider.id} "${name}": refresh was refused, its stored token is spent — load the slot and log in again`)
+    return snapshot
+  }
+  await writeBackup(refreshed)
+  await writeSnapshot(name, refreshed)
+  return refreshed
+}
+
+async function usageRows(provider: Provider, refresh: boolean): Promise<UsageRow[]> {
   const active = await provider.capture()
   const slots = await listSlots(provider.id)
   const rows: UsageRow[] = []
@@ -142,7 +163,8 @@ async function usageRows(provider: Provider): Promise<UsageRow[]> {
   for (const slot of slots) {
     const stored = await readSnapshot(provider.id, slot.name)
     const live = Boolean(active && active.identity.account === slot.identity.account)
-    const snapshot = live ? active : stored
+    let snapshot = live ? active : stored
+    if (!live && refresh && snapshot) snapshot = await refreshSlot(provider, slot.name, snapshot)
     rows.push({
       provider: provider.id,
       slot: slot.name,
@@ -191,8 +213,10 @@ function renderUsage(provider: Provider, rows: UsageRow[]): void {
   }
 }
 
-async function usage(providers: Provider[], json: boolean): Promise<void> {
-  const collected = await Promise.all(providers.map(async (provider) => [provider, await usageRows(provider)] as const))
+async function usage(providers: Provider[], json: boolean, refresh: boolean): Promise<void> {
+  const collected = await Promise.all(
+    providers.map(async (provider) => [provider, await usageRows(provider, refresh)] as const),
+  )
   if (json) return console.log(JSON.stringify(Object.fromEntries(collected.map(([p, rows]) => [p.id, rows])), null, 2))
 
   collected.forEach(([provider, rows], index) => {
@@ -279,7 +303,13 @@ async function doctor(): Promise<void> {
   }
 }
 
-async function runProvider(provider: Provider, args: string[], json: boolean, yes: boolean): Promise<void> {
+async function runProvider(
+  provider: Provider,
+  args: string[],
+  json: boolean,
+  yes: boolean,
+  refresh: boolean,
+): Promise<void> {
   const [command = "list", first, second] = args
   switch (command) {
     case "save":
@@ -291,7 +321,9 @@ async function runProvider(provider: Provider, args: string[], json: boolean, ye
     case "ls":
       return await list(provider, json)
     case "usage":
-      return await usage([provider], json)
+      return await usage([provider], json, refresh)
+    case "refresh":
+      return await usage([provider], json, true)
     case "rm":
     case "remove":
     case "delete":
@@ -313,6 +345,7 @@ async function main(): Promise<void> {
       args: Bun.argv.slice(2),
       options: {
         json: { type: "boolean" },
+        refresh: { type: "boolean" },
         yes: { type: "boolean", short: "y" },
         help: { type: "boolean", short: "h" },
       },
@@ -327,13 +360,17 @@ async function main(): Promise<void> {
   if (values.help) return console.log(HELP)
 
   const [head = "status", ...rest] = positionals
-  if (isProviderId(head)) return await runProvider(providerById(head), rest, Boolean(values.json), Boolean(values.yes))
+  if (isProviderId(head)) {
+    return await runProvider(providerById(head), rest, Boolean(values.json), Boolean(values.yes), Boolean(values.refresh))
+  }
 
   switch (head) {
     case "status":
       return await status(Boolean(values.json))
     case "usage":
-      return await usage(PROVIDERS, Boolean(values.json))
+      return await usage(PROVIDERS, Boolean(values.json), Boolean(values.refresh))
+    case "refresh":
+      return await usage(PROVIDERS, Boolean(values.json), true)
     case "doctor":
       return await doctor()
     case "help":

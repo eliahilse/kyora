@@ -212,6 +212,7 @@ test("refreshCredentials rotates the tokens and keeps everything else in the blo
   expect(blob.claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"])
   expect(blob.claudeAiOauth.subscriptionType).toBe("max")
   expect(blob.mcpOAuth).toEqual({ linear: { accessToken: "keep-me" } })
+  expect(refreshed).toBe(JSON.stringify(blob))
 })
 
 test("refreshCredentials keeps the sent refresh token when the response omits one", async () => {

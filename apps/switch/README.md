@@ -26,10 +26,12 @@ kyora-switch codex load private
 ## Install
 
 ```bash
-cd apps/switch && bun link
+ln -s "$PWD/apps/switch/src/index.ts" ~/.local/bin/kyora-switch
 ```
 
-That puts `kyora-switch` on your PATH. Or run it directly with `bun apps/switch/src/index.ts`.
+The entry point carries a `#!/usr/bin/env bun` shebang, so a symlink from anywhere on your PATH is the whole install. `bun link` also works, but only creates the shim once Bun has a global package.json to hang it on.
+
+The link points at the checkout, so the tool runs whatever branch you have out. Or skip the install and run `bun apps/switch/src/index.ts`.
 
 ## Commands
 
@@ -41,6 +43,7 @@ Every provider takes the same verbs, under `kyora-switch claude …` or `kyora-s
 | `load <slot>` | log that provider back into a stored account |
 | `list` | slots for that provider, with the live one marked |
 | `usage` | how much quota each stored account has left |
+| `clear` | sign out locally, without revoking the account |
 | `rm <slot>` | delete a slot |
 | `rename <old> <new>` | rename a slot |
 
@@ -61,20 +64,43 @@ Slots are namespaced per provider, so `claude/work` and `codex/work` are indepen
 `usage` answers the question you actually have before switching. It probes each stored account with that slot's own token, so you see every account at once rather than only the one you are logged into:
 
 ```
-$ kyora-switch claude usage
+$ kyora-switch usage
+claude — Claude Code
 * work     you@work.dev · Acme · max
-           68% left   5h 32% used, resets in 4h 12m · 7d 30% used, resets in 4d
+           38% left   session 50% used, resets in 3h 33m · weekly 32% used, resets in 4d · weekly Fable 62% used, resets in 4d
   private  you@home.dev · max
-           9% left    5h 91% used, resets in 38m · 7d 44% used, resets in 3d
+           9% left    session 91% used, resets in 38m · weekly 44% used, resets in 3d
+
+codex — Codex
+* work     you@work.dev · pro
+           26% left   7d 74% used, resets in 6d · GPT-5.3-Codex-Spark 5h 0% used, resets in 5h
 ```
 
-`*` marks the account that is live. Quota comes from `api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's own `/usage` reads, and the percentage is what is left on the tightest window.
+`*` marks the account that is live, and the percentage is what is left on the tightest window — including the per-model ones, which are often the binding limit long before the plan-wide window is.
+
+| provider | source |
+| --- | --- |
+| Claude Code | `api.anthropic.com/api/oauth/usage`, the endpoint `/usage` reads |
+| Codex | `chatgpt.com/backend-api/codex/usage`, the endpoint `/status` reads |
+
+Claude's payload carries a `limits` array covering the session window, the plan-wide weekly window, and a weekly window per model — that last one is where a `weekly Fable` or `weekly Opus` limit shows up, and it is easy to be near it while the plan-wide number still looks comfortable. Codex reports its plan window plus any model-scoped limits the account has.
 
 A slot whose access token has gone stale reports nothing until you load it and start the CLI once, which refreshes it.
 
-Codex has no equivalent: it reports limits in API response headers during a request, so there is nothing to poll, and `usage` says so rather than guessing.
-
 The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
+
+## Signing out without losing the account
+
+`codex logout` and Claude's `/logout` end the account's session server side, which also invalidates the credentials sitting in your saved slots. That is the wrong tool when all you want is a free slot to log a second account into.
+
+```bash
+kyora-switch codex clear     # remove the local credentials, nothing else
+codex login                  # now log in as someone else
+```
+
+`clear` removes only what is on this machine: `~/.codex/auth.json` for Codex, and for Claude Code the OAuth blob plus the `oauthAccount` key. It makes no network call, so every slot you saved earlier still loads. The outgoing login is backed up first, exactly like `load` does.
+
+`config.toml`, project history, settings and MCP config are untouched.
 
 ## What actually gets swapped
 

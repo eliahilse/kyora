@@ -27,6 +27,13 @@ export async function keychainRead(service = KEYCHAIN_SERVICE): Promise<string |
   return value
 }
 
+export async function keychainDelete(service = KEYCHAIN_SERVICE): Promise<void> {
+  const result = await Bun.$`security delete-generic-password -a ${keychainAccount()} -s ${service}`.quiet().nothrow()
+  if (result.exitCode !== 0 && !/could not be found/i.test(result.stderr.toString())) {
+    throw new Error(`keychain delete failed: ${result.stderr.toString().trim() || `exit ${result.exitCode}`}`)
+  }
+}
+
 async function run(command: string[], input?: string): Promise<{ ok: boolean; stderr: string }> {
   const proc = Bun.spawn(command, {
     stdin: input === undefined ? "ignore" : new TextEncoder().encode(input),

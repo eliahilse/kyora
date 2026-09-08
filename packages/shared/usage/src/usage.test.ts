@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { cooldownRemainingMs, lastRunAt, loadUsage, looksRateLimited, markRun, resetHintMs } from "./state"
-import { parseClaudeOauthUsage, parseQuotaWindows, parseTokenPlanUsage, parseZaiQuota } from "./quota"
+import { codexCredentials, parseClaudeOauthUsage, parseCodexUsage, parseQuotaWindows, parseTokenPlanUsage, parseZaiQuota } from "./quota"
 
 beforeEach(() => {
   process.env.KYORA_REVIEW_STATE_DIR = mkdtempSync(join(tmpdir(), "kyora-usage-"))
@@ -121,33 +121,94 @@ describe("resetHintMs", () => {
   })
 })
 
-describe("parseClaudeOauthUsage windows", () => {
-  test("reports each window with its reset time", () => {
+describe("parseClaudeOauthUsage", () => {
+  test("prefers the limits array, so a model-scoped weekly window is not missed", () => {
+    const parsed = parseClaudeOauthUsage({
+      five_hour: { utilization: 49, resets_at: "2026-09-08T03:40:00.011853+00:00" },
+      seven_day: { utilization: 32, resets_at: "2026-09-12T09:00:00.011875+00:00" },
+      limits: [
+        { kind: "session", group: "session", percent: 49, resets_at: "2026-09-08T03:40:00.011853+00:00", scope: null, is_active: false },
+        { kind: "weekly_all", group: "weekly", percent: 32, resets_at: "2026-09-12T09:00:00.011875+00:00", scope: null, is_active: false },
+        {
+          kind: "weekly_scoped",
+          group: "weekly",
+          percent: 62,
+          resets_at: "2026-09-12T09:00:00.012118+00:00",
+          scope: { model: { id: null, display_name: "Fable" }, surface: null },
+          is_active: true,
+        },
+      ],
+    })
+    expect(parsed?.windows?.map((w) => w.label)).toEqual(["session", "weekly", "weekly Fable"])
+    expect(parsed?.windows?.find((w) => w.label === "weekly Fable")).toEqual({
+      label: "weekly Fable",
+      usedPct: 62,
+      resetsAt: Date.parse("2026-09-12T09:00:00.012118+00:00"),
+      active: true,
+    })
+    expect(parsed?.remainingPct).toBe(38)
+  })
+
+  test("falls back to the top-level windows when there is no limits array", () => {
     const parsed = parseClaudeOauthUsage({
       five_hour: { utilization: 32, resets_at: "2026-09-08T03:39:59.660912+00:00" },
-      seven_day: { utilization: 30, resets_at: "2026-09-12T08:59:59.660934+00:00" },
+      seven_day: { utilization: 30 },
     })
     expect(parsed?.remainingPct).toBe(68)
     expect(parsed?.windows).toEqual([
       { label: "5h", usedPct: 32, resetsAt: Date.parse("2026-09-08T03:39:59.660912+00:00") },
-      { label: "7d", usedPct: 30, resetsAt: Date.parse("2026-09-12T08:59:59.660934+00:00") },
+      { label: "7d", usedPct: 30, resetsAt: undefined },
     ])
   })
 
-  test("omits resetsAt when the payload has none or it is unparseable", () => {
-    const parsed = parseClaudeOauthUsage({
-      five_hour: { utilization: 10 },
-      seven_day: { utilization: 20, resets_at: "not a date" },
-    })
+  test("skips windows the payload leaves null and reports nothing when all are", () => {
+    expect(parseClaudeOauthUsage({ five_hour: { utilization: 45 }, seven_day: null })?.remainingPct).toBe(55)
+    expect(parseClaudeOauthUsage({ five_hour: null, seven_day: null })).toBeNull()
+    expect(parseClaudeOauthUsage(null)).toBeNull()
+  })
+})
+
+describe("parseCodexUsage", () => {
+  const payload = {
+    plan_type: "pro",
+    rate_limit: {
+      primary_window: { used_percent: 73, limit_window_seconds: 604800, reset_at: 1789321995 },
+      secondary_window: null,
+    },
+    additional_rate_limits: [
+      {
+        limit_name: "GPT-5.3-Codex-Spark",
+        rate_limit: {
+          primary_window: { used_percent: 4, limit_window_seconds: 18000, reset_at: 1788843816 },
+          secondary_window: { used_percent: 9, limit_window_seconds: 604800, reset_at: 1789430616 },
+        },
+      },
+    ],
+  }
+
+  test("labels windows by length and keeps named sub-limits", () => {
+    const parsed = parseCodexUsage(payload)
     expect(parsed?.windows).toEqual([
-      { label: "5h", usedPct: 10, resetsAt: undefined },
-      { label: "7d", usedPct: 20, resetsAt: undefined },
+      { label: "7d", usedPct: 73, resetsAt: 1789321995000 },
+      { label: "GPT-5.3-Codex-Spark 5h", usedPct: 4, resetsAt: 1788843816000 },
+      { label: "GPT-5.3-Codex-Spark 7d", usedPct: 9, resetsAt: 1789430616000 },
     ])
+    expect(parsed?.remainingPct).toBe(27)
   })
 
-  test("skips windows the payload leaves null", () => {
-    const parsed = parseClaudeOauthUsage({ five_hour: { utilization: 45 }, seven_day: null })
-    expect(parsed?.windows).toHaveLength(1)
-    expect(parsed?.remainingPct).toBe(55)
+  test("returns null when no window carries a percentage", () => {
+    expect(parseCodexUsage({ rate_limit: { primary_window: null, secondary_window: null } })).toBeNull()
+    expect(parseCodexUsage(null)).toBeNull()
+  })
+})
+
+describe("codexCredentials", () => {
+  test("takes the access token and account id, rejecting anything else", () => {
+    expect(codexCredentials(JSON.stringify({ tokens: { access_token: "t", account_id: "a" } }))).toEqual({
+      token: "t",
+      account: "a",
+    })
+    expect(codexCredentials(JSON.stringify({ tokens: { access_token: "t" } }))).toBeNull()
+    expect(codexCredentials("not json")).toBeNull()
   })
 })

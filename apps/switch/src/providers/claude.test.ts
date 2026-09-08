@@ -153,3 +153,14 @@ test("a slot saved before forget still restores afterwards", async () => {
   expect(await Bun.file(join(dir, ".credentials.json")).text()).toBe('{"claudeAiOauth":{"accessToken":"work-token"}}')
   expect(JSON.parse(await Bun.file(claudeConfigPath()).text()).oauthAccount.emailAddress).toBe("work@acme.dev")
 })
+
+test("credentialExpiry reads the OAuth expiry, and copes with a blob without one", async () => {
+  await seed("work@acme.dev", JSON.stringify({ claudeAiOauth: { accessToken: "t", expiresAt: 1788849727085 } }))
+  expect(claudeProvider.credentialExpiry!((await claudeProvider.capture())!)).toBe(1788849727085)
+
+  await seed("work@acme.dev", JSON.stringify({ claudeAiOauth: { accessToken: "t" } }))
+  expect(claudeProvider.credentialExpiry!((await claudeProvider.capture())!)).toBeUndefined()
+
+  await seed("work@acme.dev", "{not json")
+  expect(claudeProvider.credentialExpiry!((await claudeProvider.capture())!)).toBeUndefined()
+})

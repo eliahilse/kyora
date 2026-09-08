@@ -85,7 +85,7 @@ codex — Codex
 
 Claude's payload carries a `limits` array covering the session window, the plan-wide weekly window, and a weekly window per model — that last one is where a `weekly Fable` or `weekly Opus` limit shows up, and it is easy to be near it while the plan-wide number still looks comfortable. Codex reports its plan window plus any model-scoped limits the account has.
 
-A slot whose access token has gone stale reports nothing until you load it and start the CLI once, which refreshes it.
+The account that is live is always probed with its live credentials, which the CLI keeps refreshed. Other slots are probed with the access token frozen into them at save time, and Claude's expire after about eight hours — so a slot you have not loaded today reports how long ago its token expired rather than a quota. Its refresh token is still good for weeks, so loading the slot and starting the CLI once brings it back. Codex access tokens last around ten days, so its slots keep reporting for longer.
 
 The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
 

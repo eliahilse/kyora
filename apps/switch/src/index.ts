@@ -102,14 +102,17 @@ async function list(provider: Provider, json: boolean): Promise<void> {
 }
 
 
-function relative(timestamp: number): string {
-  const ms = timestamp - Date.now()
-  if (ms <= 0) return "now"
-  const minutes = Math.round(ms / 60_000)
+function duration(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60_000))
   if (minutes < 60) return `${minutes}m`
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return minutes % 60 === 0 ? `${hours}h` : `${hours}h ${minutes % 60}m`
   return `${Math.round(hours / 24)}d`
+}
+
+function relative(timestamp: number): string {
+  const ms = timestamp - Date.now()
+  return ms <= 0 ? "now" : duration(ms)
 }
 
 function describeQuota(quota: LiveUsage): string {
@@ -127,6 +130,7 @@ interface UsageRow {
   account: string
   live: boolean
   quota: LiveUsage | null
+  expiresAt?: number
   note?: string
 }
 
@@ -136,13 +140,16 @@ async function usageRows(provider: Provider): Promise<UsageRow[]> {
   const rows: UsageRow[] = []
 
   for (const slot of slots) {
-    const snapshot = await readSnapshot(provider.id, slot.name)
+    const stored = await readSnapshot(provider.id, slot.name)
+    const live = Boolean(active && active.identity.account === slot.identity.account)
+    const snapshot = live ? active : stored
     rows.push({
       provider: provider.id,
       slot: slot.name,
       account: describeIdentity(slot.identity),
-      live: Boolean(active && active.identity.account === slot.identity.account),
+      live,
       quota: snapshot && provider.quota ? await provider.quota(snapshot) : null,
+      expiresAt: snapshot ? provider.credentialExpiry?.(snapshot) : undefined,
     })
   }
 
@@ -153,10 +160,19 @@ async function usageRows(provider: Provider): Promise<UsageRow[]> {
       account: describeIdentity(active.identity),
       live: true,
       quota: provider.quota ? await provider.quota(active) : null,
+      expiresAt: provider.credentialExpiry?.(active),
       note: "not saved to a slot",
     })
   }
   return rows
+}
+
+function unavailable(provider: Provider, row: UsageRow): string {
+  if (provider.quotaHint) return provider.quotaHint
+  if (row.expiresAt !== undefined && row.expiresAt <= Date.now()) {
+    return `stored access token expired ${duration(Date.now() - row.expiresAt)} ago — load this slot to refresh it`
+  }
+  return "no quota reported"
 }
 
 function renderUsage(provider: Provider, rows: UsageRow[]): void {
@@ -168,9 +184,7 @@ function renderUsage(provider: Provider, rows: UsageRow[]): void {
   for (const row of rows) {
     const name = (row.slot ?? "live").padEnd(width)
     const marker = row.live ? "*" : " "
-    const quota = row.quota
-      ? describeQuota(row.quota)
-      : (provider.quotaHint ?? "no quota reported — load the slot and start the CLI to refresh its token")
+    const quota = row.quota ? describeQuota(row.quota) : unavailable(provider, row)
     console.log(`${marker} ${name}  ${row.account}`)
     console.log(`  ${" ".repeat(width)}  ${quota}`)
     if (row.note) console.log(`  ${" ".repeat(width)}  ${row.note}`)

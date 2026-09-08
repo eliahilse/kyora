@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { rm } from "node:fs/promises"
 import { readTextIfExists, writeFileAtomic } from "../fsx"
-import { codexIdentity } from "../identity"
+import { codexIdentity, jwtPayload } from "../identity"
 import type { Provider, Snapshot } from "../types"
 
 const AUTH_FILE = "auth.json"
@@ -40,6 +40,12 @@ export const codexProvider: Provider = {
 
   async forget(): Promise<void> {
     await rm(authPath(), { force: true })
+  },
+
+  credentialExpiry(snapshot: Snapshot): number | undefined {
+    const token = codexCredentials(snapshot.files[AUTH_FILE] ?? "")?.token
+    const exp = token ? jwtPayload(token)?.exp : undefined
+    return typeof exp === "number" ? exp * 1000 : undefined
   },
 
   async quota(snapshot: Snapshot): Promise<LiveUsage | null> {

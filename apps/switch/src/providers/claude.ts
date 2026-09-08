@@ -128,7 +128,7 @@ export async function refreshCredentials(credentials: string): Promise<string | 
         : oauth.refreshTokenExpiresAt,
     scopes: typeof data.scope === "string" ? data.scope.split(" ") : oauth.scopes,
   }
-  return `${JSON.stringify({ ...parsed, claudeAiOauth: next }, null, 2)}\n`
+  return JSON.stringify({ ...parsed, claudeAiOauth: next })
 }
 
 export function accountSlice(config: Record<string, unknown> | null): Record<string, unknown> {

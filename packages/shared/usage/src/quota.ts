@@ -8,6 +8,7 @@ export interface UsageWindow {
   label: string
   usedPct: number
   resetsAt?: number
+  active?: boolean
 }
 
 /**
@@ -121,33 +122,74 @@ function collectPercentages(node: unknown, out: { pct: number; label: string }[]
 }
 
 /**
- * Claude's OAuth usage payload reports window utilization rather than raw
- * counts: five_hour / seven_day objects with a percentage (0-1 or 0-100).
+ * Claude's OAuth usage payload carries a `limits` array covering session, weekly
+ * and per-model weekly windows; the older top-level keys are the fallback.
  */
 export function parseClaudeOauthUsage(payload: unknown): LiveUsage | null {
   if (payload === null || typeof payload !== "object") return null
   const obj = payload as Record<string, unknown>
-  const parts: string[] = []
+  const windows = Array.isArray(obj.limits) ? claudeLimitWindows(obj.limits) : []
+  return summarize(windows.length > 0 ? windows : claudeLegacyWindows(obj))
+}
+
+function summarize(windows: UsageWindow[]): LiveUsage | null {
+  if (windows.length === 0) return null
+  const worst = Math.max(...windows.map((window) => window.usedPct))
+  return {
+    remainingPct: Math.max(0, Math.round(100 - worst)),
+    detail: windows.map((window) => `${window.label} ${window.usedPct}% used`).join(" · "),
+    windows,
+  }
+}
+
+function claudeLimitWindows(limits: unknown[]): UsageWindow[] {
   const windows: UsageWindow[] = []
-  let worst = -1
+  for (const entry of limits) {
+    if (entry === null || typeof entry !== "object") continue
+    const limit = entry as Record<string, unknown>
+    if (typeof limit.percent !== "number") continue
+    windows.push({
+      label: claudeLimitLabel(limit),
+      usedPct: Math.round(limit.percent),
+      resetsAt: parseTimestamp(limit.resets_at),
+      active: limit.is_active === true,
+    })
+  }
+  return windows
+}
+
+function claudeLimitLabel(limit: Record<string, unknown>): string {
+  const kind = typeof limit.kind === "string" ? limit.kind : "limit"
+  const scope = limit.scope as Record<string, unknown> | null | undefined
+  const model = scope?.model as Record<string, unknown> | null | undefined
+  const name = typeof model?.display_name === "string" ? model.display_name : undefined
+  if (kind === "session") return "session"
+  if (kind === "weekly_all") return "weekly"
+  if (kind === "weekly_scoped") return name ? `weekly ${name}` : "weekly scoped"
+  return name ? `${kind} ${name}` : kind
+}
+
+function claudeLegacyWindows(obj: Record<string, unknown>): UsageWindow[] {
+  const windows: UsageWindow[] = []
   for (const [key, label] of [["five_hour", "5h"], ["seven_day", "7d"]] as const) {
     const window = obj[key]
     if (window === null || typeof window !== "object") continue
     const util = utilizationOf(window as Record<string, unknown>)
     if (util === null) continue
-    worst = Math.max(worst, util)
-    parts.push(`${label} ${Math.round(util)}% used`)
     windows.push({ label, usedPct: Math.round(util), resetsAt: resetsAtOf(window as Record<string, unknown>) })
   }
-  if (worst === -1) return null
-  return { remainingPct: Math.max(0, Math.round(100 - worst)), detail: parts.join(" · "), windows }
+  return windows
 }
 
-function resetsAtOf(window: Record<string, unknown>): number | undefined {
-  const raw = window.resets_at
+function parseTimestamp(raw: unknown): number | undefined {
+  if (typeof raw === "number") return raw > 1e11 ? raw : raw * 1000
   if (typeof raw !== "string") return undefined
   const parsed = Date.parse(raw)
   return Number.isNaN(parsed) ? undefined : parsed
+}
+
+function resetsAtOf(window: Record<string, unknown>): number | undefined {
+  return parseTimestamp(window.resets_at)
 }
 
 function utilizationOf(window: Record<string, unknown>): number | null {
@@ -194,4 +236,67 @@ export async function bearerUsage(
 ): Promise<LiveUsage | null> {
   const payload = await probeJson(url, { authorization: `Bearer ${key}` })
   return payload ? parse(payload) : null
+}
+
+function windowLabel(seconds: unknown): string {
+  if (typeof seconds !== "number" || seconds <= 0) return "window"
+  const hours = Math.round(seconds / 3600)
+  return hours < 24 ? `${hours}h` : `${Math.round(hours / 24)}d`
+}
+
+function codexWindows(rateLimit: unknown, prefix = ""): UsageWindow[] {
+  if (rateLimit === null || typeof rateLimit !== "object") return []
+  const limit = rateLimit as Record<string, unknown>
+  const windows: UsageWindow[] = []
+  for (const key of ["primary_window", "secondary_window"]) {
+    const window = limit[key]
+    if (window === null || typeof window !== "object") continue
+    const entry = window as Record<string, unknown>
+    if (typeof entry.used_percent !== "number") continue
+    windows.push({
+      label: `${prefix}${windowLabel(entry.limit_window_seconds)}`,
+      usedPct: Math.round(entry.used_percent),
+      resetsAt: parseTimestamp(entry.reset_at),
+    })
+  }
+  return windows
+}
+
+/** Reads the plan window plus any model-scoped limits out of Codex's usage payload. */
+export function parseCodexUsage(payload: unknown): LiveUsage | null {
+  if (payload === null || typeof payload !== "object") return null
+  const obj = payload as Record<string, unknown>
+  const windows = codexWindows(obj.rate_limit)
+
+  if (Array.isArray(obj.additional_rate_limits)) {
+    for (const entry of obj.additional_rate_limits) {
+      if (entry === null || typeof entry !== "object") continue
+      const extra = entry as Record<string, unknown>
+      const name = typeof extra.limit_name === "string" ? `${extra.limit_name} ` : ""
+      windows.push(...codexWindows(extra.rate_limit, name))
+    }
+  }
+  return summarize(windows)
+}
+
+/** Pulls the ChatGPT access token and account id out of a Codex auth.json blob. */
+export function codexCredentials(auth: string): { token: string; account: string } | null {
+  try {
+    const tokens = JSON.parse(auth)?.tokens
+    const token = tokens?.access_token
+    const account = tokens?.account_id
+    return typeof token === "string" && typeof account === "string" ? { token, account } : null
+  } catch {
+    return null
+  }
+}
+
+/** Asks ChatGPT what is left on the Codex plan windows for one account. */
+export async function codexUsage(token: string, account: string): Promise<LiveUsage | null> {
+  const payload = await probeJson(process.env.KYORA_CODEX_USAGE_URL ?? "https://chatgpt.com/backend-api/codex/usage", {
+    authorization: `Bearer ${token}`,
+    "chatgpt-account-id": account,
+    accept: "application/json",
+  })
+  return payload ? parseCodexUsage(payload) : null
 }

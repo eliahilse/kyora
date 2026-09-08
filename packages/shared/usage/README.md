@@ -10,12 +10,15 @@ Two halves:
 
 | function | source |
 | --- | --- |
-| `claudeOauthUsage(token)` | `api.anthropic.com/api/oauth/usage` — five-hour and seven-day windows |
+| `claudeOauthUsage(token)` | `api.anthropic.com/api/oauth/usage` — session, weekly, and per-model weekly windows |
+| `codexUsage(token, account)` | `chatgpt.com/backend-api/codex/usage` — plan window plus model-scoped limits |
 | `parseZaiQuota` | Z.ai monitor, per-window percentages |
 | `parseQuotaWindows` | Kimi and anything else exposing used/limit pairs |
 | `parseTokenPlanUsage` | Bailian token-plan console credits |
 
-`claudeAccessToken(blob)` pulls the OAuth token out of a Claude Code credentials blob, so a caller holding a stored login can ask about that account rather than the live one — which is how `kyora-switch usage` reports every saved account at once.
+Claude's payload reports windows twice over: a set of top-level keys, and a `limits` array. Only the array carries the per-model weekly windows, so that is what gets read when present, with the top-level keys as the fallback. A `weekly Fable` window at 62% while the plan-wide weekly sits at 32% is the normal case, not an edge one.
+
+`claudeAccessToken(blob)` and `codexCredentials(blob)` pull the credentials out of a stored login, so a caller can ask about an account it is not currently using — which is how `kyora-switch usage` reports every saved account at once.
 
 The tightest window always wins: `remainingPct` is what is left on the most constrained limit, not an average.
 

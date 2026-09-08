@@ -1,0 +1,2 @@
+[test]
+preload = ["./apps/switch/src/test-setup.ts"]

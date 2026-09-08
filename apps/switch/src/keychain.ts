@@ -8,9 +8,15 @@ export function keychainAccount(): string {
   return userInfo().username
 }
 
-/** Set KYORA_SWITCH_NO_KEYCHAIN=1 to keep credentials in files only. */
+/**
+ * Set KYORA_SWITCH_NO_KEYCHAIN=1 to keep credentials in files only. A test run is
+ * refused outright, because reaching the real login keychain from one signs the
+ * developer out of their own CLI.
+ */
 export function keychainSupported(): boolean {
-  return process.platform === "darwin" && process.env.KYORA_SWITCH_NO_KEYCHAIN !== "1"
+  if (process.env.KYORA_SWITCH_NO_KEYCHAIN === "1") return false
+  if (process.env.NODE_ENV === "test") return false
+  return process.platform === "darwin"
 }
 
 /**

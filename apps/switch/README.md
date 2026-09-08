@@ -43,6 +43,7 @@ Every provider takes the same verbs, under `kyora-switch claude …` or `kyora-s
 | `load <slot>` | log that provider back into a stored account |
 | `list` | slots for that provider, with the live one marked |
 | `usage` | how much quota each stored account has left |
+| `sync` | copy the live login back into its slot |
 | `clear` | sign out locally, without revoking the account |
 | `rm <slot>` | delete a slot |
 | `rename <old> <new>` | rename a slot |
@@ -100,6 +101,14 @@ Codex access tokens last around ten days, so its slots keep reporting without an
 
 The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
 
+## Slots never fall behind the CLI
+
+Claude Code rotates its own tokens every few hours and writes them straight to the keychain. A slot saved in the morning holds the morning's token by the evening — still loadable, since the refresh token survives rotation, but stale enough that `usage` had nothing to read and a switch away froze the slot on an old credential.
+
+So every `status`, `list`, `usage` and `load` first copies the live login back into whichever slot holds the same account. `load` does it before switching away, which is the moment that matters: the account you are leaving gets its freshest token saved before its keychain entry is overwritten. `sync` runs that step on its own.
+
+It is a local file copy, nothing more — no network, no keychain write, and a slot that already matches is left untouched so its timestamps do not churn. Slots for other accounts are never involved.
+
 ## Signing out without losing the account
 
 `codex logout` and Claude's `/logout` end the account's session server side, which also invalidates the credentials sitting in your saved slots. That is the wrong tool when all you want is a free slot to log a second account into.
@@ -121,8 +130,8 @@ Only the credentials and the account they belong to. Session history, project se
 
 - the OAuth blob, from the macOS login keychain (service `Claude Code-credentials`) or `~/.claude/.credentials.json` where there is no keychain
 - `oauthAccount` in `~/.claude.json`, and nothing else in that file — `userID` and `machineID` identify the install, not the account, so they stay put
-- `policy-limits.json` and `remote-settings.json`
-- entitlement caches (`modelAccessCache`, `hasAvailableSubscription`, `orgModelDefaultCache` and friends) are dropped so the incoming account refetches its own plan and limits instead of showing the outgoing account's
+
+Nothing else is touched, which is the same surface `/login` changes when you sign in as a different account. In particular `policy-limits.json` and `remote-settings.json` are left alone: the second one carries your org's plugin and marketplace config, and an earlier version of this tool deleted it on every switch. The entitlement caches in `~/.claude.json` are left alone too — the CLI refetches them for whoever is logged in.
 
 **Codex**
 

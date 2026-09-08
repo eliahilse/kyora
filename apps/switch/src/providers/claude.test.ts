@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import { chmod, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { keychainSupported } from "../keychain"
 import { accountSlice, claudeConfigPath, claudeProvider, mergeAccountIntoConfig, refreshCredentials } from "./claude"
 
 test("mergeAccountIntoConfig swaps identity and keeps unrelated machine state", () => {
@@ -26,14 +27,14 @@ test("mergeAccountIntoConfig leaves userID and machineID alone, they identify th
   expect(merged.machineID).toBe("machine-id")
 })
 
-test("mergeAccountIntoConfig drops the previous account's entitlement caches", () => {
+test("mergeAccountIntoConfig leaves the caches the CLI refetches for itself", () => {
   const merged = mergeAccountIntoConfig(
     { modelAccessCache: { a: 1 }, hasAvailableSubscription: true, subscriptionNoticeCount: 3, autoUpdates: true },
     { oauthAccount: {} },
   )
-  expect(merged).not.toHaveProperty("modelAccessCache")
-  expect(merged).not.toHaveProperty("hasAvailableSubscription")
-  expect(merged).not.toHaveProperty("subscriptionNoticeCount")
+  expect(merged.modelAccessCache).toEqual({ a: 1 })
+  expect(merged.hasAvailableSubscription).toBe(true)
+  expect(merged.subscriptionNoticeCount).toBe(3)
   expect(merged.autoUpdates).toBe(true)
 })
 
@@ -55,15 +56,19 @@ test("accountSlice takes only the account", () => {
 
 let dir: string
 const previous = process.env.CLAUDE_CONFIG_DIR
+const previousKeychain = process.env.KYORA_SWITCH_NO_KEYCHAIN
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "kyora-switch-claude-"))
   process.env.CLAUDE_CONFIG_DIR = dir
+  process.env.KYORA_SWITCH_NO_KEYCHAIN = "1"
 })
 
 afterEach(async () => {
   if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
   else process.env.CLAUDE_CONFIG_DIR = previous
+  if (previousKeychain === undefined) delete process.env.KYORA_SWITCH_NO_KEYCHAIN
+  else process.env.KYORA_SWITCH_NO_KEYCHAIN = previousKeychain
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -76,11 +81,15 @@ async function seed(email: string, credentials: string): Promise<void> {
   await Bun.write(join(dir, "policy-limits.json"), `{"for":"${email}"}`)
 }
 
+test("the keychain is unreachable from tests, whatever directory they run in", () => {
+  expect(keychainSupported()).toBe(false)
+})
+
 test("capture returns null when nothing is logged in", async () => {
   expect(await claudeProvider.capture()).toBeNull()
 })
 
-test("capture then restore round-trips the account and the side files", async () => {
+test("capture then restore round-trips the account", async () => {
   await seed("work@acme.dev", '{"claudeAiOauth":{"accessToken":"work-token"}}')
   const work = (await claudeProvider.capture())!
   expect(work.identity).toEqual({ account: "work@acme.dev", org: "Acme", plan: undefined })
@@ -93,16 +102,18 @@ test("capture then restore round-trips the account and the side files", async ()
   expect(config.userID).toBe("install-id")
   expect(config.numStartups).toBe(7)
   expect(await Bun.file(join(dir, ".credentials.json")).text()).toBe('{"claudeAiOauth":{"accessToken":"work-token"}}')
-  expect(await Bun.file(join(dir, "policy-limits.json")).text()).toBe('{"for":"work@acme.dev"}')
 })
 
-test("restore clears a side file the slot does not carry", async () => {
-  await seed("work@acme.dev", "{}")
-  const withoutSideFiles = (await claudeProvider.capture())!
-  delete withoutSideFiles.files["policy-limits.json"]
+test("restore leaves the CLI's own files alone", async () => {
+  await seed("work@acme.dev", '{"claudeAiOauth":{"accessToken":"work-token"}}')
+  const work = (await claudeProvider.capture())!
+  await Bun.write(join(dir, "remote-settings.json"), '{"enabledPlugins":{"team-tools":true}}')
 
-  await claudeProvider.restore(withoutSideFiles)
-  expect(await Bun.file(join(dir, "policy-limits.json")).exists()).toBe(false)
+  await claudeProvider.restore(work)
+
+  expect(await Bun.file(join(dir, "policy-limits.json")).text()).toBe('{"for":"work@acme.dev"}')
+  expect(await Bun.file(join(dir, "remote-settings.json")).text()).toBe('{"enabledPlugins":{"team-tools":true}}')
+  expect(Object.keys(work.files).sort()).toEqual(["account.json", "credentials.json"])
 })
 
 test("restore refuses a slot with no credentials", async () => {
@@ -134,7 +145,6 @@ test("forget drops the credentials and the account, keeping machine state", asyn
   await claudeProvider.forget()
 
   expect(await Bun.file(join(dir, ".credentials.json")).exists()).toBe(false)
-  expect(await Bun.file(join(dir, "policy-limits.json")).exists()).toBe(false)
   expect(await claudeProvider.capture()).toBeNull()
 
   const config = JSON.parse(await Bun.file(claudeConfigPath()).text())
@@ -212,6 +222,7 @@ test("refreshCredentials rotates the tokens and keeps everything else in the blo
   expect(blob.claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"])
   expect(blob.claudeAiOauth.subscriptionType).toBe("max")
   expect(blob.mcpOAuth).toEqual({ linear: { accessToken: "keep-me" } })
+  expect(refreshed).toBe(JSON.stringify(blob))
 })
 
 test("refreshCredentials keeps the sent refresh token when the response omits one", async () => {

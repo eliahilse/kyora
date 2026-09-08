@@ -14,6 +14,7 @@ import {
   writeBackup,
   writeSnapshot,
 } from "./store"
+import { syncLiveSlot } from "./sync"
 import { describeIdentity, isProviderId, type Provider, type ProviderId, type Snapshot } from "./types"
 
 const HELP = `kyora-switch — hot-swap Claude Code and Codex logins
@@ -24,6 +25,7 @@ usage:
   kyora-switch claude list              slots for Claude Code
   kyora-switch claude usage             how much quota each stored account has left
   kyora-switch claude refresh           renew the tokens of stale slots, then show usage
+  kyora-switch claude sync              copy the live login back into its slot
   kyora-switch claude clear             sign out locally, without revoking the account
   kyora-switch claude rm <slot>         delete a slot
   kyora-switch claude rename <a> <b>    rename a slot
@@ -34,7 +36,11 @@ usage:
   kyora-switch status                   which account each CLI is logged into
   kyora-switch usage                    remaining quota across every stored account
   kyora-switch refresh                  renew stale slot tokens, then show usage
+  kyora-switch sync                     copy each live login back into its slot
   kyora-switch doctor                   where each CLI keeps its auth on this machine
+
+Every read (status, list, usage) and every load syncs the live login into its
+slot first, so the CLI's own token refreshes never leave a slot behind.
 
 options:
   --json         machine-readable output (list, status, usage)
@@ -73,12 +79,11 @@ async function save(provider: Provider, name: string): Promise<void> {
 async function load(provider: Provider, name: string): Promise<void> {
   const snapshot = (await readSnapshot(provider.id, assertName(name))) ?? die(`no ${provider.id} slot "${name}"`)
 
-  const outgoing = await provider.capture()
+  const { active: outgoing, slots, synced } = await syncLiveSlot(provider)
   if (outgoing) {
     const backup = await writeBackup(outgoing)
-    const slots = await listSlots(provider.id)
-    const stored = slots.some((slot) => slot.identity.account === outgoing.identity.account)
-    if (!stored) {
+    if (synced) note(`synced ${provider.id} "${synced}" from the live login before switching away`)
+    else if (!slots.some((slot) => slot.identity.account === outgoing.identity.account)) {
       note(`the login you just replaced (${describeIdentity(outgoing.identity)}) was in no slot — it is in ${backup}`)
     }
   }
@@ -91,13 +96,12 @@ async function load(provider: Provider, name: string): Promise<void> {
 }
 
 async function list(provider: Provider, json: boolean): Promise<void> {
-  const slots = await listSlots(provider.id)
+  const { active: live, slots } = await syncLiveSlot(provider)
   if (json) return console.log(JSON.stringify(slots, null, 2))
   if (slots.length === 0) {
     return console.log(`no ${provider.id} slots yet — run \`kyora-switch ${provider.id} save <slot>\` while logged in`)
   }
 
-  const live = await provider.capture()
   for (const slot of slots) {
     const active = live && slot.identity.account === live.identity.account ? "  (active)" : ""
     console.log(`${pad(slot.name)} ${describeIdentity(slot.identity)}${active}`)
@@ -156,8 +160,7 @@ async function refreshSlot(provider: Provider, name: string, snapshot: Snapshot)
 }
 
 async function usageRows(provider: Provider, refresh: boolean): Promise<UsageRow[]> {
-  const active = await provider.capture()
-  const slots = await listSlots(provider.id)
+  const { active, slots } = await syncLiveSlot(provider)
   const rows: UsageRow[] = []
 
   for (const slot of slots) {
@@ -266,11 +269,23 @@ async function rename(provider: Provider, from: string, to: string): Promise<voi
   console.log(`renamed ${provider.id} "${from}" to "${to}"`)
 }
 
+async function sync(providers: Provider[]): Promise<void> {
+  for (const provider of providers) {
+    const { active, slots, synced } = await syncLiveSlot(provider)
+    if (!active) console.log(`${pad(provider.id)} not logged in — nothing to sync`)
+    else if (synced) console.log(`${pad(provider.id)} synced "${synced}" — ${describeIdentity(active.identity)}`)
+    else if (slots.some((slot) => slot.identity.account === active.identity.account)) {
+      console.log(`${pad(provider.id)} already current — ${describeIdentity(active.identity)}`)
+    } else {
+      console.log(`${pad(provider.id)} ${describeIdentity(active.identity)} is in no slot — save it first`)
+    }
+  }
+}
+
 async function status(json: boolean): Promise<void> {
   const rows = []
   for (const provider of PROVIDERS) {
-    const live: Snapshot | null = await provider.capture()
-    const slots = await listSlots(provider.id)
+    const { active: live, slots } = await syncLiveSlot(provider)
     const slot = slots.find((candidate) => live && candidate.identity.account === live.identity.account)
     rows.push({ provider: provider.id, identity: live?.identity ?? null, slot: slot?.name ?? null })
   }
@@ -324,6 +339,8 @@ async function runProvider(
       return await usage([provider], json, refresh)
     case "refresh":
       return await usage([provider], json, true)
+    case "sync":
+      return await sync([provider])
     case "rm":
     case "remove":
     case "delete":
@@ -371,6 +388,8 @@ async function main(): Promise<void> {
       return await usage(PROVIDERS, Boolean(values.json), Boolean(values.refresh))
     case "refresh":
       return await usage(PROVIDERS, Boolean(values.json), true)
+    case "sync":
+      return await sync(PROVIDERS)
     case "doctor":
       return await doctor()
     case "help":

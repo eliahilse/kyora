@@ -26,10 +26,12 @@ kyora-switch codex load private
 ## Install
 
 ```bash
-cd apps/switch && bun link
+ln -s "$PWD/apps/switch/src/index.ts" ~/.local/bin/kyora-switch
 ```
 
-That puts `kyora-switch` on your PATH. Or run it directly with `bun apps/switch/src/index.ts`.
+The entry point carries a `#!/usr/bin/env bun` shebang, so a symlink from anywhere on your PATH is the whole install. `bun link` also works, but only creates the shim once Bun has a global package.json to hang it on.
+
+The link points at the checkout, so the tool runs whatever branch you have out. Or skip the install and run `bun apps/switch/src/index.ts`.
 
 ## Commands
 

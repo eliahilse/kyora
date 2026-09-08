@@ -55,3 +55,20 @@ test("restore refuses a slot with no auth file", async () => {
     /no Codex credentials/,
   )
 })
+
+test("forget removes auth.json and is a no-op when there is none", async () => {
+  await Bun.write(join(dir, "auth.json"), auth("work@acme.dev"))
+  await codexProvider.forget()
+  expect(await Bun.file(join(dir, "auth.json")).exists()).toBe(false)
+  expect(await codexProvider.capture()).toBeNull()
+
+  await codexProvider.forget()
+  expect(await Bun.file(join(dir, "auth.json")).exists()).toBe(false)
+})
+
+test("forget leaves config.toml alone", async () => {
+  await Bun.write(join(dir, "auth.json"), auth("work@acme.dev"))
+  await Bun.write(join(dir, "config.toml"), 'model = "gpt-5.6-luna"\n')
+  await codexProvider.forget()
+  expect(await Bun.file(join(dir, "config.toml")).text()).toBe('model = "gpt-5.6-luna"\n')
+})

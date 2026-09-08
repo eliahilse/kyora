@@ -128,3 +128,28 @@ test("restore leaves the mode of .claude.json alone", async () => {
   await claudeProvider.restore(work)
   expect((await stat(claudeConfigPath())).mode & 0o777).toBe(0o644)
 })
+
+test("forget drops the credentials and the account, keeping machine state", async () => {
+  await seed("work@acme.dev", "{}")
+  await claudeProvider.forget()
+
+  expect(await Bun.file(join(dir, ".credentials.json")).exists()).toBe(false)
+  expect(await Bun.file(join(dir, "policy-limits.json")).exists()).toBe(false)
+  expect(await claudeProvider.capture()).toBeNull()
+
+  const config = JSON.parse(await Bun.file(claudeConfigPath()).text())
+  expect(config).not.toHaveProperty("oauthAccount")
+  expect(config.userID).toBe("install-id")
+  expect(config.numStartups).toBe(7)
+})
+
+test("a slot saved before forget still restores afterwards", async () => {
+  await seed("work@acme.dev", '{"claudeAiOauth":{"accessToken":"work-token"}}')
+  const saved = (await claudeProvider.capture())!
+
+  await claudeProvider.forget()
+  await claudeProvider.restore(saved)
+
+  expect(await Bun.file(join(dir, ".credentials.json")).text()).toBe('{"claudeAiOauth":{"accessToken":"work-token"}}')
+  expect(JSON.parse(await Bun.file(claudeConfigPath()).text()).oauthAccount.emailAddress).toBe("work@acme.dev")
+})

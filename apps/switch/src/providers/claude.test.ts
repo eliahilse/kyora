@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import { chmod, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { accountSlice, claudeConfigPath, claudeProvider, mergeAccountIntoConfig } from "./claude"
+import { accountSlice, claudeConfigPath, claudeProvider, mergeAccountIntoConfig, refreshCredentials } from "./claude"
 
 test("mergeAccountIntoConfig swaps identity and keeps unrelated machine state", () => {
   const config = {
@@ -163,4 +163,82 @@ test("credentialExpiry reads the OAuth expiry, and copes with a blob without one
 
   await seed("work@acme.dev", "{not json")
   expect(claudeProvider.credentialExpiry!((await claudeProvider.capture())!)).toBeUndefined()
+})
+
+test("refreshCredentials rejects a blob it cannot use", async () => {
+  expect(await refreshCredentials("{not json")).toBeNull()
+  expect(await refreshCredentials(JSON.stringify({ claudeAiOauth: { accessToken: "a" } }))).toBeNull()
+})
+
+test("refreshCredentials rotates the tokens and keeps everything else in the blob", async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      const body = (await request.json()) as Record<string, unknown>
+      if (body.grant_type !== "refresh_token" || body.refresh_token !== "old-refresh") {
+        return new Response("bad", { status: 400 })
+      }
+      return Response.json({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 28800,
+        refresh_token_expires_in: 2_332_800,
+        scope: "user:inference user:profile",
+      })
+    },
+  })
+  process.env.KYORA_CLAUDE_TOKEN_URL = server.url.href
+
+  const before = Date.now()
+  const refreshed = await refreshCredentials(
+    JSON.stringify({
+      mcpOAuth: { linear: { accessToken: "keep-me" } },
+      claudeAiOauth: {
+        accessToken: "old-access",
+        refreshToken: "old-refresh",
+        expiresAt: 1,
+        subscriptionType: "max",
+        scopes: ["user:inference"],
+      },
+    }),
+  )
+  server.stop(true)
+  delete process.env.KYORA_CLAUDE_TOKEN_URL
+
+  const blob = JSON.parse(refreshed!)
+  expect(blob.claudeAiOauth.accessToken).toBe("new-access")
+  expect(blob.claudeAiOauth.refreshToken).toBe("new-refresh")
+  expect(blob.claudeAiOauth.expiresAt).toBeGreaterThanOrEqual(before + 28_800_000)
+  expect(blob.claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"])
+  expect(blob.claudeAiOauth.subscriptionType).toBe("max")
+  expect(blob.mcpOAuth).toEqual({ linear: { accessToken: "keep-me" } })
+})
+
+test("refreshCredentials keeps the sent refresh token when the response omits one", async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => Response.json({ access_token: "new-access", expires_in: 100 }),
+  })
+  process.env.KYORA_CLAUDE_TOKEN_URL = server.url.href
+
+  const refreshed = await refreshCredentials(
+    JSON.stringify({ claudeAiOauth: { accessToken: "old", refreshToken: "old-refresh", refreshTokenExpiresAt: 42 } }),
+  )
+  server.stop(true)
+  delete process.env.KYORA_CLAUDE_TOKEN_URL
+
+  const oauth = JSON.parse(refreshed!).claudeAiOauth
+  expect(oauth.refreshToken).toBe("old-refresh")
+  expect(oauth.refreshTokenExpiresAt).toBe(42)
+})
+
+test("refreshCredentials returns null when the endpoint refuses the token", async () => {
+  const server = Bun.serve({ port: 0, fetch: () => new Response("invalid_grant", { status: 400 }) })
+  process.env.KYORA_CLAUDE_TOKEN_URL = server.url.href
+
+  const refreshed = await refreshCredentials(JSON.stringify({ claudeAiOauth: { refreshToken: "spent" } }))
+  server.stop(true)
+  delete process.env.KYORA_CLAUDE_TOKEN_URL
+
+  expect(refreshed).toBeNull()
 })

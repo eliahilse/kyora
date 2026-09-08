@@ -43,6 +43,7 @@ Every provider takes the same verbs, under `kyora-switch claude …` or `kyora-s
 | `load <slot>` | log that provider back into a stored account |
 | `list` | slots for that provider, with the live one marked |
 | `usage` | how much quota each stored account has left |
+| `sync` | copy the live login back into its slot |
 | `clear` | sign out locally, without revoking the account |
 | `rm <slot>` | delete a slot |
 | `rename <old> <new>` | rename a slot |
@@ -99,6 +100,14 @@ A refresh does not extend the session. The refresh token expiry is absolute, rou
 Codex access tokens last around ten days, so its slots keep reporting without any of this.
 
 The probing and cooldown logic is [`@kyora-sh/usage`](../../packages/shared/usage), shared with kyora review and council so all three read quota the same way.
+
+## Slots never fall behind the CLI
+
+Claude Code rotates its own tokens every few hours and writes them straight to the keychain. A slot saved in the morning holds the morning's token by the evening — still loadable, since the refresh token survives rotation, but stale enough that `usage` had nothing to read and a switch away froze the slot on an old credential.
+
+So every `status`, `list`, `usage` and `load` first copies the live login back into whichever slot holds the same account. `load` does it before switching away, which is the moment that matters: the account you are leaving gets its freshest token saved before its keychain entry is overwritten. `sync` runs that step on its own.
+
+It is a local file copy, nothing more — no network, no keychain write, and a slot that already matches is left untouched so its timestamps do not churn. Slots for other accounts are never involved.
 
 ## Signing out without losing the account
 

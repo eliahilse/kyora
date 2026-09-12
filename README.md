@@ -193,7 +193,7 @@ Codex takes the same verbs — `kyora-switch codex save|load <slot>` — with it
 
 `kyora-switch usage` probes every stored account with its own token and reports what is left on each — so you can see which login has room before you switch into it. That probing is shared with review and council as [`@kyora-sh/usage`](packages/shared/usage).
 
-The keychain read and write paths are the ones read out of the shipped `claude` binary, not guessed at. Details: [`apps/switch`](apps/switch).
+The keychain read and write paths are the ones read out of the shipped `claude` binary, not guessed at. Details: [`packages/switch/cli`](packages/switch/cli).
 
 ## Repo layout
 
@@ -204,10 +204,10 @@ packages/state/nora     @kyora/nora       semantic doc indexing + search (local 
 packages/state/db       @kyora/db         embedded PostgreSQL (PGLite) + vector search
 packages/review/cli     @kyora-sh/review  multi-engine review CLI (published)
 packages/council/mcp    @kyora-sh/council cross-family council + subagents over MCP
+packages/switch/cli     kyora-switch      hot-swap Claude Code and Codex logins
 packages/shared/usage   @kyora-sh/usage   engine quota state + live usage probes
 packages/tooling/*                        shared eslint/tsconfig
 action/                                   GitHub Action for kyora review
-apps/switch                               hot-swap Claude Code and Codex logins
 apps/reckon                               SWE-bench-style eval harness
 apps/test                                 demo server
 ```

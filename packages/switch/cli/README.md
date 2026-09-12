@@ -25,13 +25,28 @@ kyora-switch codex load private
 
 ## Install
 
+Requires [Bun](https://bun.sh). The tool runs on Bun's shell and file APIs, so `bun` has to be on your PATH. `npx` will not work.
+
 ```bash
-ln -s "$PWD/apps/switch/src/index.ts" ~/.local/bin/kyora-switch
+bun add -g kyora-switch
+kyora-switch status
 ```
 
-The entry point carries a `#!/usr/bin/env bun` shebang, so a symlink from anywhere on your PATH is the whole install. `bun link` also works, but only creates the shim once Bun has a global package.json to hang it on.
+Or run it without installing anything:
 
-The link points at the checkout, so the tool runs whatever branch you have out. Or skip the install and run `bun apps/switch/src/index.ts`.
+```bash
+bunx kyora-switch status
+```
+
+macOS is the primary target: Claude Code keeps its OAuth blob in the login keychain there, and switch reads and writes it the same way. On Linux both CLIs keep credentials in files, which switch handles natively. Windows is untested.
+
+From a checkout, the entry point carries a `#!/usr/bin/env bun` shebang, so a symlink from anywhere on your PATH is the whole install:
+
+```bash
+ln -s "$PWD/packages/switch/cli/src/index.ts" ~/.local/bin/kyora-switch
+```
+
+The link points at the checkout, so the tool runs whatever branch you have out. Or skip the install and run `bun packages/switch/cli/src/index.ts`.
 
 ## Commands
 
@@ -178,3 +193,7 @@ bun run check-types
 ```
 
 Tests never touch the real keychain or your real logins — they run against temp directories, with keychain access disabled by a preload (`src/test-setup.ts`).
+
+## License
+
+[Apache-2.0](https://github.com/eliahilse/kyora/blob/main/packages/switch/cli/LICENSE). The rest of the kyora repo is [Elastic-2.0](https://github.com/eliahilse/kyora/blob/main/LICENSE); this package is the exception.

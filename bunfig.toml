@@ -1,2 +1,2 @@
 [test]
-preload = ["./apps/switch/src/test-setup.ts"]
+preload = ["./packages/switch/cli/src/test-setup.ts"]

@@ -15,9 +15,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         package:
           - state/mcp
+          - switch/cli
     steps:
       - uses: actions/checkout@v4
 

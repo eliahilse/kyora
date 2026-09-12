@@ -1,0 +1,53 @@
+{
+  "name": "kyora-switch",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Hot-swap Claude Code and Codex logins between accounts, with live quota for every stored account",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "cli",
+    "account-switcher",
+    "oauth",
+    "keychain"
+  ],
+  "license": "Apache-2.0",
+  "author": "Elia Hilse",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliahilse/kyora",
+    "directory": "packages/switch/cli"
+  },
+  "homepage": "https://kyora.sh",
+  "bugs": "https://github.com/eliahilse/kyora/issues",
+  "main": "./dist/index.js",
+  "bin": {
+    "kyora-switch": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --minify && chmod +x ./dist/index.js",
+    "check-types": "tsc --noEmit",
+    "test": "bun test",
+    "dev": "bun --watch src/index.ts",
+    "switch": "bun src/index.ts",
+    "prepublishOnly": "bun run build"
+  },
+  "devDependencies": {
+    "@kyora-sh/usage": "workspace:*",
+    "@repo/typescript-config": "workspace:*",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

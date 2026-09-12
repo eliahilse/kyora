@@ -1,6 +1,6 @@
 # @kyora-sh/usage
 
-Engine quota state and live usage probing, shared by [kyora review](../../review/cli), [kyora council](../../council/mcp) and [kyora switch](../../../apps/switch).
+Engine quota state and live usage probing, shared by [kyora review](../../review/cli), [kyora council](../../council/mcp) and [kyora switch](../../switch/cli).
 
 Two halves:
 

@@ -185,13 +185,12 @@ async fn shell_flood_is_drained_into_bounded_capture() {
 }
 fn running(pid: i32) -> bool {
     #[cfg(target_os = "linux")]
-    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        if stat
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        && stat
             .split_once(") ")
             .is_some_and(|(_, tail)| tail.starts_with('Z'))
-        {
-            return false;
-        }
+    {
+        return false;
     }
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }

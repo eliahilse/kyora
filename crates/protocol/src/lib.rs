@@ -119,7 +119,7 @@ pub enum ToolResultPart {
 }
 
 /// A tool definition made available to the model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     /// The tool name.
     pub name: String,
@@ -127,6 +127,10 @@ pub struct ToolSpec {
     pub description: String,
     /// The JSON schema for the tool's input.
     pub input_schema: Value,
+    /// The tool takes large inputs (code, file contents), so providers should
+    /// stream its input as generated instead of buffering it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub large_input: bool,
 }
 
 /// Token counters, with omitted JSON fields defaulting to zero.

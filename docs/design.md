@@ -152,7 +152,7 @@ impl NodeCtx {
 pub enum Owner { Cell(CancellationToken), Node }   // who cancels the child (8.3)
 ```
 
-An `AgentSpec` holds the task, optional name, model reference, tool selection, preloaded REPL variables, and per-node limits (max turns, token budget, deadline). `AgentHandle` exposes `result().await -> AgentOutcome`, `status()`, `cancel()`. `AgentOutcome { node, status, answer, usage_self, usage_subtree, turns }` where `answer` is `Answer::Text(String)` or `Answer::Value(Box<RawValue>)` (from `kyora.final`), and `status` is one of `completed`, `max_turns`, `budget_exhausted`, `timeout`, `context_exhausted`, `cancelled`, `refused`, `failed`.
+An `AgentSpec` holds the task, optional name, model reference, tool selection, preloaded REPL variables, and per-node limits (max turns, token budget, deadline). `AgentHandle` exposes `result().await -> AgentOutcome`, `status()`, `cancel()`. `AgentOutcome { node, status, answer, usage_self, usage_subtree, turns }` where `answer` is `Answer::Text(String)` or `Answer::Value(Box<RawValue>)` (from `kyora.final`), and `status` is one of `completed`, `max_turns`, `budget_exhausted`, `timeout`, `context_exhausted`, `cancelled`, `refused`, `failed`, and `interrupted` (assigned on recovery to nodes that were running when the process died, 11.3).
 
 The root of a session is an agent node like any other; `kyora run` creates it with depth 0 and submits one user turn. Interactive sessions (TUI, `kyora resume` in M2) submit further user turns to the same root node.
 
@@ -168,7 +168,7 @@ on user input:
     if turns >= max_turns          -> stop(max_turns)
     maybe_compact(history)                             # M2; a no-op in M1; never mid-round (12)
     resp = attempt_with_retries(request(history))      # 6.2, 10.2: reserve, call, settle
-                                                       # a request rejected as too long -> stop(context_exhausted)
+                                                       # rejected as too long: M1 stop(context_exhausted); M2 compact and retry (12)
     turn = admit(resp)                                 # see "admission" below
     history.push(assistant message = turn.content)     # recorded verbatim
     if turn has tool_use blocks and stop_reason != tool_use:
@@ -351,9 +351,8 @@ Error semantics, one code per situation:
 |---|---|
 | Admission refused (depth, agent or call counts, batch size, outstanding requests) | `LimitExceeded`, nothing started |
 | No budget left for the call or the child | `BudgetExceeded`, nothing started |
-| Child started and ended in any status except `completed` (including its own timeout, `max_turns`, `budget_exhausted`, `refused`) | `AgentFailed` with `.status` |
-| `handle.result(timeout=...)` expired | `Timeout`; a node-owned child keeps running |
-| `kyora.agent(..., timeout=...)` expired | the cell-owned child is cancelled, then `Timeout` |
+| Child started and ended in any status except `completed`, including its own deadline (the `timeout=` argument of `agent`/`spawn`, status `timeout`), `max_turns`, `budget_exhausted`, `refused` | `AgentFailed` with `.status` |
+| The waiter's own limit expired: `handle.result(timeout=...)` | `Timeout`; the child keeps running |
 | The calling cell was interrupted, timed out or cancelled | `Cancelled` |
 | Provider failure of an `llm` call after retries, or a refusal | `ModelError` |
 | Oversized request (checked locally) or oversized result (checked by the host) | `ValueTooLarge` |
@@ -364,7 +363,7 @@ Semantics:
 
 - **`llm`** is a single completion with no tools: a leaf node (`kind: llm`) in the tree. `prompt` is a string or a list of `{"role", "content"}` dicts. Default model is the configured `llm_model` (section 17). Allowed at every depth, including `max_depth`; disabled entirely with `--no-llm` (for ablations, R§1).
 - **`llm_batch`** sends one request to the host, which runs the calls concurrently (default `max_concurrency` 8; values below 1 are rejected; never above the global in-flight cap; at most 1,000 items per batch) and returns results in input order. With `return_exceptions=True`, failed items are exception instances instead of raising.
-- **`agent`** runs a full child agent (`kind: agent`, depth + 1) with its own history, tools, REPL and budget, and blocks until it ends. The child is owned by the calling cell: if the cell is interrupted or times out, the child is cancelled. `context` (any JSON value) is preloaded as the variable `context` in the child's REPL; `vars` preloads several named variables. The child's first user message contains the task and a manifest of the preloaded variables (name, type, size, a short preview), never the values themselves. Returns the child's answer: the value committed with `kyora.final` in the child, otherwise the child's final assistant text. Non-completed endings raise `AgentFailed`.
+- **`agent`** runs a full child agent (`kind: agent`, depth + 1) with its own history, tools, REPL and budget, and blocks until it ends. `timeout=` (on `agent` and `spawn`) is the child's own deadline, capped by the parent's; when it passes, the child ends with status `timeout`. The child is owned by the calling cell: if the cell is interrupted or times out, the child is cancelled. `context` (any JSON value) is preloaded as the variable `context` in the child's REPL; `vars` preloads several named variables. The child's first user message contains the task and a manifest of the preloaded variables (name, type, size, a short preview), never the values themselves. Returns the child's answer: the value committed with `kyora.final` in the child, otherwise the child's final assistant text. Non-completed endings raise `AgentFailed`.
 - **`spawn`** registers a child owned by the agent node (not the cell) and returns immediately; the child runs concurrently and its handle stays valid in later cells. All node-owned children are cancelled when the agent ends.
 - **`final`** stages an answer for the current cell. It is committed only if the cell finishes with status `ok`; then the tool result says the answer was recorded and the loop ends without another model call. A cell that fails, times out or is interrupted discards its staged answer. For the root, the committed value is what `kyora run` prints (strings as-is, other values as JSON).
 - **Values crossing the boundary are JSON**, encoded with `json.dumps(..., allow_nan=False)` (NaN and infinity are rejected; tuples become lists; other non-JSON objects raise `TypeError` in the calling code). Integers are limited to what the interpreter can convert to text (on Python 3.11 and later, 4,300 digits by default); a larger integer raises `ValueError` locally. Python measures the complete encoded request frame before sending; if it exceeds the frame cap (9.1) it raises `ValueTooLarge` locally, which is recoverable. The host passes context values, variables and final answers through as raw JSON (`serde_json::value::RawValue`) without converting numbers. Larger data should be written to a file and passed by path (a content-addressed blob store is M3).
@@ -384,7 +383,7 @@ fixes = kyora.gather([kyora.spawn("Resolve the dates in this text precisely.",
 
 `kyora-repl` implements the `python` tool. Per agent node it owns a `ReplHost`: the child process, the IPC pumps (9.3), the current cell (id, generation, cancellation token, deadline, staged final answer), a table of in-flight requests, and a table of node-owned child handles. Requests from Python are handled as follows:
 
-- `llm` / `llm_batch` -> `NodeCtx::llm` per item, owned by the cell's token: ledger admission and reservation, a model slot, a trace node, the provider call. Batch items run on a `JoinSet` limited by the batch's own semaphore.
+- `llm` / `llm_batch` -> `NodeCtx::llm` per item, owned by the cell's token: ledger admission, a model slot, then the reservation, a trace node and the provider call. Batch items run on a `JoinSet` limited by the batch's own semaphore.
 - `agent.spawn` -> `NodeCtx::spawn_agent` with `Owner::Cell` (for `kyora.agent`) or `Owner::Node` (for `kyora.spawn`). Admission (depth, live and total agent counts, budget) is checked in the same ledger transaction that registers the child; violations come back as typed errors.
 - `agent.result` -> await the handle, bounded by the request's timeout and the cell's deadline; `agent.cancel` -> cancel the child's token. `agent.result`, `agent.status` and `agent.cancel` accept only node ids of children registered to the calling node (other ids are `invalid_request`), so code cannot wait on or cancel arbitrary nodes.
 - `final` -> stage the answer on the current cell.
@@ -502,9 +501,9 @@ On timeout or cancellation the host starts the 2 s grace deadline first (on the 
 | bytes of buffered IPC payloads, process-wide (requests, accumulated results, queued frames) | 1 GiB | new requests fail with `limit_exceeded` (`memory`) |
 | graceful shutdown | 2 s | kill |
 
-Results are size-checked as they are produced, never only after aggregation: an `llm` result or an agent answer that alone would exceed the response frame becomes a `value_too_large` error for that call, and a batch whose accumulated results would exceed the frame turns the remaining items into `value_too_large` item errors instead of building an oversized aggregate. Request concurrency parameters must be positive integers; other values are `invalid_request`.
+Results are size-checked as they are produced, never only after aggregation: an `llm` result or an agent answer that alone would exceed the response frame becomes a `value_too_large` error for that call, and a batch whose accumulated results would exceed the frame turns the remaining items into `value_too_large` item errors instead of building an oversized aggregate. Request concurrency parameters must be positive integers.
 
-Any malformed frame, unknown method or schema violation from the REPL is a protocol error: the REPL is killed and the cell reports an error. The host never trusts a REPL to recover from its own corruption.
+Two kinds of bad input are distinguished. Envelope violations (a frame that is not JSON, a message without a valid `id`/`method` shape, an unknown method, a response to an id the host never sent) are protocol errors: the REPL is killed and the cell reports an error; the host never trusts a REPL to recover from its own corruption. A well-formed request with bad arguments (wrong parameter types, a non-positive concurrency, a node id that is not the caller's child) gets an `invalid_request` response and the REPL keeps running.
 
 ## 10. Limits, budgets and cancellation
 
@@ -520,7 +519,7 @@ Any malformed frame, unknown method or schema violation from the REPL is a proto
 | `budget_tokens` | 20,000,000 | session, and optionally per subtree | reservation fails; the node stops with `budget_exhausted` |
 | `max_turns` | root 200, sub-agent 50 | node | node stops with `max_turns` |
 | `run_timeout` | 2 h | root deadline | everything is cancelled, status `timeout` |
-| agent `timeout` | parent's deadline | per spawn | child cancelled, `Timeout` raised |
+| agent `timeout` | parent's deadline | per spawn (child's own deadline) | child ends with status `timeout`; a waiter gets `AgentFailed` |
 | cell timeout | 30 min (max 2 h) | cell | cell interrupted |
 | request timeouts | 300 s idle, 30 min total | model request | attempt fails, retry policy applies |
 | `max_output_tokens` | agents 32,000, llm 16,000 | request | passed as `max_tokens` |
@@ -545,7 +544,11 @@ The ledger is a single structure behind one mutex: a tree of scopes mirroring th
 
 If `R` does not fit, `max_tokens` is reduced to fit, down to a floor of `min(4096, requested max_tokens)`; below that the request is refused (`budget_exhausted` in the loop, `BudgetExceeded` in Python).
 
-**What is guaranteed.** Dispatch is exact: no attempt is sent unless its reservation fits every scope on its path, and admission and reservation are atomic. Accounting is exact: every attempt is settled with what the provider reported, or conservatively (below). The limit itself is enforced at dispatch time with an estimate, so it can be exceeded when an attempt is charged more than its `R`. The overshoot is bounded: only attempts already in flight can cause it, there are at most `max_inflight_requests` of them, and each one is charged at most the model's context window plus `max_tokens` (the API rejects larger prompts), so the worst case is `max_inflight_requests * (context_window + max_output_tokens - R)`. In practice it is the estimator's error. When an attempt settles above its reservation, the excess is recorded on the `attempt` record, and every scope on its path with `used >= limit` is closed to further reservations. Live smoke tests compare `R` with actual usage to keep the estimator honest; property tests check the ledger arithmetic itself (dispatch never exceeds headroom, settlement is exact, closing on overshoot).
+**What is guaranteed.** An attempt reserves only after it holds a model slot, and dispatches immediately after reserving, so the attempts that are reserved but not yet settled are at most `max_inflight_requests`. Admission and reservation are atomic, and no attempt is sent unless its reservation fits every scope on its path. When an attempt settles above its reservation, the excess is recorded on its `attempt_end` record, and every scope on its path with `used >= limit` is closed: later reservations fail, and nothing that has not reserved yet can dispatch. The limit is therefore enforced at dispatch time with estimates, and can be exceeded only by attempts that were already reserved when the scope closed.
+
+Numerically, for M1 (one billed iteration per attempt, no compaction and no refusal fallback): an attempt `i` on model `m_i` can be charged at most `A_i = context_window(m_i) + max_tokens_i`, because the API rejects longer prompts and never generates more than `max_tokens`. The overshoot of a scope is at most `sum(max(0, A_i - R_i))` over the attempts reserved on it when it closed, and that set has at most `max_inflight_requests` members. In practice it is the estimator's error. Features that bill several iterations per attempt (M2 compaction and refusal fallback) are excluded from this bound until their iteration ceilings are established; until then they reserve `R` per expected iteration and their excess is recorded the same way.
+
+These statements are about kyora's recorded charges. Where usage is unknown (10.2 settlement table, crash recovery), the recorded charge is the reservation `R`, which is itself an estimate of what the provider consumed. Live smoke tests compare `R` with actual usage to keep the estimator honest; property tests check the ledger arithmetic itself (dispatch never exceeds headroom, settlement is exact, overshoot closes the scope).
 
 **Settlement and durability.** Each attempt is written ahead: an `attempt_start` record (attempt id, node, `R`) is persisted and flushed before the request is sent, and an `attempt_end` record (outcome, usage, charge) after it settles. The charge depends on what is known:
 
@@ -655,7 +658,7 @@ First line of defense is structural: large data stays in REPL variables, tool ou
 
 What M1 does:
 
-- Shell commands and the REPL run as separate processes in their own process group, with the node's cwd, a scrubbed environment (allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, plus configured extras; provider keys are never passed), and stdin `/dev/null`.
+- Shell commands and the REPL run as separate processes in their own process group, with the node's cwd, a scrubbed environment (allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, plus configured extras; provider keys are never passed), and user stdin `/dev/null` (the REPL keeps its original stdin pipe for the protocol, 9.1).
 - The REPL boot script lowers its own resource limits before running user code, setting soft and hard together so user code cannot raise them: `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 1024, `RLIMIT_CPU` (a generous backstop), and `RLIMIT_AS` on Linux (default 4 GiB).
 
 What M1 does not do: there is no filesystem or network sandbox. The REPL, the shell and the file tools act with the user's full authority: they can read any file the user can (including credential files on disk), use the network, and start processes that escape their process group. Environment scrubbing only keeps keys out of child environments. Until M3, run kyora only on trusted inputs, or inside a disposable container or VM.
@@ -802,7 +805,7 @@ Threat model: the model and everything it reads are untrusted. Long-context work
 |---|---|---|
 | Model-written code damages the machine or reads secrets on disk | Not prevented. Separate processes, scrubbed env, rlimits; documented requirement to run on trusted inputs or in a disposable environment. | OS sandbox for shell and REPL, the same policy for host file tools, sensitive paths unreadable, network off by default, fail closed. |
 | API keys leak through kyora itself | Keys live only in the host process; never in child environments, prompts, logs or transcripts. | Same, plus the sandbox hides key files and the REPL has no network. |
-| Runaway recursion or spend | Atomic admission and pre-dispatch reservations; exact, crash-safe accounting with a stated worst-case overshoot (10.2); depth, agent, call and turn caps; finite deadlines on every wait; cancellation through the whole token tree. | Same, plus dollar budgets. |
+| Runaway recursion or spend | Atomic admission and pre-dispatch reservations; crash-safe accounting; overshoot limited to attempts already reserved when a scope closes (10.2); depth, agent, call and turn caps; finite deadlines on every wait; cancellation through the whole token tree. | Same, plus dollar budgets. |
 | Capability escalation through sub-agents | A child's tools are a subset of its parent's; its budget and deadline are bounded by its ancestors; its depth is parent + 1; request parameters cannot raise any of these. | Policies are inherited and can only narrow. |
 | Malicious or buggy REPL traffic | Private pipes only (no listening sockets), framing and progress deadlines, frame, queue, request and batch quotas, schema validation, stale-cell rejection, kill on protocol violation (9.5). | Same. |
 | Injection via sub-agent results | Child answers return into Python variables as data; they reach the parent's context only through bounded printed output. | Same. |
@@ -864,7 +867,7 @@ Not built now; recorded so current interfaces do not block it.
 ## 23. Open questions
 
 1. **Default models (provisional).** Proposal: root `claude-opus-5-5`, `kyora.llm` defaults to `claude-sonnet-5-5`, sub-agents inherit the parent's model. Acceptable, or should sub-calls default to the root model?
-2. **Default limits (provisional).** Proposal: `max_depth` 2, `budget_tokens` 20M processed tokens per session (cache reads included, so the bound is hard), 100 agents total, 16 live, 2 h run timeout. The research suggests depth 1 is the safe baseline and deeper recursion is model dependent (R§1).
+2. **Default limits (provisional).** Proposal: `max_depth` 2, `budget_tokens` 20M processed tokens per session (cache reads included; enforced at dispatch with estimates, 10.2), 100 agents total, 16 live, 2 h run timeout. The research suggests depth 1 is the safe baseline and deeper recursion is model dependent (R§1).
 3. **Milestone order.** M2 (OpenAI and local providers, compaction, resume) before M3 (OS sandbox and MCP), or sandbox first? M1 runs model-written code without a sandbox (13.1).
 4. **npm names.** Per-platform package names, for example `@kyora-sh/kyora-darwin-arm64`, and whether `kyora` should later also dispatch to the switch and vms CLIs as proposed in section 22.
 5. **Data directory.** Share `~/.kyora` with kyora-switch (sessions under `~/.kyora/sessions`), or use a separate directory?

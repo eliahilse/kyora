@@ -1,7 +1,7 @@
-//! Sequential agent loop and the node-scoped entry point for leaf completions.
+//! Shared agent loop and node-scoped entry points for recursive work.
 use crate::{
-    Effect, Limits, ModelRef, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent,
-    TraceSink, defaults,
+    AgentHandle, ChildSpec, ChildStatus, Effect, Limits, ModelRef, Owner, RecursionError, ToolCx,
+    ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
     prompts,
     tool::truncate,
@@ -20,8 +20,8 @@ use std::{
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use tokio::{sync::Semaphore, time::Instant};
@@ -95,6 +95,10 @@ pub struct NodeInfo {
     pub depth: u32,
     /// Model inherited by future child agents.
     pub model: ModelRef,
+    /// Opaque initialization data supplied by the caller.
+    pub init: Option<Arc<Value>>,
+    /// Resolved tool selection for this node.
+    pub selection: ToolSelection,
     /// Working directory.
     pub cwd: PathBuf,
 }
@@ -151,12 +155,29 @@ struct RuntimeInner {
     cancel: CancellationToken,
     started: AtomicBool,
     panicked: AtomicBool,
-    leaves: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    subagent_prompt: Mutex<String>,
 }
 /// Shared runtime for one invocation. `run` may be called exactly once.
 #[derive(Clone)]
 pub struct Runtime(Arc<RuntimeInner>);
-/// Node-scoped recursion context. Child-agent spawning is reserved for M1.3.
+#[derive(Default)]
+struct Work {
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+#[derive(Default)]
+struct NodeState {
+    work: Mutex<Work>,
+    tools: OnceLock<Vec<String>>,
+    turns: AtomicU32,
+}
+struct AgentSettings {
+    name: String,
+    origin_cell: Option<u32>,
+    init: Option<Arc<Value>>,
+    max_turns: u32,
+}
+/// Node-scoped entry point for child agents and leaf completions.
 #[derive(Clone)]
 pub struct NodeCtx {
     /// Node id.
@@ -172,6 +193,9 @@ pub struct NodeCtx {
     /// Parent model for future sub-agent inheritance.
     pub model: ModelRef,
     runtime: Runtime,
+    state: Arc<NodeState>,
+    cwd: PathBuf,
+    options: RequestOptions,
 }
 /// One leaf completion without tools.
 #[derive(Debug, Clone)]
@@ -231,8 +255,21 @@ impl Runtime {
             cancel: CancellationToken::new(),
             started: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
-            leaves: std::sync::Mutex::new(Vec::new()),
+            subagent_prompt: Mutex::new(prompts::SUBAGENT.into()),
         })))
+    }
+    /// Overrides the default child system prompt before the invocation starts.
+    pub fn set_subagent_prompt(&self, prompt: String) -> Result<()> {
+        let mut frozen = self
+            .0
+            .subagent_prompt
+            .lock()
+            .expect("prompt mutex poisoned");
+        if self.0.started.load(Ordering::SeqCst) {
+            bail!("runtime already invoked");
+        }
+        *frozen = prompt;
+        Ok(())
     }
     /// Cancels this invocation and all node-owned requests.
     pub fn cancel(&self) {
@@ -248,85 +285,122 @@ impl Runtime {
     }
     /// Runs a root agent, closes its scope and writes session_end.
     pub async fn run(&self, spec: AgentSpec) -> Result<AgentOutcome> {
-        if self.0.started.swap(true, Ordering::SeqCst) {
-            bail!("runtime already invoked");
+        {
+            // Freeze configuration atomically with admission of the root.
+            let _prompt = self
+                .0
+                .subagent_prompt
+                .lock()
+                .expect("prompt mutex poisoned");
+            if self.0.started.swap(true, Ordering::SeqCst) {
+                bail!("runtime already invoked");
+            }
         }
         let _cancel_on_drop = CancelOnDrop(self.0.cancel.clone());
         let runtime = self.clone();
         tokio::spawn(async move { runtime.run_owned(spec).await }).await?
     }
     async fn run_owned(&self, spec: AgentSpec) -> Result<AgentOutcome> {
-        let deadline = Instant::now() + self.0.config.limits.run_timeout;
         let cx = NodeCtx {
             id: 0,
             parent: None,
             depth: 0,
             cancel: self.0.cancel.child_token(),
-            deadline,
+            deadline: Instant::now() + self.0.config.limits.run_timeout,
             model: spec.model.clone(),
             runtime: self.clone(),
+            state: Arc::new(NodeState::default()),
+            cwd: spec.cwd.clone(),
+            options: spec.options.clone(),
         };
-        let run_cancel = self.0.cancel.clone();
-        let timer = tokio::spawn(async move {
-            tokio::select! { _ = tokio::time::sleep_until(deadline) => run_cancel.cancel(), _ = run_cancel.cancelled() => {} }
-        });
-        let result = AssertUnwindSafe(async {
-            self.emit(TraceEvent::SessionStart {
-                session: self.0.config.session.clone(),
-                cwd: spec.cwd.clone(),
-                kyora: env!("CARGO_PKG_VERSION").into(),
-                limits: self.0.config.limits.clone(),
-            })
-            .await?;
-            self.agent(&cx, spec).await
+        self.emit(TraceEvent::SessionStart {
+            session: self.0.config.session.clone(),
+            cwd: spec.cwd.clone(),
+            kyora: env!("CARGO_PKG_VERSION").into(),
+            limits: self.0.config.limits.clone(),
         })
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
-            self.0.panicked.store(true, Ordering::SeqCst);
-            Err(anyhow::anyhow!("root task panicked"))
+        .await?;
+        let result = self
+            .run_node(
+                cx,
+                spec,
+                AgentSettings {
+                    name: "root".into(),
+                    origin_cell: None,
+                    init: None,
+                    max_turns: self.0.config.limits.max_turns,
+                },
+                None,
+            )
+            .await;
+        self.emit(TraceEvent::SessionEnd {
+            status: result.as_ref().map_or(Status::Failed, |o| o.status),
+        })
+        .await?;
+        result
+    }
+    async fn run_node(
+        &self,
+        cx: NodeCtx,
+        spec: AgentSpec,
+        settings: AgentSettings,
+        owner: Option<CancellationToken>,
+    ) -> Result<AgentOutcome> {
+        let token = cx.cancel.clone();
+        let deadline = cx.deadline;
+        let watcher = tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = tokio::time::sleep_until(deadline) => token.cancel(),
+                _ = async { match owner { Some(owner) => owner.cancelled().await, None => std::future::pending().await } } => token.cancel(),
+            }
         });
-        cx.cancel.cancel();
-        loop {
-            let leaves =
-                std::mem::take(&mut *self.0.leaves.lock().expect("leaf registry poisoned"));
-            if leaves.is_empty() {
-                break;
-            }
-            for leaf in leaves {
-                if leaf.await.is_err() {
-                    self.0.panicked.store(true, Ordering::SeqCst);
-                }
-            }
+        let result = AssertUnwindSafe(self.agent(&cx, spec, settings))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                self.0.panicked.store(true, Ordering::SeqCst);
+                Err(anyhow::anyhow!("agent task panicked"))
+            });
+        self.join_descendants(&cx).await;
+        watcher.abort();
+        let _ = watcher.await;
+        let mut outcome = result.as_ref().cloned().unwrap_or_else(|_| {
+            self.outcome(
+                cx.id,
+                Status::Failed,
+                Answer::Text(String::new()),
+                cx.state.turns.load(Ordering::SeqCst),
+            )
+        });
+        if cx.id == 0 && self.0.panicked.load(Ordering::SeqCst) {
+            outcome.status = Status::Failed;
         }
-        self.0.ledger.shutdown(0);
-        timer.abort();
-        let _ = timer.await;
-        match result {
-            Ok(mut outcome) => {
-                if self.0.panicked.load(Ordering::SeqCst) {
-                    outcome.status = Status::Failed;
-                }
-                (outcome.usage_self, outcome.usage_subtree) = self.0.ledger.usage(0);
-                self.emit(TraceEvent::NodeEnd {
-                    outcome: outcome.clone(),
-                })
-                .await?;
-                self.emit(TraceEvent::SessionEnd {
-                    status: outcome.status,
-                })
-                .await?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let outcome = self.outcome(0, Status::Failed, Answer::Text(String::new()), 0);
-                let _ = self.emit(TraceEvent::NodeEnd { outcome }).await;
-                let _ = self
-                    .emit(TraceEvent::SessionEnd {
-                        status: Status::Failed,
-                    })
-                    .await;
-                Err(error)
+        (outcome.usage_self, outcome.usage_subtree) = self.0.ledger.usage(cx.id);
+        let emitted = self
+            .emit(TraceEvent::NodeEnd {
+                outcome: outcome.clone(),
+            })
+            .await;
+        self.0.ledger.shutdown(cx.id);
+        emitted?;
+        if cx.parent.is_some() {
+            Ok(outcome)
+        } else {
+            result.map(|_| outcome)
+        }
+    }
+    async fn join_descendants(&self, cx: &NodeCtx) {
+        let tasks = {
+            let mut work = cx.state.work.lock().expect("node work mutex poisoned");
+            work.closed = true;
+            self.0.ledger.close_admission(cx.id);
+            cx.cancel.cancel();
+            std::mem::take(&mut work.tasks)
+        };
+        for task in tasks {
+            if task.await.is_err() {
+                self.0.panicked.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -358,30 +432,58 @@ impl Runtime {
         history.push(message);
         Ok(())
     }
-    async fn agent(&self, cx: &NodeCtx, spec: AgentSpec) -> Result<AgentOutcome> {
+    async fn agent(
+        &self,
+        cx: &NodeCtx,
+        spec: AgentSpec,
+        settings: AgentSettings,
+    ) -> Result<AgentOutcome> {
         let info = NodeInfo {
             id: cx.id,
             parent: cx.parent,
             depth: cx.depth,
             model: cx.model.clone(),
             cwd: spec.cwd.clone(),
+            init: settings.init,
+            selection: spec.tools.clone(),
         };
-        let tools = self.0.config.toolsets.toolset(&info, &spec.tools)?;
-        let specs = tools.specs();
+        let tools = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.0
+                .config
+                .toolsets
+                .toolset(&info, &spec.tools)
+                .and_then(|tools| tools.select(&spec.tools))
+        }))
+        .unwrap_or_else(|_| {
+            self.0.panicked.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!("toolset factory panicked"))
+        });
+        let specs = tools
+            .as_ref()
+            .map_or_else(|_| Vec::new(), |tools| tools.specs());
         let system = spec.system.unwrap_or_else(|| prompts::root(&specs));
+        let mut node_limits = self.0.config.limits.clone();
+        node_limits.max_turns = settings.max_turns;
+        node_limits.budget_tokens = cx.budget().limit;
         self.emit(TraceEvent::NodeStart {
             node: cx.id,
             parent: cx.parent,
             depth: cx.depth,
             kind: "agent".into(),
-            name: "root".into(),
+            name: settings.name,
+            origin_cell: settings.origin_cell,
             model: spec.model.to_string(),
             system: Some(system.clone()),
             tools: specs.clone(),
-            limits: self.0.config.limits.clone(),
+            limits: node_limits,
             prompt: None,
         })
         .await?;
+        let tools = tools?;
+        cx.state
+            .tools
+            .set(specs.iter().map(|tool| tool.name.clone()).collect())
+            .expect("toolset frozen once");
         let mut history = Vec::new();
         self.message(cx.id, &mut history, Message::user_text(spec.task))
             .await?;
@@ -394,7 +496,7 @@ impl Runtime {
             if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
                 break cx.cancel_status();
             }
-            if turns >= self.0.config.limits.max_turns {
+            if turns >= settings.max_turns {
                 break Status::MaxTurns;
             }
             // M1 compaction is deliberately a no-op at this round boundary.
@@ -453,6 +555,7 @@ impl Runtime {
             output_cap = self.0.config.limits.max_output_tokens;
             previous = Some((response.usage, sent));
             turns += 1;
+            cx.state.turns.store(turns, Ordering::SeqCst);
             for block in &mut response.content {
                 if let ContentBlock::ToolUse { id, input, .. } = block
                     && invalid.contains_key(id)
@@ -647,49 +750,60 @@ impl Runtime {
             request.max_tokens = max_tokens;
             let start = Instant::now();
             let mut partial = false;
-            let result = if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
-                Err(ProviderError::NotSent("cancelled before dispatch".into()))
-            } else {
-                reservation.dispatched = true;
-                let attempt_cancel = cx.cancel.child_token();
-                let mut attempt_cx = cx.clone();
-                attempt_cx.cancel = attempt_cancel.clone();
-                let future = self.stream(
-                    &attempt_cx,
-                    provider.as_ref(),
-                    request.clone(),
-                    &mut partial,
-                );
-                tokio::pin!(future);
-                tokio::select! {
-                    biased;
-                    result = &mut future => result,
-                    _ = async {
-                        tokio::select! {
-                            _ = cx.cancel.cancelled() => {},
-                            _ = tokio::time::sleep_until(cx.deadline) => {},
-                            _ = tokio::time::sleep(self.0.config.limits.request_total) => {},
-                        }
-                    } => {
-                        // Keep polling the same future so the provider can classify an
-                        // unsent request. An unresponsive provider costs the reservation.
-                        attempt_cancel.cancel();
-                        let result = tokio::time::timeout(defaults::PROVIDER_CANCEL_GRACE, &mut future)
-                            .await
-                            .unwrap_or(Err(if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
-                                ProviderError::Cancelled
+            let dispatched = AssertUnwindSafe(async {
+                if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                    Err(ProviderError::NotSent("cancelled before dispatch".into()))
+                } else {
+                    reservation.dispatched = true;
+                    let attempt_cancel = cx.cancel.child_token();
+                    let mut attempt_cx = cx.clone();
+                    attempt_cx.cancel = attempt_cancel.clone();
+                    let future = self.stream(
+                        &attempt_cx,
+                        provider.as_ref(),
+                        request.clone(),
+                        &mut partial,
+                    );
+                    tokio::pin!(future);
+                    tokio::select! {
+                        biased;
+                        result = &mut future => result,
+                        _ = async {
+                            tokio::select! {
+                                _ = cx.cancel.cancelled() => {},
+                                _ = tokio::time::sleep_until(cx.deadline) => {},
+                                _ = tokio::time::sleep(self.0.config.limits.request_total) => {},
+                            }
+                        } => {
+                            // Keep polling the same future so the provider can classify an
+                            // unsent request. An unresponsive provider costs the reservation.
+                            attempt_cancel.cancel();
+                            let result = tokio::time::timeout(defaults::PROVIDER_CANCEL_GRACE, &mut future)
+                                .await
+                                .unwrap_or(Err(if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                                    ProviderError::Cancelled
+                                } else {
+                                    ProviderError::IdleTimeout
+                                }));
+                            if matches!(result, Err(ProviderError::Cancelled))
+                                && !cx.cancel.is_cancelled() && Instant::now() < cx.deadline
+                            {
+                                Err(ProviderError::IdleTimeout)
                             } else {
-                                ProviderError::IdleTimeout
-                            }));
-                        if matches!(result, Err(ProviderError::Cancelled))
-                            && !cx.cancel.is_cancelled() && Instant::now() < cx.deadline
-                        {
-                            Err(ProviderError::IdleTimeout)
-                        } else {
-                            result
-                        }
-                    },
+                                result
+                            }
+                        },
+                    }
                 }
+            })
+            .catch_unwind()
+            .await;
+            let (result, panic) = match dispatched {
+                Ok(result) => (result, None),
+                Err(panic) => (
+                    Err(ProviderError::Other("provider task panicked".into())),
+                    Some(panic),
+                ),
             };
             let charge = match &result {
                 Ok((resp, _)) => Charge::Usage(resp.usage),
@@ -711,6 +825,9 @@ impl Runtime {
                 ms: start.elapsed().as_millis() as u64,
             })
             .await?;
+            if let Some(panic) = panic {
+                std::panic::resume_unwind(panic);
+            }
             match result {
                 Ok(response) => return Ok(response),
                 Err(error) => {
@@ -819,6 +936,152 @@ impl Runtime {
     }
 }
 impl NodeCtx {
+    fn check_open(&self, work: &Work) -> std::result::Result<(), RecursionError> {
+        if work.closed || self.cancel.is_cancelled() || Instant::now() >= self.deadline {
+            return Err(RecursionError::Cancelled);
+        }
+        Ok(())
+    }
+    fn validate_model(&self, model: &ModelRef) -> std::result::Result<(), RecursionError> {
+        if model.model.is_empty()
+            || !self
+                .runtime
+                .0
+                .config
+                .providers
+                .contains_key(&model.provider)
+        {
+            return Err(RecursionError::InvalidRequest(format!(
+                "unknown model reference: {model}"
+            )));
+        }
+        Ok(())
+    }
+    pub(crate) fn child_status(&self, outcome: Option<&AgentOutcome>) -> ChildStatus {
+        let (usage_self, usage_subtree) = self.runtime.0.ledger.usage(self.id);
+        ChildStatus {
+            status: outcome.map(|o| o.status),
+            turns: self.state.turns.load(Ordering::SeqCst),
+            usage_self,
+            usage_subtree,
+        }
+    }
+    /// Atomically admits a child without waiting for slots or budget.
+    /// Explicit tools must be a subset of this node's frozen tool names.
+    pub fn spawn_agent(
+        &self,
+        spec: ChildSpec,
+        owner: Owner,
+    ) -> std::result::Result<AgentHandle, RecursionError> {
+        let mut work = self.state.work.lock().expect("node work mutex poisoned");
+        self.check_open(&work)?;
+        if spec.max_turns == Some(0) || spec.timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(RecursionError::InvalidRequest(
+                "turns and timeout must be positive".into(),
+            ));
+        }
+        let deadline = match spec.timeout {
+            Some(timeout) => Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| RecursionError::InvalidRequest("timeout is too large".into()))?
+                .min(self.deadline),
+            None => self.deadline,
+        };
+        let model = spec.model.unwrap_or_else(|| self.model.clone());
+        self.validate_model(&model)?;
+        let names = self
+            .state
+            .tools
+            .get()
+            .ok_or_else(|| RecursionError::InvalidRequest("toolset not frozen".into()))?;
+        let selection = ToolSelection(Some(match spec.tools.0 {
+            Some(requested) => {
+                if let Some(name) = requested.iter().find(|name| !names.contains(name)) {
+                    return Err(RecursionError::InvalidRequest(format!(
+                        "tool not held by parent: {name}"
+                    )));
+                }
+                requested
+            }
+            None => defaults::SUBAGENT_TOOLS
+                .iter()
+                .filter(|name| names.iter().any(|held| held == **name))
+                .map(|name| (*name).into())
+                .collect(),
+        }));
+        let owner_token = match owner {
+            Owner::Node => None,
+            Owner::Cell(token) => {
+                if token.is_cancelled() {
+                    return Err(RecursionError::Cancelled);
+                }
+                Some(token)
+            }
+        };
+        let cancel = owner_token.as_ref().unwrap_or(&self.cancel).child_token();
+        let id = self.runtime.0.ledger.admit(self.id, true, spec.budget)?;
+        let cx = NodeCtx {
+            id,
+            parent: Some(self.id),
+            depth: self.depth + 1,
+            cancel,
+            deadline,
+            model: model.clone(),
+            runtime: self.runtime.clone(),
+            state: Arc::new(NodeState::default()),
+            cwd: self.cwd.clone(),
+            options: self.options.clone(),
+        };
+        let task = match spec.preamble {
+            Some(preamble) => format!("{}\n\n{preamble}", spec.task),
+            None => spec.task,
+        };
+        let agent_spec = AgentSpec {
+            task,
+            model,
+            cwd: self.cwd.clone(),
+            tools: selection,
+            system: Some(
+                self.runtime
+                    .0
+                    .subagent_prompt
+                    .lock()
+                    .expect("prompt mutex poisoned")
+                    .clone(),
+            ),
+            options: self.options.clone(),
+        };
+        let settings = AgentSettings {
+            name: spec.name.unwrap_or_default(),
+            origin_cell: spec.origin_cell,
+            init: spec.init,
+            max_turns: spec
+                .max_turns
+                .unwrap_or(self.runtime.0.config.limits.subagent_max_turns),
+        };
+        let (tx, outcome) = tokio::sync::watch::channel(None);
+        let handle = AgentHandle {
+            id,
+            node: Arc::new(cx.clone()),
+            outcome,
+        };
+        let runtime = self.runtime.clone();
+        let parent_cancel = self.cancel.clone();
+        work.tasks.push(tokio::spawn(async move {
+            // Cell tokens may be supplied by external adapters; also enforce parent cancellation.
+            let child_cancel = cx.cancel.clone();
+            let bridge = tokio::spawn(async move {
+                tokio::select! { _ = parent_cancel.cancelled() => child_cancel.cancel(), _ = child_cancel.cancelled() => {} }
+            });
+            let state = cx.state.clone();
+            let result = runtime.run_node(cx, agent_spec, settings, owner_token).await;
+            bridge.abort();
+            let _ = bridge.await;
+            let result = result.unwrap_or_else(|_| runtime.outcome(id, Status::Failed, Answer::Text(String::new()), state.turns.load(Ordering::SeqCst)));
+            tx.send_replace(Some(result));
+        }));
+        Ok(handle)
+    }
     fn cancel_status(&self) -> Status {
         if Instant::now() >= self.deadline {
             Status::Timeout
@@ -832,52 +1095,62 @@ impl NodeCtx {
     }
     /// Admits and runs a traceable leaf completion owned by both node and caller tokens.
     /// Leaf calls consume the LLM count but no live-agent slot or agent depth.
-    pub async fn llm(&self, call: LlmCall, owner: &CancellationToken) -> Result<LlmOutcome> {
+    pub async fn llm(
+        &self,
+        call: LlmCall,
+        owner: &CancellationToken,
+    ) -> std::result::Result<LlmOutcome, RecursionError> {
+        if call.max_tokens == Some(0) {
+            return Err(RecursionError::InvalidRequest(
+                "max_tokens must be positive".into(),
+            ));
+        }
         let scope = self.cancel.child_token();
         let _cancel_on_drop = CancelOnDrop(scope.clone());
-        let node = self.clone();
         let owner = owner.clone();
+        let model = call
+            .model
+            .clone()
+            .unwrap_or_else(|| self.runtime.0.config.llm_model.clone());
+        self.validate_model(&model)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // The owned task completes settlement even when a tool drops its waiting future.
-        let task = tokio::spawn(async move {
-            let result = node.llm_owned(call, &owner, scope).await;
-            let _ = tx.send(result);
-        });
-        self.runtime
-            .0
-            .leaves
-            .lock()
-            .expect("leaf registry poisoned")
-            .push(task);
-        rx.await?
+        {
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            self.check_open(&work)?;
+            if owner.is_cancelled() {
+                return Err(RecursionError::Cancelled);
+            }
+            let id = self.runtime.0.ledger.admit(self.id, false, None)?;
+            let cx = NodeCtx {
+                id,
+                parent: Some(self.id),
+                depth: self.depth,
+                cancel: scope.child_token(),
+                deadline: self.deadline,
+                model,
+                runtime: self.runtime.clone(),
+                state: Arc::new(NodeState::default()),
+                cwd: self.cwd.clone(),
+                options: call.options.clone(),
+            };
+            // Own the task independently of the waiting future so settlement always completes.
+            work.tasks.push(tokio::spawn(async move {
+                let result = cx.llm_owned(call, owner).await;
+                let _ = tx.send(result);
+            }));
+        }
+        rx.await
+            .map_err(|e| RecursionError::ModelError(e.to_string()))?
     }
     async fn llm_owned(
         &self,
         call: LlmCall,
-        owner: &CancellationToken,
-        scope: CancellationToken,
-    ) -> Result<LlmOutcome> {
-        if scope.is_cancelled() || owner.is_cancelled() || Instant::now() >= self.deadline {
-            bail!("cancelled");
-        }
-        if call.max_tokens == Some(0) {
-            bail!("max_tokens must be positive");
-        }
-        let model = call
-            .model
-            .unwrap_or_else(|| self.runtime.0.config.llm_model.clone());
-        let id = self.runtime.0.ledger.admit(self.id, false, None)?;
-        let cx = NodeCtx {
-            id,
-            parent: Some(self.id),
-            depth: self.depth,
-            cancel: scope.child_token(),
-            deadline: self.deadline,
-            model: model.clone(),
-            runtime: self.runtime.clone(),
-        };
+        owner: CancellationToken,
+    ) -> std::result::Result<LlmOutcome, RecursionError> {
+        let cx = self;
+        let id = self.id;
+        let model = self.model.clone();
         let child = cx.cancel.clone();
-        let owner = owner.clone();
         let watcher = tokio::spawn(async move {
             tokio::select! { _ = owner.cancelled() => child.cancel(), _ = child.cancelled() => {} }
         });
@@ -900,18 +1173,19 @@ impl NodeCtx {
             self.runtime
                 .emit(TraceEvent::NodeStart {
                     node: id,
-                    parent: Some(self.id),
+                    parent: self.parent,
                     depth: self.depth,
                     kind: "llm".into(),
                     name: String::new(),
                     model: model.to_string(),
+                    origin_cell: None,
                     system: call.system,
                     tools: vec![],
                     limits: self.runtime.0.config.limits.clone(),
                     prompt: Some(Value::String(call.prompt)),
                 })
                 .await?;
-            self.runtime.attempts(&cx, &model, request, None).await
+            self.runtime.attempts(cx, &model, request, None).await
         })
         .catch_unwind()
         .await
@@ -919,10 +1193,10 @@ impl NodeCtx {
             self.runtime.0.panicked.store(true, Ordering::SeqCst);
             Err(CallError::Internal(anyhow::anyhow!("leaf task panicked")))
         });
+        self.runtime.0.ledger.close_admission(id);
         cx.cancel.cancel();
         watcher.abort();
         let _ = watcher.await;
-        self.runtime.0.ledger.shutdown(id);
         let (status, text) = match &result {
             Ok((r, _)) => (
                 match r.stop_reason {
@@ -939,13 +1213,24 @@ impl NodeCtx {
                 }
                 .text(),
             ),
-            Err(e) => (status_for(e, &cx), String::new()),
+            Err(e) => (status_for(e, cx), String::new()),
         };
         let outcome = self
             .runtime
             .outcome(id, status, Answer::Text(text.clone()), 1);
-        self.runtime.emit(TraceEvent::NodeEnd { outcome }).await?;
-        let (response, _) = result?;
+        let emitted = self.runtime.emit(TraceEvent::NodeEnd { outcome }).await;
+        self.runtime.0.ledger.shutdown(id);
+        emitted.map_err(|e| RecursionError::ModelError(e.to_string()))?;
+        let (response, _) = result.map_err(|error| match error {
+            CallError::Budget => RecursionError::BudgetExceeded,
+            CallError::Provider(ProviderError::Cancelled) => RecursionError::Cancelled,
+            other => RecursionError::ModelError(other.to_string()),
+        })?;
+        if status != Status::Completed {
+            return Err(RecursionError::ModelError(format!(
+                "leaf ended with {status:?}"
+            )));
+        }
         Ok(LlmOutcome {
             node: id,
             text,

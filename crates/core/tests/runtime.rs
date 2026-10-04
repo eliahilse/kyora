@@ -853,7 +853,18 @@ async fn provider_dispatch_and_stream_panics_settle_root_reservations() {
         let snapshot = rt.ledger().snapshot(0);
         assert_eq!(snapshot.reserved, 0);
         assert!(snapshot.used > 0);
-        assert!(drain(rx).iter().any(|event| matches!(
+        let events = drain(rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    TraceEvent::AttemptEnd { charged, .. } => Some(charged),
+                    _ => None,
+                })
+                .sum::<u64>(),
+            snapshot.used
+        );
+        assert!(events.iter().any(|event| matches!(
             event,
             TraceEvent::SessionEnd {
                 status: Status::Failed

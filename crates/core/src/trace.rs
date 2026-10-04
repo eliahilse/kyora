@@ -36,6 +36,9 @@ pub enum TraceEvent {
         name: String,
         /// Provider/model reference.
         model: String,
+        /// Originating REPL cell, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_cell: Option<u32>,
         /// Frozen system prompt.
         system: Option<String>,
         /// Frozen tool specifications.
@@ -247,4 +250,147 @@ impl TraceSink {
         }
         Ok(())
     }
+}
+
+/// Serializable recursion node reconstructed from lifecycle and accounting records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecursionTree {
+    /// Session-local identifier.
+    pub id: NodeId,
+    /// Agent or llm.
+    pub kind: String,
+    /// Display name.
+    pub name: String,
+    /// Provider/model reference.
+    pub model: String,
+    /// Originating cell, when recorded.
+    pub origin_cell: Option<u32>,
+    /// Terminal status, or None for a running node.
+    pub status: Option<Status>,
+    /// Admitted assistant turns.
+    pub turns: u32,
+    /// Usage charged directly to this node.
+    pub usage_self: Usage,
+    /// Direct usage plus all descendant charges.
+    pub usage_subtree: Usage,
+    /// Children sorted by session-local id.
+    pub children: Vec<RecursionTree>,
+}
+
+/// Reconstructs a forest from session records without IO or dependence on event scheduling.
+/// Rejects duplicate starts, missing parents and cycles. Partial traces retain running status.
+pub fn reconstruct_tree(records: &[TraceRecord]) -> Result<Vec<RecursionTree>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut nodes = BTreeMap::new();
+    for record in records {
+        if let TraceEvent::NodeStart {
+            node,
+            parent,
+            kind,
+            name,
+            model,
+            origin_cell,
+            ..
+        } = &record.event
+        {
+            let tree = RecursionTree {
+                id: *node,
+                kind: kind.clone(),
+                name: name.clone(),
+                model: model.clone(),
+                origin_cell: *origin_cell,
+                status: None,
+                turns: 0,
+                usage_self: Usage::default(),
+                usage_subtree: Usage::default(),
+                children: Vec::new(),
+            };
+            if nodes.insert(*node, (*parent, tree)).is_some() {
+                anyhow::bail!("duplicate node_start: {node}");
+            }
+        }
+    }
+    let mut settled = BTreeSet::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::Message { node, message }
+                if message.role == kyora_protocol::Role::Assistant =>
+            {
+                if let Some((_, tree)) = nodes.get_mut(node) {
+                    tree.turns += 1;
+                }
+            }
+            TraceEvent::AttemptEnd {
+                node,
+                attempt,
+                usage,
+                charged,
+                ..
+            } if settled.insert(*attempt) => {
+                if let Some((_, tree)) = nodes.get_mut(node) {
+                    tree.usage_self += usage.unwrap_or(Usage {
+                        input_tokens: *charged,
+                        ..Usage::default()
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    for record in records {
+        if let TraceEvent::NodeEnd { outcome } = &record.event
+            && let Some((_, tree)) = nodes.get_mut(&outcome.node)
+        {
+            tree.status = Some(outcome.status);
+            tree.turns = outcome.turns;
+            tree.usage_self = outcome.usage_self;
+        }
+    }
+    let mut children: BTreeMap<Option<NodeId>, Vec<NodeId>> = BTreeMap::new();
+    for (id, (parent, _)) in &nodes {
+        if parent.is_some_and(|parent| !nodes.contains_key(&parent)) {
+            anyhow::bail!("missing parent for node: {id}");
+        }
+        children.entry(*parent).or_default().push(*id);
+    }
+    fn build(
+        id: NodeId,
+        nodes: &mut BTreeMap<NodeId, (Option<NodeId>, RecursionTree)>,
+        children: &BTreeMap<Option<NodeId>, Vec<NodeId>>,
+    ) -> RecursionTree {
+        let (_, mut tree) = nodes.remove(&id).expect("acyclic node tree");
+        tree.usage_subtree = tree.usage_self;
+        for child in children.get(&Some(id)).into_iter().flatten() {
+            let child = build(*child, nodes, children);
+            tree.usage_subtree += child.usage_subtree;
+            tree.children.push(child);
+        }
+        tree
+    }
+    let roots = children.get(&None).cloned().unwrap_or_default();
+    // Verify ancestry before recursive construction, including disconnected cycles.
+    for id in nodes.keys() {
+        let mut seen = BTreeSet::new();
+        let mut next = Some(*id);
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                anyhow::bail!("cycle at node: {id}");
+            }
+            next = nodes[&id].0;
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .map(|id| build(id, &mut nodes, &children))
+        .collect())
+}
+
+/// Parses events.jsonl contents and reconstructs the tree without reading any files.
+pub fn reconstruct_jsonl(jsonl: &str) -> Result<Vec<RecursionTree>> {
+    let records = jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<TraceRecord>, _>>()?;
+    reconstruct_tree(&records)
 }

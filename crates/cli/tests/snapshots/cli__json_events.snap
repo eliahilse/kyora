@@ -1,0 +1,134 @@
+---
+source: crates/cli/tests/cli.rs
+expression: shape
+---
+[
+  {
+    "cwd": "<cwd>",
+    "kyora": "0.0.0",
+    "seq": 0,
+    "session": "<session>",
+    "ts": "<timestamp>",
+    "type": "session_start",
+    "v": 1
+  },
+  {
+    "depth": 0,
+    "kind": "agent",
+    "model": "anthropic/claude-opus-5-5",
+    "name": "root",
+    "node": 0,
+    "parent": null,
+    "prompt": null,
+    "seq": 1,
+    "system": "<system>",
+    "ts": "<timestamp>",
+    "type": "node_start",
+    "v": 1
+  },
+  {
+    "message": {
+      "content": [
+        {
+          "text": "task",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    },
+    "node": 0,
+    "seq": 2,
+    "ts": "<timestamp>",
+    "type": "message",
+    "v": 1
+  },
+  {
+    "attempt": "<attempt>",
+    "max_tokens": 32000,
+    "model": "anthropic/claude-opus-5-5",
+    "node": 0,
+    "reserved": "<reserved>",
+    "seq": 3,
+    "ts": "<timestamp>",
+    "type": "attempt_start",
+    "v": 1
+  },
+  {
+    "event": {
+      "index": 0,
+      "text": "done",
+      "type": "text_delta"
+    },
+    "node": 0,
+    "ts": "<timestamp>",
+    "type": "delta",
+    "v": 1
+  },
+  {
+    "attempt": "<attempt>",
+    "charged": "<charged>",
+    "excess": 0,
+    "ms": "<ms>",
+    "node": 0,
+    "outcome": "completed",
+    "request_id": "<request_id>",
+    "seq": 4,
+    "stop_reason": "end_turn",
+    "ts": "<timestamp>",
+    "type": "attempt_end",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 48,
+      "output_tokens": 1
+    },
+    "v": 1
+  },
+  {
+    "message": {
+      "content": [
+        {
+          "text": "done",
+          "type": "text"
+        }
+      ],
+      "role": "assistant"
+    },
+    "node": 0,
+    "seq": 5,
+    "ts": "<timestamp>",
+    "type": "message",
+    "v": 1
+  },
+  {
+    "answer": {
+      "text": "done"
+    },
+    "node": 0,
+    "seq": 6,
+    "status": "completed",
+    "ts": "<timestamp>",
+    "turns": 1,
+    "type": "node_end",
+    "usage_self": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 48,
+      "output_tokens": 1
+    },
+    "usage_subtree": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 48,
+      "output_tokens": 1
+    },
+    "v": 1
+  },
+  {
+    "seq": 7,
+    "status": "completed",
+    "ts": "<timestamp>",
+    "type": "session_end",
+    "v": 1
+  }
+]

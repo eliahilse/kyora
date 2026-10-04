@@ -1,0 +1,22 @@
+{
+  "rules": [
+    {
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "bad",
+              "name": "write_file",
+              "input": {
+                "path": "forbidden",
+                "content": "no"
+              }
+            }
+          ],
+          "stop_reason": "refusal"
+        }
+      ]
+    }
+  ]
+}

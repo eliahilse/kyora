@@ -1,0 +1,28 @@
+{
+  "rules": [
+    {
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "bad",
+              "name": "write_file",
+              "input": {}
+            }
+          ],
+          "stop_reason": "tool_use"
+        },
+        {
+          "content": [
+            {
+              "type": "text",
+              "text": "recovered"
+            }
+          ],
+          "stop_reason": "end_turn"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "rules": [
+    {
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "write",
+              "name": "write_file",
+              "input": {
+                "path": "result.txt",
+                "content": "hello\n"
+              }
+            }
+          ],
+          "stop_reason": "tool_use"
+        },
+        {
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "read",
+              "name": "read_file",
+              "input": {
+                "path": "result.txt"
+              }
+            }
+          ],
+          "stop_reason": "tool_use"
+        },
+        {
+          "content": [
+            {
+              "type": "text",
+              "text": "done"
+            }
+          ],
+          "stop_reason": "end_turn"
+        }
+      ]
+    }
+  ]
+}

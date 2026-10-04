@@ -1,0 +1,17 @@
+{
+  "rules": [
+    {
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "text",
+              "text": "partial"
+            }
+          ],
+          "stop_reason": "pause_turn"
+        }
+      ]
+    }
+  ]
+}

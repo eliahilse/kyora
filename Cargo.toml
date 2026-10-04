@@ -7,18 +7,18 @@ version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/eliahilse/kyora"
-rust-version = "1.88"
+rust-version = "1.89"
 publish = false
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "fs"] }
 tokio-util = "0.7"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
 async-stream = "0.3"
@@ -31,6 +31,18 @@ ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 tui-textarea = "0.7"
 libc = "0.2"
+
+kyora-core = { path = "crates/core" }
+kyora-tools = { path = "crates/tools" }
+uuid = { version = "1", features = ["v7"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sha2 = "0.10"
+tempfile = "3"
+proptest = "1"
+nix = { version = "0.30", features = ["signal", "process"] }
+assert_cmd = "2"
+insta = { version = "1", features = ["json"] }
+humantime = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

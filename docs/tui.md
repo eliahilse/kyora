@@ -34,12 +34,12 @@ the fake provider is free. Budgets are display fixtures, not enforced runtime li
 | Enter / Space in conversation | Expand or collapse selected tool arguments/result |
 | PgUp / PgDn outside input | Scroll the transcript |
 | End outside input | Follow the streaming transcript |
-| ? | Toggle help |
+| ? outside input | Toggle help |
 | Esc | Close a modal, otherwise cancel the active turn |
 | q outside input / Ctrl-C anywhere | Quit, confirming with y/n when a run is active |
 
-`q` is ordinary text in the composer. Shift+Enter needs a terminal that supports
-the enhanced keyboard protocol; Ctrl-J works with the legacy protocol. Resize
+`?`, `q`, and Space are ordinary text in the composer. Shift+Enter needs a terminal
+that supports the enhanced keyboard protocol; Ctrl-J works with the legacy protocol. Resize
 keeps all panes visible; below 70 columns the tree sits below the conversation.
 Ratatui diffs frames, and the loop redraws only for UI events, input or resize.
 Set `NO_COLOR=1` to use terminal defaults with emphasis and no accent color.
@@ -66,7 +66,9 @@ the driver. Replacing the demo driver with a core adapter should preserve this
 split. Cancel drops the turn receiver, cancels its token and marks unfinished
 nodes/tools cancelled; a replay uses a fresh channel so stale events cannot leak
 into the next turn. The terminal restores raw mode, alternate screen, paste and
-keyboard settings on exit, errors and panics.
+keyboard settings once on exit, errors and panics. On Unix, delivered SIGINT,
+SIGTERM and SIGHUP exit through the same cleanup path. Keyboard Ctrl-C still
+asks for confirmation when a turn is active.
 
 Check the workspace:
 
@@ -75,6 +77,11 @@ CARGO_BUILD_JOBS=4 cargo fmt --check
 CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
 CARGO_BUILD_JOBS=4 cargo test --workspace --locked
 ```
+
+The Unix PTY regression uses `python3` and its standard library to verify terminal
+settings after SIGINT, SIGTERM, SIGHUP and keyboard Ctrl-C, both idle and during a
+turn. Unit tests cover restore-once behavior, restoring the previous panic hook,
+and composer punctuation.
 
 Layout snapshots cover empty and mid-run sessions at 120x32 and a mid-run session
 at 80x24. To deliberately regenerate the checked-in text fixtures:

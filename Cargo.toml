@@ -26,6 +26,7 @@ kyora-tui = { path = "crates/tui" }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 tui-textarea = "0.7"
+signal-hook = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

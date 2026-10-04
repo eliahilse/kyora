@@ -168,6 +168,29 @@ fn composer_focus_help_and_quit_confirmation() {
     );
 }
 
+#[test]
+fn composer_keeps_single_character_shortcuts_as_text() {
+    let mut app = App::new(true);
+    for character in "why? q ".chars() {
+        assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+    }
+    assert!(!app.help);
+    assert!(!app.confirm_quit);
+    assert_eq!(app.input.lines(), &["why? q "]);
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Action::Submit("why? q ".into())
+    );
+    app.handle_key(key(KeyCode::Char('?')));
+    assert_eq!(app.input.lines(), &["?"]);
+    assert!(!app.help);
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.help);
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(!app.help);
+}
+
 #[tokio::test]
 async fn demo_streams_a_complete_tree_and_replays_with_exact_accounting() {
     let mut app = App::new(true);

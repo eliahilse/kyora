@@ -286,7 +286,7 @@ impl App {
             }
             return Action::Quit;
         }
-        if key.code == KeyCode::Char('?') {
+        if key.code == KeyCode::Char('?') && (self.focus != Focus::Input || self.help) {
             self.help = !self.help;
             return Action::None;
         }

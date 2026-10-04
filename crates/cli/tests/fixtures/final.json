@@ -1,0 +1,17 @@
+{
+  "rules": [
+    {
+      "responses": [
+        {
+          "content": [
+            {
+              "type": "text",
+              "text": "done"
+            }
+          ],
+          "stop_reason": "end_turn"
+        }
+      ]
+    }
+  ]
+}

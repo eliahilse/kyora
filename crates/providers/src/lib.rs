@@ -21,6 +21,9 @@ pub mod fake;
 /// Variants are chosen so the caller can decide both whether to retry
 /// ([`ProviderError::is_retryable`]) and what an attempt costs when it fails
 /// ([`ProviderError::charge`]).
+/// Cancellation observed before any request bytes are sent is [`Self::NotSent`]
+/// and charges zero. Once the request may have reached the server, cancellation
+/// is [`Self::Cancelled`] and charges the reservation because usage is unknown.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     /// An unsuccessful HTTP response received before any stream event.
@@ -33,7 +36,8 @@ pub enum ProviderError {
         /// The provider's optional retry delay.
         retry_after: Option<Duration>,
     },
-    /// The request was never sent: DNS, connect or TLS failure before the body was written.
+    /// No request bytes were sent, including cancellation before sending and
+    /// DNS, connect or TLS failure before sending.
     #[error("not sent: {0}")]
     NotSent(String),
     /// A connection or transport failure after the request was sent.
@@ -53,7 +57,7 @@ pub enum ProviderError {
     /// A malformed or incomplete provider stream.
     #[error("protocol: {0}")]
     Protocol(String),
-    /// The request was cancelled.
+    /// The request was cancelled after it may have reached the server.
     #[error("cancelled")]
     Cancelled,
     /// The request exceeded the model's context limit.
@@ -74,6 +78,16 @@ pub enum AttemptCharge {
 }
 
 impl ProviderError {
+    /// Classifies cancellation by whether the request may have reached the server.
+    /// Pass `false` only when no request bytes have been sent.
+    pub fn cancelled(request_may_have_been_sent: bool) -> Self {
+        if request_may_have_been_sent {
+            Self::Cancelled
+        } else {
+            Self::NotSent("cancelled before sending".into())
+        }
+    }
+
     /// Whether retrying the same request may succeed.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -92,8 +106,9 @@ impl ProviderError {
     ///
     /// HTTP 4xx responses and 529 before any stream event are not charged by
     /// policy; other failures after sending are charged conservatively.
-    /// `Cancelled` is charged as reserved: callers that cancel before sending
-    /// must not dispatch at all, so a cancellation here may follow sending.
+    /// Cancellation before any request bytes are sent is `NotSent` and charges
+    /// zero. `Cancelled` means the request may have reached the server and
+    /// charges the reservation, even if no response has arrived.
     pub fn charge(&self) -> AttemptCharge {
         match self {
             Self::NotSent(_) | Self::ContextTooLarge(_) => AttemptCharge::Zero,
@@ -215,6 +230,17 @@ mod tests {
         ] {
             assert_eq!(error.charge(), AttemptCharge::Reserved, "{error}");
         }
+    }
+
+    #[test]
+    fn cancellation_charge_depends_on_whether_sending_may_have_started() {
+        let unsent = ProviderError::cancelled(false);
+        assert!(matches!(unsent, ProviderError::NotSent(_)));
+        assert_eq!(unsent.charge(), AttemptCharge::Zero);
+
+        let sent = ProviderError::cancelled(true);
+        assert!(matches!(sent, ProviderError::Cancelled));
+        assert_eq!(sent.charge(), AttemptCharge::Reserved);
     }
 
     #[test]

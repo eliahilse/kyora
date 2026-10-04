@@ -175,6 +175,20 @@ impl AddAssign for Usage {
     }
 }
 
+/// Usage for one provider-reported attempt, kept separate across models.
+/// Reported tokens can include unbilled refusals, so this is not a bill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageIteration {
+    /// The model that ran this attempt.
+    pub model: String,
+    /// The provider's iteration kind, such as `message` or `fallback_message`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Token counters for this attempt only.
+    #[serde(flatten)]
+    pub usage: Usage,
+}
+
 /// Why a model stopped, preserving unknown provider strings verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
@@ -418,6 +432,18 @@ pub enum StreamEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_iteration_retains_model_and_kind() {
+        let raw = json!({"model": "fallback-model", "type": "fallback_message",
+            "input_tokens": 12, "output_tokens": 3,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0});
+        let iteration: UsageIteration = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(iteration.model, "fallback-model");
+        assert_eq!(iteration.kind, "fallback_message");
+        assert_eq!(iteration.usage.input_tokens, 12);
+        assert_eq!(serde_json::to_value(iteration).unwrap(), raw);
+    }
 
     #[test]
     fn message_and_all_blocks_round_trip() {

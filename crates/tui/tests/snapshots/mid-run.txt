@@ -1,0 +1,32 @@
+┌Conversation #0───────────────────────────────────────────────────────────────┐┌Recursion | Up/Down inspect───────────┐
+│You                                                                           ││#0 agent root running                 │
+│Summarize three incident reports and check their dates.                       ││  fake/root 1200t r18800              │
+│                                                                              ││  #1 repl cell 1 running              │
+│Assistant                                                                     ││    fake/root 0t r18800               │
+│I will review the reports with three agents and check dates with llm() calls. ││    #2 agent report 0 running         │
+│                                                                              ││      fake/agent 0t r18800            │
+│[+] python [running]                                                          ││    #3 agent report 1 running         │
+│  args: from concurrent.futures import ThreadPoolExecutor with                ││      fake/agent 0t r18800            │
+│ThreadPoolExecu...                                                            ││    #4 agent report 2 running         │
+│  result: waiting...                                                          ││      fake/agent 0t r18800            │
+│                                                                              ││    #5 llm() date 0 running           │
+│Scripted run in progress.                                                     ││      fake/leaf 0t r18800             │
+│                                                                              ││    #6 llm() date 1 running           │
+│                                                                              ││      fake/leaf 0t r18800             │
+│                                                                              ││    #7 llm() date 2 running           │
+│                                                                              ││      fake/leaf 0t r18800             │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+└──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+┌Input | Enter send | Shift+Enter newline──────────────────────────────────────────────────────────────────────────────┐
+│ Type a prompt. Enter plays the offline script.                                                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+fake/root | 1200 tok | est $0.0024 | 18800 left
+Tab focus  ? help  Esc cancel  q quit*  Ctrl-C quit  PgUp/PgDn scroll

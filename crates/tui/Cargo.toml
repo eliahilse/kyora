@@ -1,0 +1,23 @@
+[package]
+name = "kyora-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+crossterm.workspace = true
+tui-textarea.workspace = true
+kyora-protocol.workspace = true
+kyora-providers.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

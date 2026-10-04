@@ -1,0 +1,19 @@
+{
+  "rules": [
+    {
+      "match": { "depth": 0, "last_user_contains": "hello" },
+      "responses": [
+        {
+          "content": [
+            { "type": "tool_use", "id": "call_1", "name": "echo", "input": { "text": "hello" } }
+          ],
+          "stop_reason": "tool_use"
+        },
+        {
+          "content": [{ "type": "text", "text": "done" }],
+          "stop_reason": "end_turn"
+        }
+      ]
+    }
+  ]
+}

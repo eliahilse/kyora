@@ -26,6 +26,7 @@ fn pane(title: String, focused: bool, style: Style) -> Block<'static> {
         .border_style(if focused { style } else { Style::default() })
 }
 
+/// Renders the selected transcript, recursion tree, input and active dialogs.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let input_height = (app.input.lines().len() as u16)

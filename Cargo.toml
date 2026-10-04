@@ -20,6 +20,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tokio-util = "0.7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
+async-stream = "0.3"
+tracing = "0.1"
+wiremock = "0.6"
 kyora-protocol = { path = "crates/protocol" }
 kyora-providers = { path = "crates/providers" }
 kyora-tui = { path = "crates/tui" }

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
 use futures::StreamExt;
-use kyora_protocol::{BlockStart, ContentBlock, ModelResponse, StopReason, StreamEvent, Usage};
+use kyora_protocol::{
+    BlockStart, ContentBlock, ModelResponse, StopReason, StreamEvent, Usage, UsageIteration,
+};
 use serde_json::Value;
 
 use crate::{EventStream, ProviderError};
@@ -19,6 +21,7 @@ pub struct Accumulator {
     header: Option<(Option<String>, String)>,
     blocks: BTreeMap<usize, PendingBlock>,
     usage: Usage,
+    usage_iterations: Vec<UsageIteration>,
     stop_reason: Option<StopReason>,
     stopped: bool,
     invalid_tool_inputs: Vec<usize>,
@@ -173,6 +176,15 @@ impl Accumulator {
                     }
                 }
             }
+            StreamEvent::UsageSnapshot {
+                model,
+                usage,
+                iterations,
+            } => {
+                self.header.as_mut().expect("message start was checked").1 = model;
+                self.usage = usage;
+                self.usage_iterations = iterations;
+            }
             StreamEvent::MessageStop => {
                 if self.blocks.values().any(|block| !block.closed) {
                     return Err(protocol("message stopped with open blocks"));
@@ -204,6 +216,7 @@ impl Accumulator {
                 .stop_reason
                 .ok_or_else(|| protocol("missing stop reason"))?,
             usage: self.usage,
+            usage_iterations: self.usage_iterations,
         })
     }
 

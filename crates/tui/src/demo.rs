@@ -77,6 +77,7 @@ impl Driver {
                     output_tokens: 100,
                     ..Usage::default()
                 },
+                usage_iterations: vec![],
             }],
         }])
         .with_chunk_size(12);
@@ -90,6 +91,7 @@ impl Driver {
                 node_id: Some(node.to_string()),
                 depth: u32::from(node != 0),
             },
+            options: Default::default(),
         };
         let mut stream = provider.stream(request, self.cancel.child_token()).await?;
         let mut accumulator = Accumulator::new();

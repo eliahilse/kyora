@@ -1,7 +1,7 @@
 //! Sequential agent loop and the node-scoped entry point for leaf completions.
 use crate::{
-    Limits, ModelRef, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink,
-    defaults,
+    Effect, Limits, ModelRef, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent,
+    TraceSink, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
     prompts,
     tool::truncate,
@@ -505,11 +505,17 @@ impl Runtime {
                         cancel: cx.cancel.child_token(),
                         events: self.0.config.trace.clone(),
                     };
-                    tokio::select! {
-                        biased;
-                        _ = cx.cancel.cancelled() => ToolOutput::error("cancelled"),
-                        _ = tokio::time::sleep_until(cx.deadline) => { cx.cancel.cancel(); ToolOutput::error("cancelled") },
-                        result = tool.call(input.clone(), tool_cx) => result,
+                    if tool.effect() == Effect::Mutating {
+                        // A started mutation must finish before its result and session_end.
+                        // The run watcher delivers cancellation through tool_cx.
+                        tool.call(input.clone(), tool_cx).await
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = cx.cancel.cancelled() => ToolOutput::error("cancelled"),
+                            _ = tokio::time::sleep_until(cx.deadline) => { cx.cancel.cancel(); ToolOutput::error("cancelled") },
+                            result = tool.call(input.clone(), tool_cx) => result,
+                        }
                     }
                 };
                 let content = truncate(
@@ -645,11 +651,37 @@ impl Runtime {
                 Err(ProviderError::NotSent("cancelled before dispatch".into()))
             } else {
                 reservation.dispatched = true;
+                let attempt_cancel = cx.cancel.child_token();
+                let mut attempt_cx = cx.clone();
+                attempt_cx.cancel = attempt_cancel.clone();
+                let future = self.stream(
+                    &attempt_cx,
+                    provider.as_ref(),
+                    request.clone(),
+                    &mut partial,
+                );
+                tokio::pin!(future);
                 tokio::select! {
                     biased;
-                    _ = cx.cancel.cancelled() => Err(ProviderError::Cancelled),
-                    _ = tokio::time::sleep_until(cx.deadline) => Err(ProviderError::Cancelled),
-                    result = tokio::time::timeout(self.0.config.limits.request_total, self.stream(cx, provider.as_ref(), request.clone(), &mut partial)) => result.unwrap_or(Err(ProviderError::IdleTimeout)),
+                    result = &mut future => result,
+                    _ = async {
+                        tokio::select! {
+                            _ = cx.cancel.cancelled() => {},
+                            _ = tokio::time::sleep_until(cx.deadline) => {},
+                            _ = tokio::time::sleep(self.0.config.limits.request_total) => {},
+                        }
+                    } => {
+                        // Keep polling the same future so the provider can classify an
+                        // unsent request. An unresponsive provider costs the reservation.
+                        attempt_cancel.cancel();
+                        tokio::time::timeout(defaults::PROVIDER_CANCEL_GRACE, &mut future)
+                            .await
+                            .unwrap_or(Err(if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                                ProviderError::Cancelled
+                            } else {
+                                ProviderError::IdleTimeout
+                            }))
+                    },
                 }
             };
             let charge = match &result {

@@ -98,9 +98,21 @@ fn provider(script: Option<PathBuf>) -> Result<Arc<dyn ModelProvider>> {
         None => bail!("the anthropic provider is not wired in yet"),
     }
 }
-#[tokio::main]
-async fn main() -> ExitCode {
-    let code = match Cli::parse().command {
+fn main() -> ExitCode {
+    ExitCode::from(with_runtime(dispatch(Cli::parse())))
+}
+fn with_runtime(work: impl std::future::Future<Output = u8>) -> u8 {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create runtime");
+    let code = runtime.block_on(work);
+    // Detached read-only blocking work must not hold the CLI open after trace flush.
+    runtime.shutdown_background();
+    code
+}
+async fn dispatch(cli: Cli) -> u8 {
+    match cli.command {
         None | Some(Command::Tui { demo: false }) => tui(false).await,
         Some(Command::Tui { demo: true }) => tui(true).await,
         Some(Command::Run(run)) => execute(*run).await,
@@ -128,8 +140,7 @@ async fn main() -> ExitCode {
                 1
             }
         },
-    };
-    ExitCode::from(code)
+    }
 }
 async fn tui(demo: bool) -> u8 {
     match kyora_tui::run(demo).await {
@@ -324,4 +335,75 @@ fn display(record: TraceRecord, json: bool, quiet: bool, thinking: bool) -> Resu
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_shutdown_exits_after_session_end_with_a_blocked_read() {
+        const CHILD: &str = "KYORA_TEST_BLOCKED_READ";
+        if std::env::var_os(CHILD).is_some() {
+            let code = with_runtime(async {
+                let (entered, ready) = oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                });
+                ready.await.unwrap();
+                let store = SessionStore::create(&defaults::home(None).unwrap()).unwrap();
+                store
+                    .trace
+                    .emit(TraceEvent::SessionEnd {
+                        status: Status::Timeout,
+                    })
+                    .await
+                    .unwrap();
+                store.trace.finish().await.unwrap();
+                3
+            });
+            assert_eq!(code, 3);
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::runtime_shutdown_exits_after_session_end_with_a_blocked_read",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("KYORA_HOME", home.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("blocking read held the process open after session_end");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let session = std::fs::read_dir(home.path().join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let records = std::fs::read_to_string(session.join("events.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(event["type"], "session_end");
+        assert_eq!(event["status"], "timeout");
+    }
 }

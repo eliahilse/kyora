@@ -87,6 +87,7 @@ impl Driver {
             messages: vec![Message::user_text(PROMPT)],
             tools: vec![],
             max_tokens: 1024,
+            options: Default::default(),
             metadata: RequestMeta {
                 node_id: Some(node.to_string()),
                 depth: u32::from(node != 0),

@@ -24,6 +24,9 @@ pub const WRITER_CAPACITY: usize = 256;
 /// Interval in which a second interrupt exits immediately.
 pub const INTERRUPT_WINDOW: Duration = Duration::from_secs(2);
 
+/// Time allowed for a cancelled provider to report whether it sent the request.
+pub const PROVIDER_CANCEL_GRACE: Duration = Duration::from_millis(250);
+
 /// Tree and request limits. All counts and durations must be positive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Limits {

@@ -912,3 +912,209 @@ async fn swallowed_leaf_panic_cannot_complete_root_or_leak_reservations() {
         }
     )));
 }
+
+struct ConnectingProvider {
+    leaf_only: bool,
+    sent: bool,
+    responsive: bool,
+    entered: Arc<tokio::sync::Notify>,
+}
+#[async_trait]
+impl ModelProvider for ConnectingProvider {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn stream(
+        &self,
+        req: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        if self.leaf_only && req.model == "root" {
+            return FnProvider::new(|req: &ModelRequest| {
+                Ok(if req.messages.len() == 1 {
+                    response(vec![call("connect")], StopReason::ToolUse)
+                } else {
+                    response(vec![text("done")], StopReason::EndTurn)
+                })
+            })
+            .stream(req, cancel)
+            .await;
+        }
+        self.entered.notify_one();
+        if !self.responsive {
+            return std::future::pending().await;
+        }
+        cancel.cancelled().await;
+        // Classification may need a little cleanup after observing cancellation.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Err(ProviderError::cancelled(self.sent))
+    }
+}
+struct CancelLeafOwner;
+#[async_trait]
+impl Tool for CancelLeafOwner {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "test".into(),
+            input_schema: json!({"type":"object"}),
+            ..ToolSpec::default()
+        }
+    }
+    fn effect(&self) -> Effect {
+        Effect::ReadOnly
+    }
+    async fn call(&self, _input: Value, cx: ToolCx) -> ToolOutput {
+        let owner = CancellationToken::new();
+        let cancel = owner.clone();
+        let watcher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        assert!(
+            cx.node
+                .llm(LlmCall::new("connecting"), &owner)
+                .await
+                .is_err()
+        );
+        watcher.await.unwrap();
+        ToolOutput::text("handled cancellation")
+    }
+}
+#[tokio::test]
+async fn leaf_owner_cancellation_before_sending_charges_zero_to_root() {
+    let (rt, rx) = runtime(
+        Arc::new(ConnectingProvider {
+            leaf_only: true,
+            sent: false,
+            responsive: true,
+            entered: Arc::new(tokio::sync::Notify::new()),
+        }),
+        vec![Arc::new(CancelLeafOwner)],
+        Limits::default(),
+    );
+    let outcome = rt.run(spec()).await.unwrap();
+    assert_eq!(outcome.status, Status::Completed);
+    assert_eq!(outcome.usage_subtree, outcome.usage_self);
+    assert_eq!(rt.ledger().snapshot(0).used, 240);
+    assert_eq!(rt.ledger().snapshot(0).reserved, 0);
+    assert!(drain(rx).iter().any(|event| matches!(
+        event,
+        TraceEvent::AttemptEnd {
+            node: 1,
+            charged: 0,
+            ..
+        }
+    )));
+}
+#[tokio::test]
+async fn root_cancellation_waits_for_send_classification_with_bounded_grace() {
+    for (sent, responsive) in [(false, true), (true, true), (false, false)] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (rt, rx) = runtime(
+            Arc::new(ConnectingProvider {
+                leaf_only: false,
+                sent,
+                responsive,
+                entered: entered.clone(),
+            }),
+            vec![],
+            Limits::default(),
+        );
+        let active = rt.clone();
+        let task = tokio::spawn(async move { active.run(spec()).await.unwrap() });
+        entered.notified().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rt.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.status, Status::Cancelled);
+        let events = drain(rx);
+        let reserved = events
+            .iter()
+            .find_map(|event| match event {
+                TraceEvent::AttemptStart { reserved, .. } => Some(*reserved),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            rt.ledger().snapshot(0).used,
+            if !sent && responsive { 0 } else { reserved }
+        );
+        assert_eq!(rt.ledger().snapshot(0).reserved, 0);
+    }
+}
+#[tokio::test]
+async fn root_deadline_before_sending_charges_zero() {
+    let (rt, _) = runtime(
+        Arc::new(ConnectingProvider {
+            leaf_only: false,
+            sent: false,
+            responsive: true,
+            entered: Arc::new(tokio::sync::Notify::new()),
+        }),
+        vec![],
+        Limits {
+            run_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        },
+    );
+    assert_eq!(rt.run(spec()).await.unwrap().status, Status::Timeout);
+    assert_eq!(rt.ledger().snapshot(0).used, 0);
+    assert_eq!(rt.ledger().snapshot(0).reserved, 0);
+}
+
+struct FinishingMutation {
+    entered: Arc<tokio::sync::Notify>,
+    finished: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for FinishingMutation {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "test".into(),
+            input_schema: json!({"type":"object"}),
+            ..ToolSpec::default()
+        }
+    }
+    fn effect(&self) -> Effect {
+        Effect::Mutating
+    }
+    async fn call(&self, _input: Value, cx: ToolCx) -> ToolOutput {
+        self.entered.notify_one();
+        cx.cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.finished.store(1, Ordering::SeqCst);
+        ToolOutput::text("mutation finished")
+    }
+}
+#[tokio::test]
+async fn started_mutation_reports_real_outcome_before_session_end() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicUsize::new(0));
+    let provider = FnProvider::new(|_| Ok(response(vec![call("mutate")], StopReason::ToolUse)));
+    let (rt, rx) = runtime(
+        Arc::new(provider),
+        vec![Arc::new(FinishingMutation {
+            entered: entered.clone(),
+            finished: finished.clone(),
+        })],
+        Limits::default(),
+    );
+    let active = rt.clone();
+    let task = tokio::spawn(async move { active.run(spec()).await.unwrap() });
+    entered.notified().await;
+    rt.cancel();
+    assert_eq!(task.await.unwrap().status, Status::Cancelled);
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+    let events = drain(rx);
+    let result = events.iter().position(|event| matches!(event,
+        TraceEvent::ToolResult { content, is_error: false, .. } if content == "mutation finished"
+    )).unwrap();
+    let end = events
+        .iter()
+        .position(|event| matches!(event, TraceEvent::SessionEnd { .. }))
+        .unwrap();
+    assert!(result < end);
+}

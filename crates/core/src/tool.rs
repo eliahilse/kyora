@@ -7,12 +7,12 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
-/// Tool effects used by future parallel dispatch.
+/// Tool effects used by cancellation and future parallel dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     /// Reads without modifying the workspace.
     ReadOnly,
-    /// May change workspace state.
+    /// May change workspace state. Runtime waits for its real outcome once started.
     Mutating,
 }
 /// Context passed to one tool execution.
@@ -82,6 +82,7 @@ pub trait Tool: Send + Sync {
         self.spec().large_input
     }
     /// Executes one validated call. Implementations must honor cancellation.
+    /// Started mutations must finish or stop safely before returning an outcome.
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput;
 }
 /// Tool name restriction; None selects all factory tools.

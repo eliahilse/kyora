@@ -383,3 +383,99 @@ async fn file_tools_refuse_fifos_without_a_writer() {
         assert!(text.contains("non-regular"), "{text}");
     }
 }
+
+#[tokio::test]
+async fn absolute_workspace_paths_and_root_aliases_are_accepted() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    for prefix in [&root, &alias, &canonical] {
+        let path = prefix.join("nested/file");
+        let (text, error) = invoke(
+            Arc::new(WriteFile),
+            json!({"path":path,"content":"one"}),
+            &root,
+        )
+        .await;
+        assert!(!error, "{text}");
+        let (text, error) = invoke(
+            Arc::new(EditFile::default()),
+            json!({"path":path,"old":"one","new":"two"}),
+            &root,
+        )
+        .await;
+        assert!(!error, "{text}");
+        let (text, error) = invoke(
+            Arc::new(ReadFile::new(FileConfig::default())),
+            json!({"path":path}),
+            &root,
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert_eq!(text, "1: two\n");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let short = std::path::Path::new("/").join(canonical.strip_prefix("/private").unwrap());
+        let (text, error) = invoke(
+            Arc::new(ReadFile::new(FileConfig::default())),
+            json!({"path":short.join("nested/file")}),
+            &canonical,
+        )
+        .await;
+        assert!(!error, "{text}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_case_and_unicode_alias_edits_preserve_all_updates() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let editor = Arc::new(EditFile::default());
+    for (first, second) in [
+        ("Case.txt", "case.txt"),
+        ("caf\u{e9}.txt", "cafe\u{301}.txt"),
+    ] {
+        std::fs::write(dir.path().join(first), "alpha beta gamma").unwrap();
+        let a = std::fs::metadata(dir.path().join(first)).unwrap();
+        let Ok(b) = std::fs::metadata(dir.path().join(second)) else {
+            continue;
+        };
+        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            continue;
+        }
+        for _ in 0..8 {
+            // A long read widens the overlap between concurrent edits.
+            let padding = "x".repeat(1024 * 1024);
+            std::fs::write(dir.path().join(first), format!("alpha beta gamma{padding}")).unwrap();
+            let (a, b, c) = tokio::join!(
+                invoke(
+                    editor.clone(),
+                    json!({"path":first,"old":"alpha","new":"ALPHA"}),
+                    dir.path()
+                ),
+                invoke(
+                    editor.clone(),
+                    json!({"path":second,"old":"beta","new":"BETA"}),
+                    dir.path()
+                ),
+                invoke(
+                    editor.clone(),
+                    json!({"path":first,"old":"gamma","new":"GAMMA"}),
+                    dir.path()
+                ),
+            );
+            assert!(!a.1, "{}", a.0);
+            assert!(!b.1, "{}", b.0);
+            assert!(!c.1, "{}", c.0);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(first)).unwrap(),
+                format!("ALPHA BETA GAMMA{padding}")
+            );
+        }
+    }
+}

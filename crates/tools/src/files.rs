@@ -30,10 +30,10 @@ impl ReadFile {
 }
 /// Atomically replaces a file after creating its parent directories.
 pub struct WriteFile;
-/// Exact-match editor with shared per-path locks.
+/// Exact-match editor with shared per-file-identity locks.
 #[derive(Default)]
 pub struct EditFile {
-    locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    locks: Arc<Mutex<HashMap<FileIdentity, Arc<Mutex<()>>>>>,
 }
 fn spec(
     name: &str,
@@ -50,12 +50,28 @@ fn spec(
     }
 }
 // Normalize before opening so no tool-supplied component can climb above the root.
-fn path(input: &Value) -> Result<PathBuf> {
+fn path(input: &Value, root: &Path) -> Result<PathBuf> {
     let p = input["path"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let supplied = Path::new(p);
+    // Match a workspace ancestor by its canonical location, accepting aliases
+    // such as /var and /private/var without resolving tool-supplied descendants.
+    let absolute_relative;
+    let supplied = if supplied.is_absolute() {
+        let root = std::fs::canonicalize(root)?;
+        let prefix = supplied
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| std::fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == root))
+            .ok_or_else(|| anyhow::anyhow!("absolute path must be inside the workspace root"))?;
+        absolute_relative = supplied.strip_prefix(prefix)?;
+        absolute_relative
+    } else {
+        supplied
+    };
     let mut relative = PathBuf::new();
-    for component in Path::new(p).components() {
+    for component in supplied.components() {
         match component {
             Component::Normal(name) => relative.push(name),
             Component::CurDir => {}
@@ -76,16 +92,34 @@ fn output(result: Result<String>) -> ToolOutput {
 }
 async fn blocking(
     cx: ToolCx,
+    mutating: bool,
     work: impl FnOnce() -> Result<String> + Send + 'static,
 ) -> ToolOutput {
-    if cx.cancel.is_cancelled() {
+    blocking_work(cx.cancel, cx.node.deadline, mutating, work).await
+}
+async fn blocking_work(
+    cancel: tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
+    mutating: bool,
+    work: impl FnOnce() -> Result<String> + Send + 'static,
+) -> ToolOutput {
+    if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
         return ToolOutput::error("cancelled");
     }
-    let task = tokio::task::spawn_blocking(work);
+    let work_cancel = cancel.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        if work_cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            bail!("cancelled");
+        }
+        work()
+    });
+    if mutating {
+        return output(task.await.map_err(anyhow::Error::from).and_then(|r| r));
+    }
     tokio::select! {
         biased;
-        _ = cx.cancel.cancelled() => ToolOutput::error("cancelled"),
-        _ = tokio::time::sleep_until(cx.node.deadline) => ToolOutput::error("cancelled"),
+        _ = cancel.cancelled() => ToolOutput::error("cancelled"),
+        _ = tokio::time::sleep_until(deadline) => ToolOutput::error("cancelled"),
         result = task => output(result.map_err(anyhow::Error::from).and_then(|r| r)),
     }
 }
@@ -107,6 +141,19 @@ fn parent(root: &Path, relative: &Path, create: bool) -> Result<File> {
         dir = File::from(openat(&dir, name, flags, Mode::empty())?);
     }
     Ok(dir)
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    device: nix::libc::dev_t,
+    inode: nix::libc::ino_t,
+}
+fn file_identity(dir: &File, name: &std::ffi::OsStr) -> Result<FileIdentity> {
+    let stat = fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    regular(stat.st_mode)?;
+    Ok(FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
 }
 fn regular(mode: nix::libc::mode_t) -> Result<()> {
     if SFlag::from_bits_truncate(mode) & SFlag::S_IFMT != SFlag::S_IFREG {
@@ -162,7 +209,7 @@ impl Tool for ReadFile {
         spec(
             "read_file",
             "Read UTF-8 text with 1-based line numbers and bounded input. Offset is a 1-based line number.",
-            json!({"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}}),
+            json!({"path":{"type":"string","description":"Path relative to the workspace. Absolute paths must be inside the workspace."},"offset":{"type":"integer"},"limit":{"type":"integer"}}),
             json!(["path"]),
             false,
         )
@@ -173,7 +220,7 @@ impl Tool for ReadFile {
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let reader = Self::new(self.config.clone());
         let cwd = cx.cwd.clone();
-        blocking(cx, move || reader.read(&input, &cwd)).await
+        blocking(cx, false, move || reader.read(&input, &cwd)).await
     }
 }
 impl ReadFile {
@@ -190,7 +237,7 @@ impl ReadFile {
             bail!("file bounds must be positive");
         }
         let mut bytes = Vec::new();
-        let p = path(input)?;
+        let p = path(input, cwd)?;
         let dir = parent(cwd, &p, false)?;
         read_file(&dir, p.file_name().expect("file name"))?
             .take(self.config.max_bytes as u64 + 1)
@@ -233,7 +280,7 @@ impl Tool for WriteFile {
         spec(
             "write_file",
             "Atomically write UTF-8 contents, creating parent directories.",
-            json!({"path":{"type":"string"},"content":{"type":"string"}}),
+            json!({"path":{"type":"string","description":"Path relative to the workspace. Absolute paths must be inside the workspace."},"content":{"type":"string"}}),
             json!(["path", "content"]),
             true,
         )
@@ -243,8 +290,8 @@ impl Tool for WriteFile {
     }
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let cwd = cx.cwd.clone();
-        blocking(cx, move || {
-            let p = path(&input)?;
+        blocking(cx, true, move || {
+            let p = path(&input, &cwd)?;
             let dir = parent(&cwd, &p, true)?;
             let content = input["content"]
                 .as_str()
@@ -261,7 +308,7 @@ impl Tool for EditFile {
         spec(
             "edit_file",
             "Replace an exact nonempty match, exactly once unless replace_all is true.",
-            json!({"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}}),
+            json!({"path":{"type":"string","description":"Path relative to the workspace. Absolute paths must be inside the workspace."},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}}),
             json!(["path", "old", "new"]),
             true,
         )
@@ -272,37 +319,45 @@ impl Tool for EditFile {
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let locks = self.locks.clone();
         let cwd = cx.cwd.clone();
-        blocking(cx, move || {
-            let p = path(&input)?;
+        blocking(cx, true, move || {
+            let p = path(&input, &cwd)?;
             let dir = parent(&cwd, &p, false)?;
-            let lock = locks
-                .lock()
-                .expect("path registry poisoned")
-                .entry(std::fs::canonicalize(&cwd)?.join(&p))
-                .or_default()
-                .clone();
-            let _guard = lock.lock().expect("path lock poisoned");
-            let old = input["old"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing old"))?;
-            let new = input["new"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing new"))?;
-            if old.is_empty() {
-                bail!("old must not be empty");
+            let name = p.file_name().expect("file name");
+            // Atomic replacement changes the inode. Revalidate after waiting and
+            // publish the new identity under the same lock before releasing it.
+            loop {
+                let identity = file_identity(&dir, name)?;
+                let lock = locks
+                    .lock()
+                    .expect("file registry poisoned")
+                    .entry(identity)
+                    .or_default()
+                    .clone();
+                let _guard = lock.lock().expect("file lock poisoned");
+                if file_identity(&dir, name)? != identity {
+                    continue;
+                }
+
+                let old = input["old"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing old"))?;
+                let new = input["new"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing new"))?;
+                if old.is_empty() {
+                    bail!("old must not be empty");
+                }
+                let mut text = String::new();
+                read_file(&dir, p.file_name().expect("file name"))?.read_to_string(&mut text)?;
+                let count = text.matches(old).count();
+                if count == 0 || (count != 1 && input["replace_all"] != true) {
+                    bail!("expected exactly one match, found {count}");
+                }
+                let mut registry = locks.lock().expect("file registry poisoned");
+                atomic_write(&dir, name, text.replace(old, new).as_bytes())?;
+                registry.insert(file_identity(&dir, name)?, lock.clone());
+                return Ok(format!("replaced {count} matches"));
             }
-            let mut text = String::new();
-            read_file(&dir, p.file_name().expect("file name"))?.read_to_string(&mut text)?;
-            let count = text.matches(old).count();
-            if count == 0 || (count != 1 && input["replace_all"] != true) {
-                bail!("expected exactly one match, found {count}");
-            }
-            atomic_write(
-                &dir,
-                p.file_name().expect("file name"),
-                text.replace(old, new).as_bytes(),
-            )?;
-            Ok(format!("replaced {count} matches"))
         })
         .await
     }
@@ -312,6 +367,86 @@ impl Tool for EditFile {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[tokio::test]
+    async fn started_blocking_mutations_report_their_real_success_or_failure() {
+        for fails in [false, true] {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("file");
+            let worker_target = target.clone();
+            let task = tokio::spawn(blocking_work(
+                worker_cancel,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                true,
+                move || {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    if fails {
+                        bail!("write failed");
+                    }
+                    std::fs::write(worker_target, "finished")?;
+                    Ok("wrote file".into())
+                },
+            ));
+            ready.await.unwrap();
+            cancel.cancel();
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "mutation returned before blocking work finished"
+            );
+            release.send(()).unwrap();
+            let result = task.await.unwrap();
+            assert_eq!(result.is_error, fails);
+            assert_eq!(
+                result.text_content(),
+                if fails { "write failed" } else { "wrote file" }
+            );
+            assert_eq!(target.exists(), !fails);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_can_be_cancelled_while_blocking_work_is_still_running() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(blocking_work(
+            cancel.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            false,
+            move || {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok("read finished".into())
+            },
+        ));
+        ready.await.unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.text_content(), "cancelled");
+    }
+
+    #[test]
+    fn file_identity_matches_hard_link_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), "text").unwrap();
+        std::fs::hard_link(root.path().join("file"), root.path().join("alias")).unwrap();
+        let dir = parent(root.path(), Path::new("file"), false).unwrap();
+        assert!(
+            file_identity(&dir, "file".as_ref()).unwrap()
+                == file_identity(&dir, "alias".as_ref()).unwrap()
+        );
+    }
 
     #[test]
     fn parent_symlink_swap_cannot_redirect_reads_or_atomic_writes() {

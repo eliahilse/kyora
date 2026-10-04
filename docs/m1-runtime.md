@@ -1,6 +1,6 @@
 # M1.1 runtime
 
-The CLI wires `kyora-core` and the Unix `kyora-tools` crate to the existing provider contract. Core has no dependency on built-in tools or a REPL implementation. `crates/providers` is unchanged.
+The CLI wires `kyora-core` and the Unix `kyora-tools` crate to the existing provider contract. Core has no dependency on built-in tools or a REPL implementation. Fake providers report pre-send cancellation as `NotSent`.
 
 `kyora run` currently requires `--fake-script PATH` or `KYORA_FAKE_SCRIPT`. The script format is the existing `ScriptedProvider` format; examples live in `crates/cli/tests/fixtures`. Without a script, the CLI exits 1 with `the anthropic provider is not wired in yet`. `provider()` in `crates/cli/src/main.rs` is the wiring point for that follow-up.
 
@@ -80,23 +80,23 @@ pub trait ToolsetFactory: Send + Sync {
 
 The root consumes one total and live agent slot. Admission counters and ancestor scope budgets share one mutex. A reservation is consumed by settlement, which records actual usage or the provider error's zero/reservation policy. Excess closes a scope as soon as `used + reserved > limit`, even if `used` alone is below the limit.
 
-`Ledger::reserve` is a low-level accounting API: its caller must already hold a model semaphore permit. Runtime enforces that order and flushes `attempt_start` before dispatch. Retries release the model slot during backoff and reserve separately. Malformed input ending at `max_tokens` gets one additional, charged attempt before admission.
+`Ledger::reserve` is a low-level accounting API: its caller must already hold a model semaphore permit. Runtime enforces that order and flushes `attempt_start` before dispatch. Retries release the model slot during backoff and reserve separately. On cancellation or a deadline, core signals an attempt-local provider token and polls the same future for up to 250 ms so the provider can report `NotSent` and charge zero. If that grace period expires, core conservatively charges the reservation. Malformed input ending at `max_tokens` gets one additional, charged attempt before admission.
 
 Root runs and leaf calls execute in owned tasks. Dropping their waiting futures cancels them; their tasks finish settlement. Each attempt has a drop guard that releases an undispatched reservation or conservatively charges a dispatched reservation if its future unwinds or is dropped. Root and leaf boundaries catch panics, complete shutdown and report failure. A leaf panic marks the root failed even when a tool handles the leaf error. Node cancellation cancels leaf calls, and root shutdown joins them before reporting subtree usage. A leaf is owned by both its node token and the explicit caller token. Child-agent spawning is omitted until M1.3; `NodeCtx` already retains the runtime, parent identity, model and inherited deadline.
 
 ## File access
 
-File tools are confined to the workspace root supplied as `AgentSpec::cwd`. Paths must be relative. Absolute paths and parent traversal above the root are rejected; `.` and parent components that stay within the root are normalized. No additional roots are enabled. Any future support for extra roots must require explicit caller configuration.
+File tools are confined to the workspace root supplied as `AgentSpec::cwd`. Paths are relative to the workspace. Absolute paths resolving inside the root are converted to relative paths, including workspace-root aliases such as `/var` and `/private/var`. Absolute paths outside the root and parent traversal above the root are rejected; `.` and parent components that stay within the root are normalized. No additional roots are enabled. Any future support for extra roots must require explicit caller configuration.
 
 Each directory component is opened relative to an already opened directory descriptor with `O_DIRECTORY | O_NOFOLLOW`. Tool-supplied symlinks are refused, including symlinks whose targets are inside the workspace. Reads and edits refuse non-regular files before opening and check the opened descriptor again. `O_NONBLOCK` prevents a replacement FIFO from blocking between those checks. Writes create an exclusive temporary file relative to the held parent descriptor and replace the target entry with `renameat`. Parent symlink swaps cannot redirect reads, edits or writes to an external target.
 
-Filesystem operations run on the blocking pool. Waiting for them observes node cancellation and the run deadline, so the run timeout and first Ctrl-C can end the invocation. FIFOs, devices and other special files are refused instead of starting a blocking read. The shell tool retains its existing process and filesystem access; file-tool confinement is not a shell sandbox.
+Filesystem operations run on the blocking pool. Cancellation or an expired deadline prevents queued work from starting. Reads can stop waiting when cancelled, but their blocking work may continue. Once a write or edit starts, both the tool and core wait for its real success or failure before reporting its result and `session_end`; cancellation cannot undo that mutation and may delay shutdown. After flushing the session and renderer, the CLI shuts down its runtime in the background so a detached read cannot keep the process alive. FIFOs, devices and other special files are refused instead of starting a blocking read. The shell tool retains its existing process and filesystem access; file-tool confinement is not a shell sandbox.
 
 ## Sessions and CLI
 
 `SessionStore` creates UUIDv7 directories with private permissions and locks the event file exclusively. Its writer acknowledges each persistent event after flushing the record. Call `TraceSink::finish()` after the invocation to join the writer and release the lock. Deltas and stream resets are broadcast only; their envelopes have no persisted sequence. Large leaf prompts are content-addressed JSON blobs; messages remain inline. `TraceSink::ephemeral()` creates no files.
 
-The CLI exposes the M1.1 model, effort, limit, tool-selection, cwd and output flags, and `sessions [--json]`. `KYORA_MODEL`, `KYORA_LLM_MODEL` and `KYORA_HOME` are supported. Models and limits are in `kyora-core::defaults`; shell and file settings are in `kyora-tools::defaults` and `ShellConfig::default()`. Library callers can pass an explicit session-home path.
+`kyora` with no arguments and `kyora tui [--demo]` open the offline terminal UI. `kyora run` exposes the M1.1 model, effort, limit, tool-selection, cwd and output flags, and `sessions [--json]`. `KYORA_MODEL`, `KYORA_LLM_MODEL` and `KYORA_HOME` are supported. Models and limits are in `kyora-core::defaults`; shell and file settings are in `kyora-tools::defaults` and `ShellConfig::default()`. Library callers can pass an explicit session-home path.
 
 Exit codes are 0 for completion, 1 for failure, 2 for usage errors, 3 for a limit, 4 for refusal and 130 for cancellation. Progress goes to stderr. JSON mode emits trace envelopes as NDJSON on stdout, including ephemeral deltas.
 
@@ -104,7 +104,7 @@ Exit codes are 0 for completion, 1 for failure, 2 for usage errors, 3 for a limi
 
 - Leaf nodes retain their owning agent's depth and consume the LLM-call counter, without consuming agent slots.
 - File offsets are 1-based. Reads refuse NUL-containing or non-UTF-8 files, inspect at most 4 MiB by default and clip long lines. These bounds are configurable.
-- Exact edits use the D7 `old` and `new` arguments and share locks for normalized paths under the canonical workspace root. Atomic file replacements preserve existing permission bits; new files use private permissions.
+- Exact edits use the D7 `old` and `new` arguments and share locks by device and inode obtained with `fstatat` relative to an opened parent directory. Lock identities are revalidated after waiting and carried forward across atomic replacements, including case and Unicode aliases on filesystems that equate those names. Atomic file replacements preserve existing permission bits; new files use private permissions.
 - Without discovered output-cap information, the configured agent output cap is the fallback ceiling. Numerical overshoot bounds depend on the provider's context and output ceilings as specified by D10.2.
 - A listing with no final session record reports `interrupted`; M2 recovery will determine and persist recovered node statuses. A missing newline on the last record is ignored at the byte level before decoding, including a tail cut inside a UTF-8 character. Corrupt complete records produce an error.
 - Schema failures preserve serialized arguments in `INVALID_JSON`; strict JSON parse failures preserve the original streamed bytes. Unknown tools receive an error without a truncation retry.
@@ -118,9 +118,9 @@ Builds and tests use `CARGO_BUILD_JOBS=4`, `nice -n 10`, and temporary HOME, KYO
 nice -n 10 cargo fmt --all --check
 nice -n 10 cargo clippy --workspace --all-targets --locked -- -D warnings
 nice -n 10 cargo test --workspace --locked
-RUSTDOCFLAGS='-D warnings -W missing_docs' nice -n 10 cargo doc --workspace --no-deps --locked
+nice -n 10 cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu --locked
 ```
 
-The Linux API check is `nice -n 10 cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu --locked`. Linux execution tests and the declared Rust 1.89 MSRV need separate runners when those toolchains are available.
+The M1 API documentation check is `RUSTDOCFLAGS='-D warnings -W missing_docs' nice -n 10 cargo doc --workspace --exclude kyora-tui --no-deps --locked`. The TUI prototype is excluded because its existing public API lacks documentation. Linux execution tests and the declared Rust 1.89 MSRV need separate runners when those toolchains are available.
 
-All four required checks passed on macOS with Rust 1.98. The workspace suite passed 85 tests: core 32, tools 13, CLI 12, protocol 4 and providers 24. Both proptest properties, the NDJSON snapshot, the 100 MB shell flood, process-group timeout and graceful Ctrl-C checks passed. Regressions cover workspace traversal and symlink escapes, a parent symlink swap, root and leaf provider panics, FIFO refusal with run timeout and first Ctrl-C, and a session tail cut inside a UTF-8 character. The Linux all-target cross-check also passed. Linux test execution and the Rust 1.89 MSRV were not run.
+All four required checks passed on macOS with Rust 1.98. The workspace suite passed 117 tests: core 36, tools 18, CLI 15, protocol 5, providers 25 and TUI 18. Counts exclude nested subprocess runs. Both proptest properties, the NDJSON snapshot, the 100 MB shell flood, process-group timeout and graceful Ctrl-C checks passed. Regressions cover workspace traversal and symlink escapes, accepted absolute workspace paths and root aliases, concurrent case and Unicode alias edits where supported by the filesystem, a parent symlink swap, root and leaf provider panics, pre-send cancellation for roots and leaves, bounded provider cancellation grace, mutation completion before session end, process exit with a blocked read, FIFO refusal with run timeout and first Ctrl-C, and a session tail cut inside a UTF-8 character. The Linux all-target cross-check also passed. Linux test execution and the Rust 1.89 MSRV were not run.

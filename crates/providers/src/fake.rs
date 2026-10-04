@@ -1,10 +1,4 @@
-//! In-memory providers with conversation-local scripted queues and chunked events.
-
-use std::{
-    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
-    sync::Mutex,
-};
+//! Stateless scripted providers and chunked event streams for tests.
 
 use async_trait::async_trait;
 use futures::stream;
@@ -20,9 +14,13 @@ const DEFAULT_CHUNK_SIZE: usize = 16;
 
 /// Optional request filters; all supplied filters must match.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Matcher {
     /// Match a specific recursion depth.
     pub depth: Option<u32>,
+    /// Match a substring of the first user message's visible text (the task),
+    /// which identifies a conversation.
+    pub first_user_contains: Option<String>,
     /// Match a substring of the last user message's visible text.
     pub last_user_contains: Option<String>,
     /// Match a substring of the system prompt; an absent prompt cannot match.
@@ -33,8 +31,11 @@ impl Matcher {
     fn matches(&self, request: &ModelRequest) -> bool {
         self.depth
             .is_none_or(|depth| depth == request.metadata.depth)
+            && self.first_user_contains.as_ref().is_none_or(|needle| {
+                user_text(request, First).is_some_and(|text| text.contains(needle))
+            })
             && self.last_user_contains.as_ref().is_none_or(|needle| {
-                last_user_text(request).is_some_and(|text| text.contains(needle))
+                user_text(request, Last).is_some_and(|text| text.contains(needle))
             })
             && self.system_contains.as_ref().is_none_or(|needle| {
                 request
@@ -45,22 +46,26 @@ impl Matcher {
     }
 }
 
-/// An ordered rule with a response queue copied separately for each conversation.
+/// An ordered rule whose responses are indexed by conversation turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Optional filters, serialized as `match` in a fixture script.
     #[serde(default, rename = "match")]
     pub matcher: Option<Matcher>,
-    /// Responses consumed in order within each conversation.
+    /// `responses[n]` answers a request that already contains `n` assistant messages.
     pub responses: Vec<ModelResponse>,
 }
 
-/// A deterministic provider using the first matching, non-exhausted rule.
-/// Conversation keys hash the system prompt and complete first message, so
-/// different initial tasks consume independent copies of every rule's queue.
+/// A deterministic, stateless provider.
+///
+/// For a request containing `n` assistant messages, the first rule whose
+/// matcher matches and which has a response at index `n` answers with that
+/// response. The same request always gets the same response, so concurrent
+/// conversations (for example identical sub-agents) are deterministic
+/// regardless of scheduling.
 pub struct ScriptedProvider {
     rules: Vec<Rule>,
-    queues: Mutex<HashMap<(usize, u64), VecDeque<ModelResponse>>>,
     chunk_size: usize,
 }
 
@@ -69,7 +74,6 @@ impl ScriptedProvider {
     pub fn new(rules: Vec<Rule>) -> Self {
         Self {
             rules,
-            queues: Mutex::new(HashMap::new()),
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
@@ -78,6 +82,7 @@ impl ScriptedProvider {
     /// Response IDs, models, and usage may be omitted.
     pub fn from_json(json: &str) -> Result<Self, ProviderError> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Script {
             rules: Vec<Rule>,
         }
@@ -93,37 +98,28 @@ impl ScriptedProvider {
         self
     }
 
-    fn next_response(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
-        let mut hasher = DefaultHasher::new();
-        request.system.hash(&mut hasher);
-        serde_json::to_vec(&request.messages.first())
-            .map_err(|error| ProviderError::Protocol(error.to_string()))?
-            .hash(&mut hasher);
-        let key = hasher.finish();
-        let mut queues = self
-            .queues
-            .lock()
-            .map_err(|_| ProviderError::Other("fake provider: queue lock poisoned".into()))?;
-        for (index, rule) in self.rules.iter().enumerate() {
-            if rule
-                .matcher
-                .as_ref()
-                .is_some_and(|matcher| !matcher.matches(request))
-            {
-                continue;
-            }
-            let queue = queues
-                .entry((index, key))
-                .or_insert_with(|| rule.responses.clone().into());
-            if let Some(response) = queue.pop_front() {
-                return Ok(response);
-            }
-        }
-        Err(ProviderError::Other(format!(
-            "fake provider: no scripted response for depth {} and last user text {:?}",
-            request.metadata.depth,
-            last_user_text(request).unwrap_or_default(),
-        )))
+    fn respond(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        let turn = request
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .count();
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.matcher
+                    .as_ref()
+                    .is_none_or(|matcher| matcher.matches(request))
+            })
+            .find_map(|rule| rule.responses.get(turn).cloned())
+            .ok_or_else(|| {
+                ProviderError::Other(format!(
+                    "fake provider: no scripted response for turn {turn} at depth {}, first user text {:?}, last user text {:?}",
+                    request.metadata.depth,
+                    user_text(request, First).unwrap_or_default(),
+                    user_text(request, Last).unwrap_or_default(),
+                ))
+            })
     }
 }
 
@@ -141,7 +137,7 @@ impl ModelProvider for ScriptedProvider {
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
-        response_stream(self.next_response(&req)?, &req, self.chunk_size, cancel)
+        response_stream(self.respond(&req)?, &req, self.chunk_size, cancel)
     }
 }
 
@@ -191,13 +187,23 @@ where
     }
 }
 
-fn last_user_text(request: &ModelRequest) -> Option<String> {
-    request
+#[derive(Clone, Copy)]
+enum Which {
+    First,
+    Last,
+}
+use Which::{First, Last};
+
+fn user_text(request: &ModelRequest, which: Which) -> Option<String> {
+    let mut users = request
         .messages
         .iter()
-        .rev()
-        .find(|message| message.role == Role::User)
-        .map(|message| message.text())
+        .filter(|message| message.role == Role::User);
+    match which {
+        First => users.next(),
+        Last => users.next_back(),
+    }
+    .map(|message| message.text())
 }
 
 fn chunks(text: &str, size: usize) -> Vec<String> {

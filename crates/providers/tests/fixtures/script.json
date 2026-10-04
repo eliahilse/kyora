@@ -1,7 +1,7 @@
 {
   "rules": [
     {
-      "match": { "depth": 0, "last_user_contains": "hello" },
+      "match": { "depth": 0, "first_user_contains": "hello" },
       "responses": [
         {
           "content": [

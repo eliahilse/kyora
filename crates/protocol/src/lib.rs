@@ -186,6 +186,8 @@ pub enum StopReason {
     PauseTurn,
     /// The provider refused the request.
     Refusal,
+    /// The response filled the model's context window.
+    ModelContextWindowExceeded,
     /// An unrecognized provider stop reason.
     Other(String),
 }
@@ -199,6 +201,7 @@ impl Serialize for StopReason {
             Self::StopSequence => "stop_sequence",
             Self::PauseTurn => "pause_turn",
             Self::Refusal => "refusal",
+            Self::ModelContextWindowExceeded => "model_context_window_exceeded",
             Self::Other(reason) => reason,
         })
     }
@@ -213,6 +216,7 @@ impl<'de> Deserialize<'de> for StopReason {
             "stop_sequence" => Self::StopSequence,
             "pause_turn" => Self::PauseTurn,
             "refusal" => Self::Refusal,
+            "model_context_window_exceeded" => Self::ModelContextWindowExceeded,
             reason => Self::Other(reason.to_owned()),
         })
     }
@@ -227,8 +231,60 @@ pub struct RequestMeta {
     pub depth: u32,
 }
 
+/// Requested reasoning effort; providers map it to their own setting or ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    /// Least reasoning.
+    Low,
+    /// Moderate reasoning.
+    Medium,
+    /// Thorough reasoning.
+    High,
+    /// More than high.
+    Xhigh,
+    /// Most reasoning.
+    Max,
+}
+
+/// How provider reasoning is returned to the client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Reasoning blocks are returned without readable text.
+    #[default]
+    Omitted,
+    /// Reasoning blocks carry a readable summary.
+    Summarized,
+}
+
+/// Provider-neutral request options; each provider maps what it supports and ignores the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestOptions {
+    /// Reasoning effort; `None` leaves the provider default.
+    pub effort: Option<Effort>,
+    /// Reasoning display; `None` leaves the provider default.
+    pub thinking_display: Option<ThinkingDisplay>,
+    /// Disables prompt-caching hints when true.
+    pub disable_cache: bool,
+    /// Advisory token budget for the whole agentic loop, sent where supported.
+    pub task_budget_total: Option<u64>,
+}
+
+/// Model limits discovered from a provider; unknown values are `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The model identifier the information describes.
+    pub id: String,
+    /// Maximum input tokens (the context window).
+    pub context_window: Option<u64>,
+    /// Maximum output tokens for one response.
+    pub max_output_tokens: Option<u32>,
+}
+
 /// A provider-neutral model request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {
     /// The requested model identifier.
     pub model: String,
@@ -240,6 +296,9 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     /// The maximum output token count.
     pub max_tokens: u32,
+    /// Provider-neutral options.
+    #[serde(default)]
+    pub options: RequestOptions,
     /// Internal context that must not be sent to a real provider API.
     pub metadata: RequestMeta,
 }
@@ -437,6 +496,10 @@ mod tests {
             (StopReason::StopSequence, "stop_sequence"),
             (StopReason::PauseTurn, "pause_turn"),
             (StopReason::Refusal, "refusal"),
+            (
+                StopReason::ModelContextWindowExceeded,
+                "model_context_window_exceeded",
+            ),
             (StopReason::Other("future_reason".into()), "future_reason"),
             (StopReason::Other(String::new()), ""),
         ] {

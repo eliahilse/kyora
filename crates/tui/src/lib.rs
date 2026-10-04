@@ -3,6 +3,8 @@
 pub mod app;
 pub mod demo;
 pub mod event;
+#[cfg(unix)]
+mod signals;
 mod terminal;
 pub mod view;
 

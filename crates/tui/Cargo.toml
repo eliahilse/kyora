@@ -20,7 +20,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-signal-hook.workspace = true
+libc.workspace = true
 
 [lints]
 workspace = true

@@ -30,6 +30,9 @@ use crate::{
 
 type UiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+#[cfg(unix)]
+use crate::signals::ExitSignals;
+
 struct RestoreState {
     once: Once,
     raw_enabled: AtomicBool,
@@ -75,43 +78,17 @@ impl RestoreState {
     }
 }
 
-#[derive(Default)]
-struct ExitSignals {
-    requested: Arc<AtomicBool>,
-    #[cfg(unix)]
-    registrations: Vec<signal_hook::SigId>,
-}
+#[cfg(not(unix))]
+struct ExitSignals;
 
+#[cfg(not(unix))]
 impl ExitSignals {
-    #[cfg(unix)]
     fn new() -> io::Result<Self> {
-        let mut signals = Self::default();
-        for signal in [
-            signal_hook::consts::SIGINT,
-            signal_hook::consts::SIGTERM,
-            signal_hook::consts::SIGHUP,
-        ] {
-            // The handler only sets a flag. Cleanup runs outside signal context.
-            signals.registrations.push(signal_hook::flag::register(
-                signal,
-                Arc::clone(&signals.requested),
-            )?);
-        }
-        Ok(signals)
+        Ok(Self)
     }
 
-    #[cfg(not(unix))]
-    fn new() -> io::Result<Self> {
-        Ok(Self::default())
-    }
-}
-
-impl Drop for ExitSignals {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        for id in self.registrations.drain(..) {
-            signal_hook::low_level::unregister(id);
-        }
+    fn requested(&self) -> bool {
+        false
     }
 }
 
@@ -247,7 +224,7 @@ async fn run_session(demo_on_start: bool, guard: &TerminalGuard) -> anyhow::Resu
     let mut app = App::new(std::env::var_os("NO_COLOR").is_some());
     let mut turn = demo_on_start.then(|| Turn::start(&mut app, demo::PROMPT.into()));
     let mut dirty = true;
-    while !guard.signals.requested.load(Ordering::SeqCst) {
+    while !guard.signals.requested() {
         if let Some(current) = &mut turn {
             // Bound each batch so input stays responsive under an event flood.
             for _ in 0..128 {

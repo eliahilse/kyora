@@ -16,6 +16,9 @@ pub use retry::RetryPolicy;
 /// Deterministic fake providers for tests and fixture scripts.
 pub mod fake;
 
+/// Anthropic Messages API transport and request mapping.
+pub mod anthropic;
+
 /// An error reported by a model provider.
 ///
 /// Variants are chosen so the caller can decide both whether to retry

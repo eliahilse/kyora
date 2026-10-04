@@ -29,10 +29,20 @@ impl ReadFile {
     }
 }
 /// Atomically replaces a file after creating its parent directories.
-pub struct WriteFile;
+#[derive(Default)]
+pub struct WriteFile {
+    config: FileConfig,
+}
+impl WriteFile {
+    /// Creates a writer with trusted workspace spellings.
+    pub fn new(config: FileConfig) -> Self {
+        Self { config }
+    }
+}
 /// Exact-match editor with shared per-file-identity locks.
 #[derive(Clone, Default)]
 pub struct EditFile {
+    config: FileConfig,
     locks: LockRegistry,
     #[cfg(test)]
     observe: Option<Arc<dyn Fn(EditPhase, FileIdentity) + Send + Sync>>,
@@ -59,28 +69,22 @@ fn spec(
     }
 }
 // Normalize before opening so no tool-supplied component can climb above the root.
-fn path(input: &Value, root: &Path) -> Result<PathBuf> {
+fn path(input: &Value, root: &Path, aliases: &[PathBuf]) -> Result<PathBuf> {
     let p = input["path"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let supplied = Path::new(p);
-    // Only trusted root paths may be canonicalized. Reject unrelated absolute
-    // paths lexically, without probing model-supplied ancestors or descendants.
-    let absolute_relative;
+    // Aliases are validated at startup. Never probe model-supplied paths.
     let supplied = if supplied.is_absolute() {
-        absolute_relative = match supplied.strip_prefix(root) {
-            Ok(relative) => relative.to_path_buf(),
-            Err(_) => {
-                let canonical = std::fs::canonicalize(root)?;
-                supplied
-                    .strip_prefix(canonical)
-                    .map_err(|_| {
-                        anyhow::anyhow!("absolute path must be inside the workspace root")
-                    })?
-                    .to_path_buf()
-            }
-        };
-        absolute_relative.as_path()
+        // Prefer the most specific spelling if trusted aliases overlap.
+        aliases
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(root))
+            .filter_map(|alias| supplied.strip_prefix(alias).ok().map(|p| (alias, p)))
+            .max_by_key(|(alias, _)| alias.components().count())
+            .map(|(_, relative)| relative)
+            .ok_or_else(|| anyhow::anyhow!("absolute path must be inside the workspace root"))?
     } else {
         supplied
     };
@@ -286,7 +290,7 @@ impl ReadFile {
             bail!("file bounds must be positive");
         }
         let mut bytes = Vec::new();
-        let p = path(input, cwd)?;
+        let p = path(input, cwd, &self.config.root_aliases)?;
         let dir = parent(cwd, &p, false)?;
         read_file(&dir, p.file_name().expect("file name"))?
             .take(self.config.max_bytes as u64 + 1)
@@ -339,8 +343,9 @@ impl Tool for WriteFile {
     }
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let cwd = cx.cwd.clone();
+        let aliases = self.config.root_aliases.clone();
         blocking(cx, true, move || {
-            let p = path(&input, &cwd)?;
+            let p = path(&input, &cwd, &aliases)?;
             let dir = parent(&cwd, &p, true)?;
             let content = input["content"]
                 .as_str()
@@ -372,6 +377,13 @@ impl Tool for EditFile {
     }
 }
 impl EditFile {
+    /// Creates an editor with trusted workspace spellings and shared inode locks.
+    pub fn new(config: FileConfig) -> Self {
+        Self {
+            config,
+            ..Self::default()
+        }
+    }
     #[cfg(test)]
     fn observe(&self, phase: EditPhase, identity: FileIdentity) {
         if let Some(observe) = &self.observe {
@@ -380,7 +392,7 @@ impl EditFile {
     }
     fn edit(&self, input: &Value, cwd: &Path) -> Result<String> {
         let locks = &self.locks;
-        let p = path(input, cwd)?;
+        let p = path(input, cwd, &self.config.root_aliases)?;
         let dir = parent(cwd, &p, false)?;
         let name = p.file_name().expect("file name");
         // Atomic replacement changes the inode. Revalidate after waiting and
@@ -445,6 +457,7 @@ mod tests {
         let replaced = Arc::new(AtomicUsize::new(0));
         let (published, wait_for_publish) = std::sync::mpsc::channel();
         let editor = EditFile {
+            config: FileConfig::default(),
             locks: LockRegistry::default(),
             observe: Some(Arc::new(move |phase, identity| {
                 let wait_for = |count: usize| {
@@ -537,14 +550,33 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let alias = outside.path().join("alias");
         symlink(root.path(), &alias).unwrap();
-        // Even an existing alias to the root is outside the lexical boundary.
-        // Accepting it would require probing an untrusted filesystem path.
-        for supplied in [alias.join("file"), outside.path().join("missing/file")] {
-            let error = path(&json!({"path":supplied}), root.path()).unwrap_err();
+        let trusted = outside.path().join("trusted");
+        symlink(root.path(), &trusted).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let aliases =
+            crate::workspace_root_aliases(&canonical, Some(&trusted), outside.path(), None);
+        // An existing symlink to the root remains untrusted unless it was
+        // validated from a startup input. Prefix lookalikes are unrelated too.
+        for supplied in [
+            alias.join("file"),
+            outside.path().join("missing/file"),
+            outside.path().join("trusted-other/file"),
+        ] {
+            let error = path(&json!({"path":supplied}), &canonical, &aliases).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "absolute path must be inside the workspace root"
             );
+        }
+        for prefix in &aliases {
+            for suffix in ["../file", "nested/../../file"] {
+                let error =
+                    path(&json!({"path":prefix.join(suffix)}), &canonical, &aliases).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "path must remain relative to the workspace root"
+                );
+            }
         }
     }
 

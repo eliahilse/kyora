@@ -38,12 +38,12 @@ Goals:
 
 - A standalone, local-first harness: `kyora run "<task>"` works on a laptop with an API key and a system `python3`, nothing else.
 - The core loop, providers and tools are in Rust and usable as a library (the CLI and TUI are thin frontends).
-- First-class recursion: plain sub-calls and full sub-agents from Python code, with depth, token, agent-count and concurrency limits that hold for the whole tree, deterministic cancellation, and a trace of the recursion tree.
+- Recursive model calls and sub-agents from Python code, with depth, token, agent-count and concurrency limits that hold for the whole tree, deterministic cancellation, and a trace of the recursion tree.
 - Anthropic Messages API first (Claude models), then OpenAI Responses and Chat-Completions-compatible endpoints including local servers.
 - Deterministic tests: every behavior above is testable with fake providers and no network.
 - Execution backends are pluggable so the REPL and sub-agents can later run in kyora vms (section 22). Local process execution is the only backend built now.
 
-Non-goals for now: Windows support (the REPL process model is Unix-only until a later milestone), a plugin system, a web UI, training integration (trajectory export for RL is noted in section 14 but not built), subscription-login auth.
+Non-goals for now: Windows support (the REPL process model is Unix-only until a later milestone), a plugin system, a web UI, training integration (trajectory export is noted in section 14 but not built), subscription-login auth.
 
 ## 2. Architecture overview
 
@@ -66,7 +66,7 @@ Non-goals for now: Windows support (the REPL process model is Unix-only until a 
                            kyora-providers: anthropic | openai | fake
 ```
 
-Every node (agent or leaf LLM call) is created by the Rust `Runtime`, charged to a shared `Ledger`, gets a child cancellation token, and is recorded in the session trace. A Python REPL never talks to a model provider directly: it asks its host over a private pipe, and the host applies limits, routes the call, and returns the result. This mirrors the host-owned brokers in every surveyed RLM runtime (R§1, R§2) and keeps credentials out of the sandbox.
+Every node (agent or leaf LLM call) is created by the Rust `Runtime`, admitted and charged by a shared `Ledger`, gets a child cancellation token, and is recorded in the session trace. A Python REPL never talks to a model provider directly: it asks its host over a private pipe, and the host applies limits, routes the call, and returns the result. The isolating implementations surveyed in R§1 and R§2 broker model calls through the host the same way; kyora does it for every backend, including local execution.
 
 ## 3. Crate layout
 
@@ -76,10 +76,10 @@ Directory names are short; package names carry the `kyora-` prefix.
 |---|---|---|---|
 | `crates/protocol` | `kyora-protocol` | IO-free serde types: messages, content blocks, tool specs, usage, stream events, trace events, node ids. | serde |
 | `crates/providers` | `kyora-providers` | `ModelProvider` trait, stream `Accumulator`, SSE parser, retry policy, Anthropic provider; later OpenAI Responses and Chat Completions; `fake` providers. | protocol |
-| `crates/core` | `kyora-core` | `Runtime`, agent loop, `Tool` trait and registry, ledger and limits, cancellation tree, trace sink, session store, compaction, prompts. | protocol, providers |
-| `crates/tools` | `kyora-tools` | Built-in tools: `shell`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`. | core |
-| `crates/repl` | `kyora-repl` | The `python` tool: REPL process host, IPC codec, embedded Python package (`python/kyora/`), result formatting. | core |
-| `crates/sandbox` | `kyora-sandbox` | M3. Seatbelt profiles (macOS), bubblewrap and seccomp or Landlock (Linux), applied to shell and REPL processes. | (none) |
+| `crates/core` | `kyora-core` | `Runtime`, agent loop, `Tool` trait and registry, ledger and admission, cancellation tree, trace sink, session store, compaction, prompts. | protocol, providers |
+| `crates/tools` | `kyora-tools` | Built-in tools: `shell`, `read_file`, `write_file`, `edit_file`, later `glob`, `grep`. | core |
+| `crates/repl` | `kyora-repl` | The `python` tool: REPL process host, IPC codec and pumps, embedded Python package (`python/kyora/`), result formatting. | core |
+| `crates/sandbox` | `kyora-sandbox` | M3. Path policy for host file operations; Seatbelt profiles (macOS), bubblewrap and seccomp or Landlock (Linux) for processes. | (none) |
 | `crates/mcp` | `kyora-mcp` | M3. MCP client (official `rmcp` crate), stdio and Streamable HTTP, exposing server tools through the registry. | core |
 | `crates/tui` | `kyora-tui` | M4. ratatui + crossterm frontend, consumes the event stream. | core |
 | `crates/cli` | `kyora-cli` | Binary `kyora`: clap commands, wiring of providers, tools and REPL into a `Runtime`, human and JSON output. | all |
@@ -104,15 +104,17 @@ pub enum ContentBlock {
 }
 ```
 
-The canonical model is close to Anthropic's content blocks because that is the strictest wire format (thinking signatures, single tool-result message per turn). `Opaque` carries anything a provider needs back byte-for-byte that kyora does not interpret: Anthropic `redacted_thinking`, `compaction` and fallback blocks, OpenAI `reasoning` items with `encrypted_content`. A provider replays `Opaque` blocks whose `provider` matches its own and drops the rest; histories therefore stay portable across providers at the cost of losing foreign reasoning.
+The canonical model is close to Anthropic's content blocks because that is the strictest wire format (thinking signatures, single tool-result message per turn). `Opaque` carries anything a provider needs back byte-for-byte that kyora does not interpret: Anthropic `redacted_thinking`, `compaction` and `fallback` blocks, OpenAI `reasoning` items with `encrypted_content`. A provider replays `Opaque` blocks whose `provider` matches its own and drops the rest; histories therefore stay portable across providers at the cost of losing foreign reasoning.
 
 Identifiers:
 
 - `SessionId`: UUIDv7 (time-ordered, so directory listings sort by creation time).
-- `NodeId`: `u32`, allocated sequentially per session; node `0` is the root. Short ids keep traces readable (`#7`).
-- `CellId`: `u32` per REPL.
+- `NodeId`: `u32`, allocated sequentially per session and never reused, also across resumes; node `0` is the root. Short ids keep traces readable (`#7`).
+- `CellId`: `u32` per REPL generation; `ReplGeneration`: `u32` per node, incremented whenever the node's REPL process is (re)started.
 
-`Usage { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens }`. The ledger's "budget tokens" for a call are `input + cache_creation + output`; cache reads are tracked and reported but not charged to the token budget, because every agent turn re-reads its whole history and charging cached re-reads at full weight would make budgets meaningless. A dollar budget (M3) prices all four fields.
+`Usage { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens }`. Providers that report several billed iterations for one request (Anthropic `usage.iterations`, used by compaction and refusal fallback) are summed into one `Usage` for charging; the raw usage object is kept in the trace.
+
+**Budget unit.** A "budget token" is any token the provider processed: `input + cache_creation + cache_read + output` (`Usage::total`). Counting cache reads makes budgets larger in absolute numbers than a "new tokens" metric (nano-rlm subtracts cached tokens, R§2), but it makes the reservation in section 10.2 a true upper bound, so the limit is hard. A dollar budget (M3) prices the same four fields and uses the same reservation logic.
 
 Trace events (`TraceEvent` in protocol) are one enum used for both the live event stream and the persisted JSONL (section 11); streaming deltas are marked ephemeral and never persisted.
 
@@ -127,11 +129,10 @@ struct RuntimeInner {
     providers: ProviderRegistry,            // "anthropic" -> Arc<dyn ModelProvider>
     toolsets: Arc<dyn ToolsetFactory>,      // builds the tool set for a node
     limits: Limits,                         // section 10
-    ledger: Ledger,                         // tree-wide accounting
+    ledger: Ledger,                         // admission and accounting, one lock (10.2)
     model_slots: Semaphore,                 // in-flight model requests
     trace: TraceSink,                       // JSONL writer + broadcast channel
-    ids: AtomicU32,
-    root_cancel: CancellationToken,
+    run_cancel: CancellationToken,          // fresh for every process invocation
 }
 
 pub trait ToolsetFactory: Send + Sync {
@@ -140,58 +141,63 @@ pub trait ToolsetFactory: Send + Sync {
 
 pub struct NodeCtx {          // handed to tools; the only door to recursion
     pub id: NodeId, pub parent: Option<NodeId>, pub depth: u32,
-    pub cancel: CancellationToken, runtime: Runtime, budget: BudgetScope,
+    pub cancel: CancellationToken, pub deadline: Option<Instant>,
+    runtime: Runtime, scope: ScopeId,
 }
 impl NodeCtx {
-    pub async fn llm(&self, call: LlmCall) -> Result<LlmOutcome, RecursionError>;
-    pub fn spawn_agent(&self, spec: AgentSpec) -> Result<AgentHandle, RecursionError>; // fail-fast on limits
+    pub async fn llm(&self, call: LlmCall, owner: &CancellationToken) -> Result<LlmOutcome, RecursionError>;
+    pub fn spawn_agent(&self, spec: AgentSpec, owner: Owner) -> Result<AgentHandle, RecursionError>; // fail-fast admission
     pub fn budget(&self) -> BudgetSnapshot;
 }
+pub enum Owner { Cell(CancellationToken), Node }   // who cancels the child (8.3)
 ```
 
-An `AgentSpec` holds the task, optional name, model reference, tool selection, preloaded REPL variables, and per-node limits (max turns, token budget, timeout). `AgentHandle` exposes `result().await -> AgentOutcome`, `status()`, `cancel()`. `AgentOutcome { node, status, answer, usage_self, usage_subtree, turns }` where `answer` is `Answer::Text(String)` or `Answer::Value(serde_json::Value)` (from `kyora.final`), and `status` is one of `completed`, `max_turns`, `budget_exhausted`, `timeout`, `cancelled`, `refused`, `failed`.
+An `AgentSpec` holds the task, optional name, model reference, tool selection, preloaded REPL variables, and per-node limits (max turns, token budget, deadline). `AgentHandle` exposes `result().await -> AgentOutcome`, `status()`, `cancel()`. `AgentOutcome { node, status, answer, usage_self, usage_subtree, turns }` where `answer` is `Answer::Text(String)` or `Answer::Value(Box<RawValue>)` (from `kyora.final`), and `status` is one of `completed`, `max_turns`, `budget_exhausted`, `timeout`, `context_exhausted`, `cancelled`, `refused`, `failed`.
 
-The root of a session is an agent node like any other; `kyora run` creates it with depth 0 and submits one user turn. An interactive session (TUI, `kyora resume`) submits further user turns to the same root node.
+The root of a session is an agent node like any other; `kyora run` creates it with depth 0 and submits one user turn. Interactive sessions (TUI, `kyora resume` in M2) submit further user turns to the same root node.
 
-### 5.2 One turn
+### 5.2 One round
+
+A round is one model request plus the tool calls it produced.
 
 ```
 on user input:
-  history.push(user message)                         # append-only, recorded
+  history.push(user message)                           # append-only, recorded
   loop:
-    if cancelled            -> stop(cancelled)
-    if turns >= max_turns   -> stop(max_turns)
-    maybe_compact(history)                           # only between rounds, section 12
-    req = ModelRequest { system: frozen, tools: frozen, messages: history, ... }
-    reservation = ledger.reserve(node, estimate(req))?    -> stop(budget_exhausted) on error
-    permit = model_slots.acquire()                   # released when the stream ends
-    resp = provider.stream(req) | accumulate         # deltas -> live events
-    ledger.commit(reservation, resp.usage)
-    history.push(assistant message = resp.content)   # recorded verbatim, incl. thinking/opaque
+    if cancelled or past deadline -> stop(cancelled | timeout)
+    if turns >= max_turns          -> stop(max_turns)
+    maybe_compact(history)                             # only here, never mid-round (12)
+    resp = attempt_with_retries(request(history))      # 6.2, 10.2: reserve, call, settle
+    turn = admit(resp)                                 # see "admission" below
+    history.push(assistant message = turn.content)     # recorded verbatim
     match resp.stop_reason:
-      tool_use     -> results = dispatch(tool_uses)  # 5.3
+      tool_use     -> results = dispatch(turn)         # 5.3; invalid inputs never run
                       history.push(user message = results [+ appended notices])
-                      if a tool reported a final answer -> stop(completed, that answer)
+                      if a cell committed a final answer -> stop(completed, that answer)
       end_turn     -> stop(completed, Answer::Text(last text))
-      max_tokens   -> if the message has tool_use blocks: return is_error results
-                      ("input truncated, retry with smaller input"); else append a
-                      user text "continue" and loop
+      max_tokens   -> tool_use present: error results ("input truncated"), loop
+                      else: append user text "continue", loop
       pause_turn   -> loop (re-send as is)
-      refusal      -> stop(refused, stop_details)
-      other        -> stop(failed)
+      model_context_window_exceeded -> compact if possible and loop, else stop(context_exhausted)
+      refusal      -> error results for any tool_use ("not executed: refusal"), stop(refused)
+      other        -> error results for any tool_use, stop(failed)
 ```
+
+**Admission of a response.** The accumulator keeps, per tool_use block, the raw concatenated `partial_json` and a validity flag (strict JSON parse, then JSON-schema validation against the tool). A response whose tool input is invalid because generation was cut off (`max_tokens`) is not admitted: the request is retried once with a doubled `max_tokens` (bounded by the model's output cap and the budget). If the retry still produces invalid input, or the input is invalid for any other reason, the turn is admitted with `input: {}` in place of the unparseable input (the same placeholder the API streams at `content_block_start`) and the tool gets an `is_error` result `{"INVALID_JSON": "<raw input>"}`, the shape the Anthropic docs recommend (R§4). The raw input is kept in the trace. Invalid tool calls are never executed.
 
 Invariants:
 
-- **Append-only history.** Nothing already sent is edited, reordered or removed. System prompt and tool list are frozen when the node starts. Dynamic information (budget status, "REPL was restarted", limit warnings) is appended: as a text block after the tool results in the same user message, or as a mid-conversation `role: "system"` message where the provider supports it. This is what Anthropic's preserved-thinking check requires (R§4) and also what keeps prompt caching effective.
-- **Every tool_use gets exactly one tool_result**, in the order of the tool_use blocks, in a single user message. On cancellation, unfinished tools get `is_error` results ("cancelled") so the history stays valid for resume (Codex normalizes the same way, R§3).
-- **Tools never run on a truncated or invalid input.** The accumulator parses tool-input JSON strictly; invalid input, `max_tokens` or `refusal` endings produce error results instead of execution (required with eager input streaming, R§4).
+- **Append-only history.** Nothing already sent is edited, reordered or removed. System prompt and tool list are frozen when the node starts. Dynamic information (budget status, "REPL was restarted", limit warnings) is appended: as a text block after the tool results in the same user message, or as a mid-conversation `role: "system"` message where the provider supports it. This is what Anthropic's preserved-thinking check requires on the accounts and models that run it, and it keeps prompt caching effective (R§4).
+- **Every admitted tool_use gets exactly one tool_result**, in the order of the tool_use blocks, in a single user message. On cancellation, unfinished tools get `is_error` results ("cancelled") so the history stays valid (Codex normalizes the same way, R§3).
+- **Tools never run on truncated, invalid or refused input.**
 
-### 5.3 Tool dispatch
+### 5.3 Tool dispatch and concurrency guarantees
 
-Each tool declares an `Effect`: `ReadOnly` or `Mutating`. Within one assistant message, consecutive read-only calls run concurrently; a mutating call waits for everything before it and blocks everything after it (Codex uses an RW lock for the same purpose, R§3). Results are collected in call order. The `python` tool is `Mutating` (cells of one REPL are serial), but recursion inside a cell is concurrent (section 8).
+M1 runs the tool calls of one assistant message sequentially, in order. M2 adds concurrency: each tool declares an `Effect` (`ReadOnly` or `Mutating`), consecutive read-only calls run concurrently and a mutating call is a barrier (Codex uses an RW lock for the same purpose, R§3); results are always recorded in call order.
 
-Unknown tool names and schema-invalid inputs return `is_error` results; inputs are validated against the tool's JSON schema before `call`.
+Guarantee scope: ordering holds within one node only. Different nodes (a parent and its spawned children, siblings) share the workspace and run concurrently, so kyora provides no tree-wide consistency for files. File tools write atomically (temp file and rename), and `edit_file` holds a per-path lock only for the duration of its read-modify-write. No lock is ever held across a recursive wait (that would reintroduce the deadlock section 10.3 rules out). Code that needs isolation between writers should give children disjoint files; separate workspaces per child (for example git worktrees) are a later option.
+
+Unknown tool names and schema-invalid inputs return `is_error` results.
 
 ### 5.4 Output to the caller
 
@@ -207,11 +213,11 @@ pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
     async fn stream(&self, req: ModelRequest, cancel: CancellationToken)
         -> Result<EventStream, ProviderError>;
-    async fn model_info(&self, model: &str) -> Result<ModelInfo, ProviderError>;  // context window, max output
+    async fn model_info(&self, model: &str) -> Result<ModelInfo, ProviderError>;  // context window, max output, capabilities
 }
 ```
 
-`ModelRequest` carries model, frozen system prompt, tools, messages, `max_tokens`, and provider-neutral options (`effort`, `thinking_display`, `cache`, `task_budget`, `metadata { node, depth }`); each provider maps what it supports and ignores the rest. `collect(stream)` turns a stream into a `ModelResponse` via the shared `Accumulator`, so non-streaming callers (leaf `llm` calls) use the same path.
+`ModelRequest` carries model, frozen system prompt, tools, messages, `max_tokens`, and provider-neutral options (`effort`, `thinking_display`, `cache`, `task_budget_total`, `metadata { node, depth }`); each provider maps what it supports and ignores the rest. `collect(stream)` turns a stream into a `ModelResponse` via the shared `Accumulator`, so leaf `llm` calls use the same path.
 
 Model references are `provider/model` (`anthropic/claude-opus-5-5`); a bare model name uses the default provider.
 
@@ -219,16 +225,15 @@ Model references are `provider/model` (`anthropic/claude-opus-5-5`); a bare mode
 
 Raw HTTP (no official Rust SDK) with `reqwest` (rustls) and a small SSE parser of our own (event/data framing, `ping`, mid-stream `error` events).
 
-- Endpoint `POST {base_url}/v1/messages`, headers `x-api-key` from `ANTHROPIC_API_KEY`, `anthropic-version: 2023-06-01`, `anthropic-beta` as needed. `ANTHROPIC_BASE_URL` overrides the base URL (used by tests against a local mock server).
-- Always streaming. Client tools carry `eager_input_streaming: true` when they take large inputs (`python.code`, `write_file.content`).
-- Caching: system prompt sent as text blocks with `cache_control: {type: "ephemeral"}` on the last block, plus top-level automatic `cache_control` for the message tail. Per-node system prompts are frozen and identical across siblings of the same role (no node ids or timestamps in them), so sibling sub-agents share a cached prefix.
-- Thinking: on Claude Opus 5.5 thinking is always adaptive; kyora sends no `thinking` config unless `--show-thinking` (then `display: "summarized"`). Thinking and opaque blocks are stored and replayed verbatim. Requests set `thinking.block_binding.prefix_mismatch_behavior: "error"` (beta `thinking-binding-controls-2026-08-01`) where supported, so any accidental history edit fails loudly in tests; at runtime a mismatch is retried once with `drop_block` and logged as a bug.
-- Effort: `output_config.effort` from config or `--effort`; unset means the API default.
-- Task budgets: when a node has a token budget, its remaining budget is passed as `output_config.task_budget` (beta `task-budgets-2026-03-13`, minimum 20,000) so the model can pace itself. M2; advisory only, the ledger stays authoritative.
-- Refusals: `stop_reason: "refusal"` ends the node with status `refused` and the `stop_details` category. Server-side refusal fallback (`fallbacks: "default"`) is a provider option, on by default for models that support it; served-by information and `fallback` blocks are recorded.
-- Retries: up to 4 retries on transport errors, 408, 409, 429, 5xx and 529, honoring `retry-after`, otherwise exponential backoff with full jitter (1 s base, 60 s cap). A 429 without `retry-after` is retried at most once (it may be a spend cap that keeps failing, R§4). A stream that fails mid-way (`error` event, idle timeout of 300 s without any event including `ping`) is retried as a whole; a `stream_reset` event tells frontends to discard partial output. Retries never happen after tool execution started, because tools only run after a complete message.
-- Forced `tool_choice` is never used (rejected on current models). Structured output for `kyora.llm(schema=...)` uses `output_config.format` (M3).
-- Context windows come from `GET /v1/models/{id}` (`max_input_tokens`, `max_tokens`), cached per process, with a built-in fallback table.
+- **Transport.** `POST {base_url}/v1/messages`, headers `x-api-key` from `ANTHROPIC_API_KEY`, `anthropic-version: 2023-06-01`, `anthropic-beta` as needed. `ANTHROPIC_BASE_URL` overrides the base URL (tests use a local mock server). Always streaming. Client tools that take large inputs (`python.code`, `write_file.content`) carry `eager_input_streaming: true`; validation is then ours (5.2).
+- **Caching.** System prompt sent as text blocks with `cache_control: {type: "ephemeral"}` on the last block, plus top-level automatic `cache_control` for the message tail. Per-node system prompts are frozen and identical across siblings of the same role (no node ids or timestamps in them), so sibling sub-agents can share a cached prefix.
+- **Thinking.** Per-model capabilities come from `GET /v1/models/{id}` (with a built-in fallback table). For models with adaptive thinking (Claude Opus 5.5, Sonnet 5.5) every request sends one complete configuration: `thinking: {type: "adaptive", display: "omitted" | "summarized", block_binding: {prefix_mismatch_behavior: "error"}}` with beta `thinking-binding-controls-2026-08-01`. `display` is `summarized` only with `--show-thinking`. Models without adaptive thinking get no `thinking` field. Thinking and opaque blocks are stored and replayed verbatim. If a request is rejected for a prefix mismatch (which means a kyora bug), the session switches to `drop_block` permanently: the choice is recorded in the session log and sent on every later request, including after resume, and every `input_transformations` entry in responses is recorded. Tests run with `"error"` so a mismatch fails CI.
+- **Effort.** `output_config.effort` from config or `--effort`; unset means the API default.
+- **Usage.** Top-level usage, or the sum over `usage.iterations` when present (the top-level fields cover only the serving iteration in that case).
+- **Refusals.** `stop_reason: "refusal"` ends the node with status `refused` and the `stop_details` category. Server-side refusal fallback is **off in M1**: after a mid-output fallback the next request must drop client `tool_use` and thinking blocks before the final `fallback` block (R§4, Anthropic "Continuing the conversation"), which needs a replay projection the M1 loop does not have. M2 adds it: the accumulator keeps the raw content for the trace, the loop executes only tool calls after the final `fallback` block, and replay applies the documented keep/drop table.
+- **Retries.** Each attempt is a separate ledger reservation (10.2). Up to 4 retries on transport errors, 408, 409, 429, 5xx and 529, honoring `retry-after`, otherwise exponential backoff with full jitter (1 s base, 60 s cap); backoff sleeps and slot waits are cancellable. A 429 without `retry-after` is retried at most once (it may be a spend cap that keeps failing, R§4). A stream that fails mid-way (`error` event, or 300 s without any event including `ping`) is retried as a whole; this is kyora's policy (the docs also describe continuing from partial text, which cannot recover partial tool_use or thinking blocks, R§4). A `stream_reset` event tells frontends to discard partial output. Tools only run after a complete, admitted message, so a retry never repeats a side effect.
+- **Not used.** Forced `tool_choice` (rejected on current models, R§4). Structured output for `kyora.llm(schema=...)` will use `output_config.format` (M3).
+- **Task budgets (M2).** When a node has its own token budget of at least 20,000, kyora sends `output_config.task_budget = {type: "tokens", total: <node budget at node start>}` (beta `task-budgets-2026-03-13`) and keeps `total` stable for the node's whole loop; it never sends `remaining`, because the server counts a different quantity than kyora's ledger and mirroring it client-side under-reports the budget (R§4, Anthropic task-budget docs). Below the minimum or on unsupported models nothing is sent. The countdown is advisory; the ledger stays authoritative.
 
 ### 6.3 OpenAI and local models (M2)
 
@@ -246,7 +251,7 @@ Raw HTTP (no official Rust SDK) with `reqwest` (rustls) and a small SSE parser o
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;               // name, description, JSON schema
-    fn effect(&self) -> Effect;               // ReadOnly | Mutating
+    fn effect(&self) -> Effect;               // ReadOnly | Mutating (used from M2)
     fn large_input(&self) -> bool { false }   // enables eager input streaming
     async fn call(&self, input: serde_json::Value, cx: ToolCx<'_>) -> ToolOutput;
 }
@@ -256,31 +261,31 @@ pub struct ToolOutput { pub content: Vec<ToolResultPart>, pub is_error: bool,
                         pub final_answer: Option<Answer> }
 ```
 
-Built-in tools (M1):
-
-| Tool | Effect | Input | Notes |
+| Tool | Milestone | Input | Notes |
 |---|---|---|---|
-| `shell` | Mutating | `command`, `timeout_s?` | `bash -c` (falls back to `sh`) in the node's cwd, new process group, scrubbed environment, combined stdout/stderr, exit code. Default timeout 120 s, kill the group on timeout or cancel. |
-| `read_file` | ReadOnly | `path`, `offset?`, `limit?` | Line-numbered output, default 2,000 lines, long lines clipped; refuses binary files. |
-| `write_file` | Mutating | `path`, `content` | Creates parent directories; atomic write via temp file and rename. |
-| `edit_file` | Mutating | `path`, `old`, `new`, `replace_all?` | Exact string replacement; `old` must match exactly once unless `replace_all`. |
-| `glob` | ReadOnly | `pattern`, `path?` | `ignore`-crate walker honoring `.gitignore`, sorted by mtime, capped. |
-| `grep` | ReadOnly | `pattern`, `path?`, `glob?`, `case_insensitive?`, `context?` | ripgrep libraries (`grep-searcher`, `grep-regex`, `ignore`), capped matches. |
-| `python` | Mutating | `code`, `timeout_s?` | The REPL (section 8). |
+| `shell` | M1 | `command`, `timeout_s?` | `bash -c` (falls back to `sh`) in the node's cwd, new process group, scrubbed environment, stdin `/dev/null`. stdout and stderr are drained continuously into bounded head and tail buffers (never collected whole); exit code reported. Default timeout 120 s; the group is killed on timeout or cancel. |
+| `read_file` | M1 | `path`, `offset?`, `limit?` | Line-numbered output, default 2,000 lines, long lines clipped, refuses binary files, reads at most a bounded number of bytes. |
+| `write_file` | M1 | `path`, `content` | Creates parent directories; atomic write via temp file and rename. |
+| `edit_file` | M1 | `path`, `old`, `new`, `replace_all?` | Exact string replacement; `old` must match exactly once unless `replace_all`; per-path lock during the edit. |
+| `glob` | M2 | `pattern`, `path?` | `ignore`-crate walker honoring `.gitignore`, capped. |
+| `grep` | M2 | `pattern`, `path?`, `glob?`, `case_insensitive?`, `context?` | ripgrep libraries (`grep-searcher`, `grep-regex`, `ignore`), capped. |
+| `python` | M1 | `code`, `timeout_s?` | The REPL (section 8). |
 
-All tool outputs pass through one truncation helper: if the text exceeds the per-tool cap (default 20,000 characters, configurable), keep the head and tail and insert `[... N characters omitted ...]`. Paths are resolved against the node's cwd; with the M3 sandbox, writes outside writable roots are refused before the OS sandbox is even reached.
+All tool outputs pass through one truncation helper: above the cap (default 20,000 characters) the head and tail are kept around `[... N characters omitted ...]`.
+
+File tools run in the kyora process, not in a sandboxed child. From M3 they apply the same policy as sandboxed processes (13.2): paths are canonicalized with symlinks resolved, reads of sensitive paths are refused, writes outside writable roots are refused. In M1 they act with the user's full authority, like the shell.
 
 GPT models are trained on Codex's `apply_patch` grammar (R§3); an `apply_patch` tool is added with the OpenAI providers in M2 and offered only to those models.
 
-MCP (M3): each configured server's tools are registered as `mcp__<server>__<tool>`, `ReadOnly` only when the server marks them `readOnlyHint`. The tool list is resolved when the node starts and stays frozen for that node (append-only rule); servers that appear later are only visible to new nodes.
+MCP (M3): each configured server's tools are registered as `mcp__<server>__<tool>`, `ReadOnly` only when the server marks them `readOnlyHint`. The tool list is resolved when the node starts and stays frozen for that node (append-only rule).
 
-Default tool sets: the root gets all built-ins plus `python`. Sub-agents get `python`, `read_file`, `glob`, `grep` unless the spawning code asks for more, and can only receive tools their parent has (capability attenuation, section 18).
+Default tool sets: the root gets all built-ins plus `python`. Sub-agents get `python` and `read_file` (plus `glob` and `grep` from M2) unless the spawning code asks for more, and can only receive tools their parent has (capability attenuation, section 18).
 
 ## 8. The recursive runtime
 
 ### 8.1 Model-facing behavior
 
-The model sees one tool, `python`, whose description documents the injected `kyora` module. Each agent node owns at most one REPL process, started lazily on the first `python` call (or eagerly when variables must be preloaded) and kept for the node's lifetime, so variables persist across cells and across compaction. A cell's result is formatted for the model as:
+The recursive interface is exposed through the `python` tool, whose description documents the injected `kyora` module. Each agent node owns at most one REPL process, started lazily on the first `python` call (or eagerly when variables must be preloaded) and kept for the node's lifetime, so variables persist across cells and across compaction. A cell's result is formatted for the model as:
 
 ```
 [stdout]
@@ -293,14 +298,14 @@ The model sees one tool, `python`, whose description documents the injected `kyo
 ZeroDivisionError: division by zero
   (traceback, trimmed to the user code frames)
 [vars] new or changed: chunks: list[str] (412 items); summaries: list[str] (412 items)
-[kyora] this cell: 412 llm calls, 0 agents, 1.21M budget tokens; remaining: 3.62M tokens, depth 0 of 2
+[kyora] this cell: 412 llm calls, 0 agents, 9.8M budget tokens; remaining: 8.3M, depth 0 of 2
 ```
 
-Sections are omitted when empty. Output is bounded twice: inside Python at capture time (head and tail buffers, so a runaway print cannot exhaust memory, R§1) and again by the tool truncation cap. The bounded output is deliberate: it pushes the model to keep data in variables and print summaries, which is the core RLM idea (R§1).
+Sections are omitted when empty. Output is bounded at capture time (head and tail buffers inside Python, and a drained pipe for subprocess output, 9.1) and again by the tool truncation cap. The bounded output is deliberate: it pushes the model to keep data in variables and print summaries, which is the core RLM idea (R§1).
 
 ### 8.2 The `kyora` Python API
 
-The module is pre-imported in the REPL namespace. It is plain synchronous Python (works from threads too); no third-party dependencies, Python 3.9 or newer.
+The module is pre-imported in the REPL namespace. It is plain synchronous Python (callable from threads too), stdlib only, Python 3.9 or newer.
 
 ```python
 kyora.llm(prompt, *, system=None, model=None, max_tokens=None) -> str
@@ -316,14 +321,15 @@ kyora.spawn(task, **same_kwargs) -> kyora.AgentHandle
     handle.cancel() -> None
 kyora.gather(handles, *, return_exceptions=False) -> list
 
-kyora.final(value) -> None      # set this agent's answer; the agent stops after the cell
+kyora.final(value) -> None      # stage this agent's answer; committed if the cell succeeds
 kyora.budget() -> dict          # remaining tokens, agents, depth, deadline
 kyora.log(message) -> None      # goes to the trace and UI, not to the model
 kyora.node_id, kyora.depth, kyora.max_depth   # constants
 
 class KyoraError(Exception)                 # base for recoverable errors
-class LimitExceeded(KyoraError)             # depth, agent count; .limit names it
+class LimitExceeded(KyoraError)             # depth, agent count, call count; .limit names it
 class BudgetExceeded(KyoraError)
+class ValueTooLarge(KyoraError)             # raised locally before anything is sent
 class ModelError(KyoraError)                # provider failure after retries, refusal
 class AgentFailed(KyoraError)               # .status, .partial (last text), .node_id
 class Timeout(KyoraError)
@@ -333,11 +339,11 @@ class Cancelled(BaseException)              # not caught by `except Exception`
 Semantics:
 
 - **`llm`** is a single completion with no tools: a leaf node (`kind: llm`) in the tree. `prompt` is a string or a list of `{"role", "content"}` dicts. Default model is the configured `llm_model` (section 17). Allowed at every depth, including `max_depth`; disabled entirely with `--no-llm` (for ablations, R§1).
-- **`llm_batch`** sends one request to the host, which runs the calls concurrently (default `max_concurrency` 8, never above the global in-flight cap) and returns results in input order. With `return_exceptions=True`, failed items are exception instances instead of raising.
-- **`agent`** runs a full child agent (`kind: agent`, depth + 1) with its own history, tools, REPL and budget, and blocks until it ends. `context` (any JSON-serializable value) is preloaded as the variable `context` in the child's REPL; `vars` preloads several named variables. The child's first user message contains the task and a manifest of the preloaded variables (name, type, size, a short preview), never the values themselves. Returns the child's answer: the object passed to `kyora.final` in the child, otherwise the child's final assistant text. Non-completed endings raise `AgentFailed`.
-- **`spawn`** registers the child and returns immediately; the child runs concurrently. Handles may outlive the cell that created them; all children of an agent are cancelled when that agent ends. `agent(...)` is `spawn(...).result()` with the child cancelled if the wait is interrupted.
-- **`final`** records the answer for the current agent. The cell finishes normally, the tool result says the answer was recorded, and the loop ends without another model call. For the root, the value is what `kyora run` prints (strings as-is, other values as JSON).
-- **Values crossing the boundary are JSON.** Python converts with `json.dumps` (tuples become lists; anything else raises `TypeError` in the calling code); the cap per value is the IPC frame cap (section 9). Larger data should be written to a file and passed by path (a content-addressed blob store is M3).
+- **`llm_batch`** sends one request to the host, which runs the calls concurrently (default `max_concurrency` 8; values below 1 are rejected; never above the global in-flight cap; at most 1,000 items per batch) and returns results in input order. With `return_exceptions=True`, failed items are exception instances instead of raising.
+- **`agent`** runs a full child agent (`kind: agent`, depth + 1) with its own history, tools, REPL and budget, and blocks until it ends. The child is owned by the calling cell: if the cell is interrupted or times out, the child is cancelled. `context` (any JSON value) is preloaded as the variable `context` in the child's REPL; `vars` preloads several named variables. The child's first user message contains the task and a manifest of the preloaded variables (name, type, size, a short preview), never the values themselves. Returns the child's answer: the value committed with `kyora.final` in the child, otherwise the child's final assistant text. Non-completed endings raise `AgentFailed`.
+- **`spawn`** registers a child owned by the agent node (not the cell) and returns immediately; the child runs concurrently and its handle stays valid in later cells. All node-owned children are cancelled when the agent ends.
+- **`final`** stages an answer for the current cell. It is committed only if the cell finishes with status `ok`; then the tool result says the answer was recorded and the loop ends without another model call. A cell that fails, times out or is interrupted discards its staged answer. For the root, the committed value is what `kyora run` prints (strings as-is, other values as JSON).
+- **Values crossing the boundary are JSON**, encoded with `json.dumps(..., allow_nan=False)` (NaN and infinity are rejected; tuples become lists; other non-JSON objects raise `TypeError` in the calling code). Python measures the complete encoded request frame before sending; if it exceeds the frame cap (9.1) it raises `ValueTooLarge` locally, which is recoverable. The host passes context values, variables and final answers through as raw JSON (`serde_json::value::RawValue`) without converting numbers, so Python integers of any size survive the round trip. Larger data should be written to a file and passed by path (a content-addressed blob store is M3).
 
 A typical long-context cell:
 
@@ -346,35 +352,43 @@ chunks = [context[i:i + 200_000] for i in range(0, len(context), 200_000)]
 notes = kyora.llm_batch([f"List every date mentioned:\n\n{c}" for c in chunks])
 hard = [i for i, n in enumerate(notes) if "unclear" in n]
 fixes = kyora.gather([kyora.spawn("Resolve the dates in this text precisely.",
-                                  context=chunks[i], budget=200_000) for i in hard])
+                                  context=chunks[i], budget=500_000) for i in hard])
 ```
 
 ### 8.3 Host side
 
-`kyora-repl` implements the `python` tool. Per agent node it owns a `ReplHost`: the child process handle, the IPC connection, the current cell, and a table of in-flight requests from Python. When a request arrives:
+`kyora-repl` implements the `python` tool. Per agent node it owns a `ReplHost`: the child process, the IPC pumps (9.3), the current cell (id, generation, cancellation token, deadline, staged final answer), a table of in-flight requests, and a table of node-owned child handles. Requests from Python are handled as follows:
 
-- `llm` / `llm_batch` -> `NodeCtx::llm` per item (ledger reservation, model slot, trace node, provider call). Batch items run on a `JoinSet` limited by the batch's own semaphore.
-- `agent.spawn` -> `NodeCtx::spawn_agent` with an `AgentSpec` built from the request; limits are checked synchronously (depth, live and total agent counts, budget) and violations come back as typed errors. The handle is stored in the host's handle table under the child's node id.
-- `agent.result` -> await the handle (optionally with a timeout); `agent.cancel` -> cancel the child's token.
-- `final` -> store the answer; the tool output for this cell carries `final_answer`.
+- `llm` / `llm_batch` -> `NodeCtx::llm` per item, owned by the cell's token: ledger admission and reservation, a model slot, a trace node, the provider call. Batch items run on a `JoinSet` limited by the batch's own semaphore.
+- `agent.spawn` -> `NodeCtx::spawn_agent` with `Owner::Cell` (for `kyora.agent`) or `Owner::Node` (for `kyora.spawn`). Admission (depth, live and total agent counts, budget) is checked in the same ledger transaction that registers the child; violations come back as typed errors.
+- `agent.result` -> await the handle, bounded by the request's timeout and the cell's deadline; `agent.cancel` -> cancel the child's token.
+- `final` -> stage the answer on the current cell.
 
-The child agent runs the same loop (section 5) as a Tokio task with a toolset built by the `ToolsetFactory`, which gives it its own `python` tool and therefore its own REPL process. Recursion depth is therefore bounded by `max_depth` and process count by the live-agent limit.
+The child agent runs the same loop (section 5) as a Tokio task with a toolset built by the `ToolsetFactory`, which gives it its own `python` tool and therefore its own REPL process.
+
+**Node shutdown** always runs the same sequence, whatever the ending: close admission for the node (no new children or calls), cancel and join all descendants, settle all outstanding reservations (10.2), shut down the REPL (graceful `shutdown`, then kill the process group), write `node_end`, and only then release the node's live-agent slot.
 
 ### 8.4 Variables and large inputs
 
 - `kyora run --context-file big.txt` (or `--var name=@path`, `--var name=value`) preloads variables into the root REPL. The host computes metadata (bytes, characters, lines, first 500 characters) from the file and puts only the manifest in the first user message; the REPL loads the file itself (`set_var` with a file source) so the content never passes through the prompt.
 - Values passed to `kyora.agent(context=...)` travel inline over IPC and are injected into the child REPL with `set_var`.
-- REPL state is in-memory only. After `kyora resume` or a REPL crash, the REPL restarts empty, preloaded file variables are reloaded (their path and sha256 were recorded), and a notice listing the lost variables is appended to the conversation. Snapshotting REPL state (for example with `dill`) is deliberately not attempted; Prime and nano-rlm do not reconstruct kernels either (R§2).
+- REPL state is in-memory only. After a REPL crash or kill (and after resume, M2), the next `python` call starts a new REPL generation, preloaded file variables are reloaded (their path and sha256 were recorded), and a notice listing the lost variables is appended to the conversation. Snapshotting REPL state is deliberately not attempted; Prime and nano-rlm do not reconstruct kernels either (R§2).
 
 ## 9. REPL IPC protocol
 
-### 9.1 Transport and framing
+### 9.1 Process, transport and framing
 
-The REPL process is `python3 -I -X utf8 <runtime>/kyora_boot.py`, where `<runtime>` is a private temp directory (mode 0700) into which the embedded Python files are written at first use. The protocol runs over the child's stdin (host to REPL) and stdout (REPL to host), so the same protocol works unchanged over any byte stream, including a remote exec session later (section 22).
+The REPL process is `python3 -I -X utf8 <runtime>/kyora_boot.py`. `<runtime>` is a private directory (mode 0700) under the system temp dir, created per kyora process, into which the embedded Python files are written. `-I` ignores `PYTHONPATH` and the user site and removes the script's directory from `sys.path`, so the boot script imports the package explicitly: it inserts its own directory (`os.path.dirname(os.path.abspath(__file__))`) at the front of `sys.path`, imports `kyora`, and then appends the node's cwd to the end of `sys.path` so user modules in the workspace stay importable.
 
-At startup the boot script duplicates fds 0 and 1 to private, non-inheritable descriptors for the protocol, points fd 0 at `/dev/null`, and points fds 1 and 2 at a spill file. User `print` output is captured per cell at the Python level; output written directly to fds 1 and 2 by subprocesses lands in the spill file and is attached to the current cell. Nothing user code does can write into the protocol stream.
+The protocol runs over the child's stdin (host to REPL) and stdout (REPL to host), so it works unchanged over any byte stream, including a remote exec session later (section 22). At startup the boot script:
 
-Frames: 4-byte big-endian unsigned length, then UTF-8 JSON (the same framing as the rlm broker and nano-rlm, R§1, R§2). Maximum frame 64 MiB in both directions, configurable; an oversized or malformed frame is a protocol error that kills the REPL (the host never trusts the REPL to recover from its own corruption).
+1. duplicates fds 0 and 1 to private descriptors (non-inheritable by default since PEP 446) and builds the protocol reader and writer on them;
+2. points fd 0 at `/dev/null`;
+3. creates a pipe and points fds 1 and 2 at its write end; a drain thread reads the other end continuously into the current cell's bounded head and tail buffer (64 KiB head, 64 KiB tail, dropped bytes counted), so subprocess output can neither fill a disk nor block the writer. Output that arrives between cells is attributed to the next cell as `[background output]`, with the same bounds.
+
+This keeps ordinary output (prints, subprocesses, C extensions) out of the protocol stream. It is not a defense against code that deliberately writes to the duplicated descriptors; such code can only send protocol messages, which the host validates and bounds like any other (9.5, section 18).
+
+Frames: 4-byte big-endian unsigned length, then UTF-8 JSON (the same framing as the rlm broker and nano-rlm, R§1, R§2). Maximum frame 64 MiB in both directions, configurable.
 
 ### 9.2 Messages
 
@@ -386,52 +400,78 @@ REPL to host, once at startup (notification):
 {"method": "ready", "params": {"protocol": 1, "python": "3.12.4", "pid": 4242}}
 ```
 
-Host to REPL:
+Host to REPL (at most one at a time, and only `interrupt` while a cell runs):
 
 | Method | Params | Result |
 |---|---|---|
-| `init` | `node_id`, `depth`, `max_depth`, `limits` (output caps), `cwd` | `{}` |
-| `exec` | `cell`, `code`, `compute_timeout_ms` | `ExecResult` (below) |
+| `init` | `node_id`, `depth`, `max_depth`, `generation`, `limits` (output caps), `cwd` | `{}` |
+| `exec` | `cell`, `code` | `ExecResult` (below) |
 | `set_var` | `name`, and either `value` (JSON) or `file {path, format: "text" or "bytes" or "json"}` | `{type, size}` |
 | `get_var` | `name`, `max_bytes` | `{json?, repr}` |
 | `vars` | | `[{name, type, size}]` |
 | `shutdown` | | `{}` then the process exits |
 | `interrupt` (notification) | `cell` | |
 
-REPL to host (only while a cell runs):
+REPL to host (accepted only while a cell runs; every request carries `cell`):
 
 | Method | Params | Result |
 |---|---|---|
-| `llm` | `prompt` or `messages`, `system?`, `model?`, `max_tokens?` | `{text, model, usage, stop_reason, node_id}` |
-| `llm_batch` | `items: [llm params]`, `max_concurrency?` | `{results: [{ok: llm result} or {error}]}` |
-| `agent.spawn` | `task`, `context?`, `vars?`, `tools?`, `model?`, `max_turns?`, `budget?`, `timeout_ms?`, `name?` | `{node_id}` |
-| `agent.result` | `node_id`, `timeout_ms?` | `{status, answer, text, turns, usage}` or error |
-| `agent.status` | `node_id` | `{status, turns, usage}` |
-| `agent.cancel` | `node_id` | `{}` |
-| `final` | `value` | `{}` |
-| `budget` | | `{tokens_remaining, agents_remaining, depth, max_depth, deadline_ms?}` |
-| `log` (notification) | `level`, `message` | |
+| `llm` | `cell`, `prompt` or `messages`, `system?`, `model?`, `max_tokens?` | `{text, model, usage, stop_reason, node_id}` |
+| `llm_batch` | `cell`, `items: [llm params]`, `max_concurrency?` | `{results: [{ok: llm result} or {error}]}` |
+| `agent.spawn` | `cell`, `owner: "cell" or "node"`, `task`, `context?`, `vars?`, `tools?`, `model?`, `max_turns?`, `budget?`, `timeout_ms?`, `name?` | `{node_id}` |
+| `agent.result` | `cell`, `node_id`, `timeout_ms?` | `{status, answer, text, turns, usage}` or error |
+| `agent.status` | `cell`, `node_id` | `{status, turns, usage}` |
+| `agent.cancel` | `cell`, `node_id` | `{}` |
+| `final` | `cell`, `value` | `{}` |
+| `budget` | `cell` | `{tokens_remaining, agents_remaining, depth, max_depth, deadline_ms?}` |
+| `log` (notification) | `cell`, `level`, `message` | |
 
 `ExecResult`:
 
 ```json
-{"status": "ok", "stdout": "...", "stderr": "...", "omitted": {"stdout": 0, "stderr": 0},
+{"status": "ok", "stdout": "...", "stderr": "...", "background": "",
+ "omitted": {"stdout": 0, "stderr": 0, "background": 0},
  "result": "repr or null", "error": null,
  "vars_changed": [{"name": "notes", "type": "list[str]", "size": "412 items"}],
- "final": false, "wall_ms": 8120, "compute_ms": 410}
+ "final_staged": false, "wall_ms": 8120}
 ```
 
 `status` is `ok`, `error` (exception in user code; `error` holds `type`, `message`, `traceback`), `interrupted`, or `timeout`.
 
-Error codes host to REPL: `limit_exceeded` (with `data.limit`: `depth`, `agents_live`, `agents_total`, `llm_calls`), `budget_exceeded`, `cancelled`, `timeout`, `model_error`, `agent_failed`, `invalid_request`, `value_too_large`. The Python module maps each to the exception classes in 8.2.
+Error codes host to REPL: `limit_exceeded` (with `data.limit`: `depth`, `agents_live`, `agents_total`, `llm_calls`, `batch_size`, `outstanding`), `budget_exceeded`, `cancelled`, `timeout`, `stale_cell`, `model_error`, `agent_failed`, `invalid_request`, `value_too_large`. The Python module maps each to the exception classes in 8.2.
 
-### 9.3 Concurrency inside Python
+### 9.3 Pumps and cell ownership
 
-The boot script runs cells on the main thread. A reader thread owns the protocol input: it routes responses to waiting futures by `id`, queues host requests for the main thread, and handles `interrupt` by failing all pending futures with `cancelled` and calling `_thread.interrupt_main()`. Writes are serialized by a lock. Waits use short timed waits in a loop, so a blocked `kyora.agent()` call notices an interrupt within about 100 ms even when the transport cannot deliver signals. User code may call `kyora.*` from its own threads; each call is an independent request.
+Host side, per REPL:
+
+- a **reader task** decodes frames and never awaits anything but the socket: responses are matched to the host's outstanding requests; each incoming request is validated and dispatched to its own task in a `JoinSet`, so a long `agent.result` never blocks later requests or cancellations;
+- a **writer task** drains a bounded queue of outbound frames;
+- a **watchdog** owns the process handle and can kill the process group without going through the writer.
+
+Requests whose `cell` is not the current cell of the current generation are rejected with `stale_cell` (this covers threads left running after their cell ended and replies racing a restart). Between cells every request is rejected the same way. Responses to stale requests are dropped.
+
+Python side: the main thread runs cells. A reader thread owns the protocol input: it routes responses to waiting futures by `id`, queues host requests for the main thread, and handles `interrupt` only if its `cell` matches the running cell, by failing that cell's pending futures with `cancelled` and calling `_thread.interrupt_main()`. The cell dispatcher catches the resulting `KeyboardInterrupt` (and a late one arriving between cells is swallowed by the main loop), so an interrupt can never kill the dispatcher. All `kyora.*` calls read the running cell id from module state set by the dispatcher, so calls from user threads are attributed to the cell that is running. Waits use short timed waits in a loop, so a blocked call notices an interrupt within about 100 ms even where signals cannot be delivered. Writes are serialized by a lock.
 
 ### 9.4 Timeouts and interruption
 
-A cell's timeout counts compute time only: the host pauses the cell clock while any request from that cell is outstanding, so a cell that waits ten minutes for sub-agents is not killed for it, while a tight loop is (default 300 s compute). Sub-agents have their own budgets and optional wall-clock timeouts. On timeout or cancellation the host sends `interrupt`; if no `exec` response arrives within 2 s it kills the REPL's process group, marks the cell `timeout` or `interrupted`, and the next `python` call starts a fresh REPL (with the restart notice of 8.4).
+M1 uses a **wall-clock** cell timeout: default 30 minutes, adjustable per call with the tool's `timeout_s` (capped at 2 hours), and never beyond the node's deadline. Every blocking wait in Python (`llm`, `agent`, `handle.result`) is bounded by the cell deadline. A process-wide `RLIMIT_CPU` is only a backstop. (Excluding time spent waiting on sub-calls from the timeout needs a per-thread wait policy; it is a possible later refinement, not part of M1.)
+
+On timeout or cancellation the host cancels the cell's token (which cancels its `llm` calls and cell-owned children), sends `interrupt`, and gives the cell 2 s to return an `exec` result. Otherwise the watchdog kills the process group, the cell is reported as `timeout` or `interrupted`, the generation ends, and the next `python` call starts a fresh REPL with the restart notice of 8.4.
+
+### 9.5 Bounds
+
+| Bound | Default | On violation |
+|---|---|---|
+| startup (`ready` after spawn) | 10 s | kill, tool error |
+| frame body after its length prefix | 30 s | kill |
+| frame size | 64 MiB | kill |
+| outstanding requests from one REPL | 256 | `limit_exceeded` (`outstanding`) |
+| bytes of outstanding request payloads | 256 MiB | `limit_exceeded` |
+| items per `llm_batch` | 1,000 | `limit_exceeded` (`batch_size`) |
+| host outbound queue | 64 frames | kill (the REPL stopped reading) |
+| graceful shutdown | 2 s | kill |
+
+Any malformed frame, unknown method or schema violation from the REPL is a protocol error: the REPL is killed and the cell reports an error. The host never trusts a REPL to recover from its own corruption.
 
 ## 10. Limits, budgets and cancellation
 
@@ -440,43 +480,64 @@ A cell's timeout counts compute time only: the host pauses the cell clock while 
 | Limit | Default | Scope | Behavior when hit |
 |---|---|---|---|
 | `max_depth` | 2 | tree | `agent.spawn` fails with `limit_exceeded` |
-| `max_agents_total` | 100 | tree | spawn fails |
+| `max_agents_total` | 100 | session | spawn fails |
 | `max_agents_live` | 16 | tree | spawn fails (fail-fast, never queues) |
-| `max_llm_calls` | 2,000 | tree | `llm` fails |
-| `max_inflight_requests` | 16 | process | requests wait for a model slot |
-| `budget_tokens` | 2,000,000 | tree, and optionally per subtree | reservation fails; the node stops with `budget_exhausted` |
+| `max_llm_calls` | 2,000 | session | `llm` fails |
+| `max_inflight_requests` | 16 | process | requests wait for a model slot (cancellable) |
+| `budget_tokens` | 20,000,000 | session, and optionally per subtree | reservation fails; the node stops with `budget_exhausted` |
 | `max_turns` | root 200, sub-agent 50 | node | node stops with `max_turns` |
-| `agent_timeout` | none | per spawn | child cancelled, `Timeout` raised |
-| `cell_compute_timeout` | 300 s | cell | cell interrupted |
+| `run_timeout` | 2 h | root deadline | everything is cancelled, status `timeout` |
+| agent `timeout` | parent's deadline | per spawn | child cancelled, `Timeout` raised |
+| cell timeout | 30 min (max 2 h) | cell | cell interrupted |
+| request timeouts | 300 s idle, 30 min total | model request | attempt fails, retry policy applies |
 | `max_output_tokens` | agents 32,000, llm 16,000 | request | passed as `max_tokens` |
 | `tool_output_chars` | 20,000 | tool result | head and tail kept |
-| `ipc_frame_bytes` | 64 MiB | REPL | protocol error |
 
-All are configurable (section 17) and overridable per run with flags.
+Every wait in the system is therefore finite. Budget counts all processed tokens including cache reads (section 4), so the default is large in absolute terms; with a warm cache most of it is cheap cache reads.
 
 ### 10.2 Ledger
 
-The ledger is a tree of `BudgetScope`s mirroring the node tree. Each scope has optional limits and atomic counters (`reserved`, `used`). A child spawned with `budget=N` gets a scope limited to `N`; without it, the child's scope has no own limit and is bounded by its ancestors.
+The ledger is a single structure behind one mutex: a tree of scopes mirroring the node tree, each with an optional limit and `reserved` and `used` counters, plus the admission counters (live agents, total agents, llm calls). Contention is negligible next to HTTP latency, and one lock makes every check-and-update atomic:
 
-- `reserve(scope, estimate)` succeeds only if `used + reserved + estimate <= limit` holds for the scope and every ancestor; it then adds `estimate` to `reserved` on the whole path. The estimate for a model call is `ceil(request_bytes / 4) + max_tokens`, or, for an agent turn, the previous turn's input plus new bytes / 4 plus `max_tokens`.
-- `commit(reservation, usage)` subtracts the reservation and adds the actual budget tokens to `used` on the whole path, so every ancestor always sees the full cost of its subtree (the rlm reference under-aggregates child cost, R§1).
-- Overshoot is bounded by estimation error of calls already in flight, never by unchecked dispatch (nano-rlm checks only between calls, R§2).
+- **Admission** (spawn, llm call): one critical section checks depth, counters and budget headroom for the whole ancestor path and registers the node, or changes nothing.
+- **Reservation** (each model attempt): one critical section checks `used + reserved + R <= limit` for the node's scope and every ancestor, then adds `R` to `reserved` on the whole path, or changes nothing.
+- **Settlement**: subtracts `R` from `reserved` and adds the charge to `used` on the whole path.
+
+The reservation `R` for an attempt is an upper bound on its budget tokens, under three stated assumptions: a token covers at least one byte of UTF-8 text (true for byte-level BPE tokenizers, for text input; images are not supported yet); the provider never generates more than `max_tokens`; and re-sending an assistant message costs at most its original `output_tokens` plus a per-message overhead. Then:
+
+- first request of a node: `R = bytes(system + tools + messages) + 16 * messages + 512 + max_tokens`;
+- later requests: `R = P + O + bytes(new user content) + 16 * new messages + max_tokens`, where `P` is the previous request's prompt tokens (`input + cache_creation + cache_read`) and `O` its `output_tokens` (an upper bound for the appended assistant message, thinking included). This is exact for the unchanged prefix because histories are append-only;
+- after compaction the first-request formula applies to the new history.
+
+If `R` does not fit, `max_tokens` is reduced to fit, down to a floor of 4,096; below that the node stops with `budget_exhausted`. Under these assumptions the budget is never exceeded, so the property tests can assert `used <= limit` exactly.
+
+Settlement per attempt:
+
+| Attempt outcome | Charge |
+|---|---|
+| completed | actual usage |
+| HTTP error before any body (4xx, 5xx, 529, connect failure) | 0 |
+| failed or cancelled after the request was sent, usage unknown | `R` (conservative) |
+
+Retries reserve again before every attempt. Settlement also happens during node shutdown, so no reservation outlives its node.
 
 ### 10.3 Why there are no blocking agent slots
 
-A parent that waits for its children must not hold a resource its children need, otherwise a fan-out tree deadlocks (nano-rlm guards this with `max_concurrent_subagents >= max_depth`, R§2). kyora's only blocking semaphore is `max_inflight_requests`, held strictly for the duration of one HTTP request, never across a wait on another node. Agent counts are admission limits that fail fast. Therefore no wait-for cycle can form.
+A parent that waits for its children must not hold a resource its children need, otherwise a fan-out tree deadlocks (nano-rlm guards this with `max_concurrent_subagents >= max_depth`, R§2). kyora's only blocking semaphore is `max_inflight_requests`, held strictly for the duration of one HTTP attempt, never across a wait on another node, and the wait for it is cancellable. Agent counts are admission limits that fail fast. The IPC reader never awaits handlers (9.3). The only other locks (the ledger mutex, per-path file locks) are never held across an await on another node. Therefore no wait-for cycle can form.
 
 ### 10.4 Cancellation
 
-Every node owns a `CancellationToken` that is a child of its parent's (`tokio_util::sync::CancellationToken::child_token`). Cancelling a node cancels its subtree:
+Tokens form a tree: run, then node, then cell. A node's own calls and cell-owned children hang off the cell token; node-owned children hang off the node token. Cancelling a token cancels its subtree:
 
-- in-flight HTTP streams are dropped;
+- in-flight HTTP streams are dropped and their reservations settled;
 - running tools get the token (shell kills its process group);
-- the node's REPL gets `interrupt`, then a process-group kill after the grace period;
-- pending IPC requests from that REPL are answered with `cancelled`;
-- the node ends with status `cancelled`, unfinished tool calls get error results, and `node_end` is recorded.
+- a cell's REPL gets `interrupt`, then a kill after the grace period;
+- pending IPC requests from that cell are answered with `cancelled`;
+- cancelled nodes run the shutdown sequence of 8.3 with status `cancelled`.
 
-`kyora run`: first Ctrl-C cancels the root gracefully (the session stays resumable); a second Ctrl-C within 2 s exits immediately with code 130.
+`kyora run`: the first Ctrl-C cancels the root gracefully; a second Ctrl-C within 2 s exits immediately with code 130.
+
+**Process scope (M1).** Cancellation reliably reaches kyora-managed processes and their process groups. A process that deliberately leaves its group (for example with `setsid`) is not tracked in M1; the M3 sandbox runs each REPL and shell in its own sandbox (and on Linux its own PID namespace via bubblewrap), which closes that gap.
 
 ## 11. Sessions and transcripts
 
@@ -492,7 +553,7 @@ $KYORA_HOME/
   logs/                                   # tracing output when enabled
 ```
 
-Directories are created 0700 and files 0600: transcripts contain whatever the agent read.
+Directories are created 0700 and files 0600: transcripts contain whatever the agent read. A process holds an exclusive lock on `events.jsonl` (`File::try_lock`) for as long as it writes to the session; a second writer fails fast.
 
 ### 11.2 Record format
 
@@ -503,52 +564,64 @@ One JSON object per line, written by a single writer task (records arrive over a
 {"v":1,"seq":1,"type":"node_start","node":0,"parent":null,"depth":0,"kind":"agent","name":"root","model":"anthropic/claude-opus-5-5","system":"...","tools":[...],"limits":{...}}
 {"v":1,"seq":2,"type":"var_loaded","node":0,"name":"context","source":{"file":"/work/big.txt","sha256":"...","bytes":48213557}}
 {"v":1,"seq":3,"type":"message","node":0,"message":{"role":"user","content":[...]}}
-{"v":1,"seq":4,"type":"model_call","node":0,"model":"claude-opus-5-5","request_id":"req_...","usage":{...},"stop_reason":"tool_use","ms":5120,"retries":0}
+{"v":1,"seq":4,"type":"attempt","node":0,"attempt":1,"model":"claude-opus-5-5","request_id":"req_...","outcome":"completed","reserved":61234,"charged":48211,"usage":{...},"stop_reason":"tool_use","ms":5120}
 {"v":1,"seq":5,"type":"message","node":0,"message":{"role":"assistant","content":[...]}}
-{"v":1,"seq":6,"type":"cell_start","node":0,"cell":1,"code":"..."}
+{"v":1,"seq":6,"type":"cell_start","node":0,"generation":1,"cell":1,"code":"..."}
 {"v":1,"seq":7,"type":"node_start","node":1,"parent":0,"depth":1,"kind":"llm","cell":1,"model":"anthropic/claude-sonnet-5-5","prompt":{"blob":"sha256:..."}}
 {"v":1,"seq":8,"type":"node_end","node":1,"status":"completed","text":"...","usage":{...},"ms":2210}
-{"v":1,"seq":9,"type":"cell_end","node":0,"cell":1,"status":"ok","compute_ms":410,"wall_ms":8120}
+{"v":1,"seq":9,"type":"cell_end","node":0,"generation":1,"cell":1,"status":"ok","wall_ms":8120}
 {"v":1,"seq":10,"type":"message","node":0,"message":{"role":"user","content":[{"type":"tool_result",...}]}}
 {"v":1,"seq":11,"type":"compaction","node":0,"through_seq":10,"message":{...}}
 {"v":1,"seq":12,"type":"node_end","node":0,"status":"completed","answer":{"text":"..."},"usage_self":{...},"usage_subtree":{...},"turns":12}
 {"v":1,"seq":13,"type":"session_end","status":"completed"}
 ```
 
-Strings or values above 64 KiB (prompts of leaf calls, context values, large tool results) are written to `blobs/` and referenced as `{"blob": "sha256:<hex>", "bytes": N}`; message records keep content inline so resume never depends on blobs. `--trace-payloads=none` stores hashes and sizes only.
+Every model attempt, including failed and cancelled ones, has an `attempt` record with what was reserved and charged, so session usage can be recomputed from the log alone. Leaf `llm` prompts, context values and other payloads above 64 KiB are written to `blobs/` and referenced as `{"blob": "sha256:<hex>", "bytes": N}`. Message records keep their content inline, because resume needs them. `--trace-payloads=none` drops blobs (hashes and sizes only) and therefore covers leaf prompts and context values, but not message content, tool inputs, tool outputs or cell code; `--no-session` writes nothing at all (no trace, no resume).
 
-### 11.3 Resume
+### 11.3 Resume (M2)
 
-`kyora resume <session> ["message"]` replays the root node's records: `node_start` gives the frozen system prompt and tool specs (so the request prefix is byte-identical to before, which keeps preserved thinking valid and the prompt cache usable), `message` and `compaction` records rebuild the history. Unanswered tool calls at the end of the log get `is_error` results ("interrupted"). Children that were running when the process died are recorded as `interrupted` and not restarted; their partial results are visible in `kyora trace`. The REPL restarts as described in 8.4. Resuming appends to the same `events.jsonl`; `kyora fork <session>` (M2) copies the root history into a new session.
+M1 writes resume-ready logs; `kyora resume <session> ["message"]` arrives in M2:
+
+- Acquire the session lock. If the last line is incomplete (no trailing newline or not parseable), truncate only that line; corruption anywhere else aborts.
+- Scan all records: the next node id is one above the highest seen; session usage and admission counters are recomputed from `attempt` and `node_start` records of all nodes; limits are per session (the `session_start` limits, possibly raised by a `limits_changed` record when the user passes new limits to `resume`).
+- Rebuild the root: `node_start` gives the frozen system prompt and tool specs (so the request prefix is byte-identical to before, which keeps preserved thinking valid and the cache usable), `message` and `compaction` records give the history, and a recorded `drop_block` choice is restored. Unanswered tool calls at the end get `is_error` results ("interrupted").
+- Children that were running when the process died get a `node_end` with status `interrupted` and are not restarted.
+- The invocation gets a fresh run cancellation token; the REPL restarts as in 8.4.
+
+`kyora fork <session>` (M2) copies the root history into a new session.
 
 ## 12. Context management and compaction
 
 First line of defense is structural: large data stays in REPL variables, tool outputs are bounded, and sub-agents keep their own histories, so the root's context grows slowly. Compaction (M2) handles the rest.
 
-- **Trigger:** after a completed round (never between a `tool_use` and its results), when the last request's `input + cache_creation + cache_read + output` exceeds a threshold (default 80% of the model's `max_input_tokens`, configurable), or reactively when the provider rejects a request as too long.
-- **Anthropic:** server-side compaction on demand (beta `compact-2026-09-04`, `compaction: {type: "summarize", instructions}`) with kyora's own instructions. The returned signed `compaction` block is stored as `Opaque` and becomes the first item of the history; summarized turns are dropped from the request (not from the log). This is the documented way to compact without breaking preserved thinking (R§4).
-- **Other providers:** client-side whole-history summary: one call with the compaction instructions, then the history is replaced by a single user message (summary plus "continue the task"). No turns are kept verbatim, because keep-tail compaction invalidates thinking on providers that bind it (R§4).
-- **Instructions** ask the summary to keep the task, constraints, decisions, files touched, open sub-agent handles, and the names and meanings of important REPL variables. After compaction kyora appends a fresh variable manifest from the live REPL (`vars`), so the model can rely on its variables after the summary (nano-rlm makes the same point, R§2).
+- **Trigger:** after a completed round (never between a `tool_use` and its results), when the last request's `input + cache_creation + cache_read + output` exceeds a threshold (default 80% of the model's `max_input_tokens`), or reactively on `model_context_window_exceeded` or a request rejected as too long.
+- **Anthropic:** server-side compaction on demand (beta `compact-2026-09-04`, `compaction: {type: "summarize", instructions}`) with the node's frozen system prompt and tools and kyora's instructions. The call goes through the ledger and a model slot like any attempt, and is charged from `usage.iterations` (top-level input and output are zero on these calls). Success means `stop_reason: "compaction"` and exactly one `compaction` block; it is stored as `Opaque` inside an assistant message that becomes the first item of the history, and the beta header is recorded and sent on every later request carrying the block. Any other outcome (HTTP 200 with empty content and `max_tokens`, `tool_use`, `refusal`, `end_turn` or `model_context_window_exceeded`) leaves the history unchanged; kyora retries at most twice (doubling `max_tokens` after `max_tokens`) and then falls back.
+- **Other providers, and the fallback:** client-side whole-history summary: one call with the compaction instructions, then the history is replaced by a single user message (summary plus "continue the task"). No turns are kept verbatim, because keep-tail compaction invalidates thinking on providers that bind it (R§4). If the history itself is too large to summarize in one call, kyora summarizes it in chunks with leaf `llm` calls and summarizes the summaries (the recursion machinery, used on its own history).
+- **Instructions** ask the summary to keep the task, constraints, decisions, files touched, open sub-agent handles, and the names and meanings of important REPL variables, and forbid tool calls. After compaction kyora appends a fresh variable manifest from the live REPL (`vars`), so the model can rely on its variables after the summary (nano-rlm makes the same point, R§2).
 - **Record:** a `compaction` record with the block or summary and `through_seq`, so resume rebuilds the compacted history exactly.
 
 ## 13. Isolation
 
-### 13.1 M1: process isolation
+### 13.1 M1: process isolation only
 
-- Shell commands and the REPL run as separate processes in their own process group, with the node's cwd, a scrubbed environment (allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, plus configured extras; provider keys are never passed), and stdin closed or `/dev/null`.
-- The REPL boot script lowers its own resource limits before running user code, setting soft and hard together so user code cannot raise them: `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 1024, `RLIMIT_CPU` (generous, as a backstop for the compute timeout), and `RLIMIT_AS` on Linux (default 4 GiB). No `unsafe` Rust is needed for this.
-- The REPL needs no network: model access goes through IPC.
+What M1 does:
 
-M1 has no filesystem or network sandbox. Until M3, run kyora in a disposable checkout, container or VM.
+- Shell commands and the REPL run as separate processes in their own process group, with the node's cwd, a scrubbed environment (allowlist: `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, plus configured extras; provider keys are never passed), and stdin `/dev/null`.
+- The REPL boot script lowers its own resource limits before running user code, setting soft and hard together so user code cannot raise them: `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 1024, `RLIMIT_CPU` (a generous backstop), and `RLIMIT_AS` on Linux (default 4 GiB).
 
-### 13.2 M3: OS sandbox
+What M1 does not do: there is no filesystem or network sandbox. The REPL, the shell and the file tools act with the user's full authority: they can read any file the user can (including credential files on disk), use the network, and start processes that escape their process group. Environment scrubbing only keeps keys out of child environments. Until M3, run kyora only on trusted inputs, or inside a disposable container or VM.
 
-Policies: `read-only`, `workspace-write` (default: write to the workspace and temp dirs, network off), `full-access`. Applied per process by `kyora-sandbox`:
+### 13.2 M3: OS sandbox and path policy
 
-- macOS: `/usr/bin/sandbox-exec` with a generated Seatbelt profile (deny by default, allow reads, allow writes to writable roots, deny network), as Codex does (R§3).
-- Linux: bubblewrap when available (`--ro-bind / /`, writable binds for roots, `--unshare-net`, fresh `/tmp`), else Landlock, plus a seccomp filter denying network sockets. Codex defaults to bubblewrap and keeps Landlock as an opt-in fallback (R§3).
-- Sensitive paths are not readable even in `read-only` mode: `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.kyora` (except the session's own runtime dir), keychains, browser profiles. The list is configurable.
-- If the sandbox cannot be applied, the process is not started (no silent fallback to unsandboxed execution).
+Policies: `read-only`, `workspace-write` (default: write to the workspace and temp dirs, network off), `full-access`. One policy object per node is inherited by its children (they can only get narrower policies) and enforced in two places:
+
+- **Host file operations** (`read_file`, `write_file`, `edit_file`, `glob`, `grep`, file preloads requested by code): paths are canonicalized with symlinks resolved and checked against the policy before the operation, and the open is done relative to an already-checked directory handle to avoid check-then-use races. Sensitive paths are refused for reading as well as writing.
+- **Processes** (shell, REPL), by `kyora-sandbox`:
+  - macOS: `/usr/bin/sandbox-exec` with a generated Seatbelt profile: deny by default, allow reads except sensitive paths (Seatbelt can deny subpaths of an allowed tree), allow writes to writable roots, deny network (as Codex does, R§3).
+  - Linux with bubblewrap: `--ro-bind / /`, every sensitive path masked with an empty `--tmpfs` or a `/dev/null` bind, writable binds for writable roots, fresh `/tmp`, `--unshare-net`, `--unshare-pid`, plus a seccomp filter denying network sockets. Codex defaults to bubblewrap (R§3).
+  - Linux without bubblewrap, Landlock: Landlock can only allow paths, not deny subpaths, so read access is limited to an allowlist (system directories such as `/usr`, `/lib`, `/bin`, `/etc`, the interpreter's prefix, the workspace and temp dirs); the home directory outside the workspace is not readable at all. Network denied by seccomp.
+- **Sensitive paths** (default list, configurable): `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`, `~/.kyora` (except the session's own runtime dir), `~/.claude`, `~/.codex`, keychains and browser profiles.
+- **Fail closed.** If a policy cannot be enforced on the platform, the operation or process is refused, never run unsandboxed.
 
 The REPL always runs with network denied in `workspace-write`, independent of the shell's network setting.
 
@@ -569,14 +642,14 @@ pub trait ExecBackend: Send + Sync {
 - **Trace tree.** `kyora trace <session>` reconstructs the node tree from `events.jsonl`:
 
   ```
-  #0 agent root  claude-opus-5-5  completed  14 turns  412k tok (2.1M subtree)  3m12s
+  #0 agent root  claude-opus-5-5  completed  14 turns  4.1M tok (11.2M subtree)  3m12s
   |-- #1 llm   claude-sonnet-5-5  completed  41k tok  9s        (cell 2)
-  |-- #2 agent "resolve dates"  depth 1  completed  6 turns  88k tok  41s  (cell 3)
+  |-- #2 agent "resolve dates"  depth 1  completed  6 turns  880k tok  41s  (cell 3)
   |   `-- #5 llm  completed  12k tok  3s
-  `-- #3 agent "resolve dates"  depth 1  budget_exhausted  50k tok  (cell 3)
+  `-- #3 agent "resolve dates"  depth 1  budget_exhausted  500k tok  (cell 3)
   ```
 
-  `--json` emits the tree; `--node <id>` prints one node's transcript; `--cells` shows the code that created each child. The rlm visualizer and nano-rlm's semantic edges (`subagent_call`, `subagent_return`) informed this (R§1, R§2).
+  M1 ships this tree view with `--json`. Per-node transcripts (`--node <id>`) and cell code (`--cells`) follow in M2. The rlm visualizer and nano-rlm's semantic edges (`subagent_call`, `subagent_return`) informed this (R§1, R§2).
 - **Live events.** The same tree is available live via `TraceEvent`s for the TUI and `kyora run --json`.
 - **Logs.** `tracing` with `KYORA_LOG` (env-filter syntax) to stderr or `$KYORA_HOME/logs/`. API keys and auth headers are never logged.
 - **Later.** OpenTelemetry spans per node; trajectory export (prompt and completion per node, plus causal edges) for training pipelines like prime-rl (R§2). Not built now; the JSONL keeps enough to derive both.
@@ -593,9 +666,9 @@ Layout:
 | python  cell 3                                     | |- #1 llm          done     |
 |   chunks = [...]                                   | |- #2 agent dates  running  |
 |   notes = kyora.llm_batch(...)                     | |  `- #5 llm       running  |
-| [kyora] 412 llm calls, 1.2M tok                    | `- #3 agent dates  budget!  |
+| [kyora] 412 llm calls, 9.8M tok                    | `- #3 agent dates  budget!  |
 +----------------------------------------------------+-----------------------------+
-| > composer                                         tokens 2.1M/5M  depth 1/2  $  |
+| > composer                                        tokens 11.2M/20M  depth 1/2   |
 +----------------------------------------------------------------------------------+
 ```
 
@@ -606,34 +679,39 @@ Layout:
 
 ## 16. CLI surface
 
+M1:
+
 ```
 kyora run [OPTIONS] <TASK>       non-interactive; final answer on stdout
-  -m, --model <provider/model>     root model (default from config)
+  -m, --model <provider/model>     root model
       --llm-model <provider/model> default model for kyora.llm
-      --agent-model <...>          default model for sub-agents (default: parent's)
+      --agent-model <provider/model>  default model for sub-agents (default: parent's)
       --effort <low|medium|high|xhigh|max>
       --context-file <PATH>        preload REPL variable `context`
       --var <NAME=@PATH|NAME=VALUE>  preload other variables (repeatable)
-      --max-depth <N>  --max-agents <N>  --budget <TOKENS>  --max-turns <N>
+      --max-depth <N>              --budget <TOKENS>         --max-turns <N>
+      --max-agents <N>             (total per session)       --max-live-agents <N>
+      --timeout <DURATION>         root deadline (default 2h)
       --no-repl  --no-llm          ablations
       --tools <list>               restrict the root's tools
   -C, --cd <DIR>                   working directory
       --json                       NDJSON events on stdout instead of the answer
       --show-thinking              request summarized thinking and print it to stderr
       --quiet                      no progress output on stderr
-kyora resume <SESSION> [MESSAGE]   continue a session (latest with --last)
+      --no-session                 do not write a session log
 kyora sessions [--json]            list sessions
-kyora trace <SESSION> [--json] [--node <ID>] [--cells]
-kyora                              TUI (M4); prints help until then
+kyora trace <SESSION> [--json]     recursion tree of a session
 ```
 
-Exit codes: 0 completed; 1 runtime failure (provider error after retries, internal error); 2 usage error; 3 stopped by a limit (`max_turns`, `budget_exhausted`; the partial answer is printed); 4 refused; 130 interrupted.
+M2 adds `kyora resume <SESSION> [MESSAGE]` (`--last`), `kyora fork`, `trace --node/--cells`, and flags for the remaining limits (`--max-llm-calls`, `--cell-timeout`). M4: `kyora` without arguments opens the TUI; until then it prints help.
+
+Exit codes: 0 completed; 1 runtime failure (provider error after retries, internal error); 2 usage error; 3 stopped by a limit (`max_turns`, `budget_exhausted`, `timeout`, `context_exhausted`; the partial answer is printed); 4 refused; 130 interrupted.
 
 Progress goes to stderr: one line per tool call and per node start or end, indented by depth. `--json` replaces both with the event stream.
 
 ## 17. Configuration
 
-`$KYORA_HOME/config.toml`, overridden by `KYORA_*` environment variables, overridden by flags. A project file (`.kyora/config.toml`) is read only for non-security settings until a trust mechanism exists (M3).
+`$KYORA_HOME/config.toml` (M2), overridden by `KYORA_*` environment variables, overridden by flags. M1 needs only the environment (`ANTHROPIC_API_KEY`, optional `KYORA_HOME`, `KYORA_PYTHON`) and flags.
 
 ```toml
 model = "anthropic/claude-opus-5-5"
@@ -643,14 +721,14 @@ effort = "high"
 
 [limits]
 max_depth = 2
-budget_tokens = 2_000_000
+budget_tokens = 20_000_000
 max_agents_total = 100
 max_agents_live = 16
 max_inflight_requests = 16
 
 [repl]
 python = "python3"            # any interpreter, e.g. a venv with numpy/pandas
-cell_compute_timeout_s = 300
+cell_timeout_s = 1800
 memory_limit_mb = 4096        # Linux RLIMIT_AS
 
 [providers.anthropic]
@@ -658,41 +736,42 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com"
 
-[providers.local]              # M2
+[providers.local]
 kind = "openai-chat"
 base_url = "http://localhost:11434/v1"
 api_key_env = ""
 ```
 
-M1 needs only the environment (`ANTHROPIC_API_KEY`, optional `KYORA_HOME`, `KYORA_PYTHON`) and flags; the config file arrives in M2.
+**Trust classes.** Security settings can only come from the user's own config, environment or flags: provider definitions (`kind`, `base_url`, `api_key_env`, headers), the Python interpreter path, environment allowlist extras, sandbox policy, sensitive paths, writable roots, and limits. A project file (`.kyora/config.toml`, M3) may set only non-security settings (models, effort, prompts, tool selection within the user's policy); security settings found there are ignored with a warning. Otherwise a malicious repository could redirect API keys to its own endpoint or pick the interpreter that runs.
 
 ## 18. Security
 
 Threat model: the model and everything it reads are untrusted. Long-context work processes large amounts of third-party text, so prompt injection is expected, and recursion multiplies both cost and the number of actors.
 
-| Risk | Control |
-|---|---|
-| Model-written code damages the machine | M1: separate processes, scrubbed env, rlimits, documented "run in a disposable environment". M3: OS sandbox, network off by default, sensitive paths unreadable, no silent fallback. |
-| Credential exfiltration | Keys live only in the host process; never in tool or REPL environments, prompts, logs or transcripts. The REPL has no network and reaches models only through the host. |
-| Runaway recursion or spend | Tree-wide ledger with pre-dispatch reservations, depth, agent and call caps, per-subtree budgets, compute timeouts, cancellation that always reaches the whole subtree. |
-| Capability escalation through sub-agents | A child's tools are a subset of its parent's; a child's budget is bounded by its ancestors; a child's depth is parent + 1; none of these can be raised by request parameters. |
-| Malicious or buggy REPL traffic | Private pipes only (no listening sockets), frame size caps, schema validation of every message, unknown methods rejected, REPL killed on protocol violation. |
-| Injection via sub-agent results | Child answers return into Python variables as data; they reach the parent's context only through bounded printed output. |
-| Sensitive data at rest | Session files 0600 in 0700 directories; `--trace-payloads=none` to avoid storing large inputs; no telemetry. |
-| Supply chain | Python runtime is stdlib-only and embedded in the binary; Rust dependencies pinned via `Cargo.lock`; CI runs `cargo deny` (licenses, advisories) from M2. |
+| Risk | M1 | M3 |
+|---|---|---|
+| Model-written code damages the machine or reads secrets on disk | Not prevented. Separate processes, scrubbed env, rlimits; documented requirement to run on trusted inputs or in a disposable environment. | OS sandbox for shell and REPL, the same policy for host file tools, sensitive paths unreadable, network off by default, fail closed. |
+| API keys leak through kyora itself | Keys live only in the host process; never in child environments, prompts, logs or transcripts. | Same, plus the sandbox hides key files and the REPL has no network. |
+| Runaway recursion or spend | Atomic admission and pre-dispatch reservations with a provable bound (10.2); depth, agent, call and turn caps; finite deadlines on every wait; cancellation through the whole token tree. | Same, plus dollar budgets. |
+| Capability escalation through sub-agents | A child's tools are a subset of its parent's; its budget and deadline are bounded by its ancestors; its depth is parent + 1; request parameters cannot raise any of these. | Policies are inherited and can only narrow. |
+| Malicious or buggy REPL traffic | Private pipes only (no listening sockets), framing and progress deadlines, frame, queue, request and batch quotas, schema validation, stale-cell rejection, kill on protocol violation (9.5). | Same. |
+| Injection via sub-agent results | Child answers return into Python variables as data; they reach the parent's context only through bounded printed output. | Same. |
+| Data at rest | Session files 0600 in 0700 directories, exclusive session lock, `--trace-payloads=none` and `--no-session`; no telemetry. | Same. |
+| Untrusted configuration | Only user config, env and flags are read. | Project config limited to non-security settings (17). |
+| Supply chain | Python runtime is stdlib-only and embedded; Rust dependencies pinned via `Cargo.lock`. | `cargo deny` (licenses, advisories) in CI from M2. |
 
 ## 19. Testing
 
 All tests run without network or API keys. Real-model smoke tests exist but run only with `KYORA_LIVE_TESTS=1` and a key in the environment.
 
-- **Unit (Rust):** SSE parser (chunk boundaries split anywhere), accumulator, retry policy and `retry-after` handling, Anthropic request building (golden JSON per feature: caching, eager streaming, thinking replay, opaque blocks), ledger arithmetic with property tests (`proptest`: random reserve and commit sequences never let any scope exceed its limit by more than in-flight estimates), IPC codec (random frame splits, oversized and malformed frames), output truncation, tool implementations against temp dirs.
-- **Provider integration:** a local mock HTTP server (`wiremock`) serving recorded SSE transcripts: tool-use round trips, thinking with signatures, mid-stream `overloaded_error`, 429 with and without `retry-after`, idle timeout. Codex tests its core the same way (R§3).
-- **Core loop:** `ScriptedProvider` and `FnProvider` drive the loop: parallel read-only tools with ordered results, mutating tool serialization, invalid tool JSON, `max_tokens` with a tool call, refusal, cancellation mid-stream and mid-tool (history stays valid), resume after a crash at every record boundary (truncate the JSONL at each line and resume).
-- **REPL (real `python3`, required in CI):** cell state persistence, output capture including subprocess output, bounded capture, exceptions, compute timeout versus waiting time, interrupt during a blocked `kyora.agent` call, REPL crash and restart notice, `final`, every error code mapped to its Python exception, protocol robustness (user code writing to fd 1 and 2, threads calling `kyora.llm` concurrently).
-- **Recursion end to end:** scripted trees: root spawns N children that each call `llm_batch`; depth limit; live and total agent limits; budget exhaustion in one subtree while siblings finish; cancellation of a subtree; deterministic trace shape regardless of scheduling (assert on the tree, not on event order).
+- **Unit (Rust):** SSE parser (chunk boundaries split anywhere), accumulator (including invalid and truncated tool input), retry policy and `retry-after` handling, Anthropic request building (golden JSON per feature: caching, eager streaming, thinking configuration, opaque replay, `usage.iterations` summation), ledger (property tests with `proptest`: random concurrent admissions, reservations and settlements, including failures and cancellations, never let `used` exceed any limit when usage respects the reservation assumptions; simultaneous sibling reservations and spawns exactly at the limit), reservation estimator against fake usage, IPC codec (random frame splits, oversized and malformed frames, stalled frames), output truncation, tool implementations against temp dirs.
+- **Provider integration:** a local mock HTTP server (`wiremock`) serving recorded SSE transcripts: tool-use round trips, thinking with signatures, mid-stream `overloaded_error`, 429 with and without `retry-after`, idle timeout, prefix-mismatch rejection and the switch to `drop_block`. Codex tests its core the same way (R§3).
+- **Core loop:** `ScriptedProvider` and `FnProvider` drive the loop: invalid tool JSON, `max_tokens` with a tool call (retry, then error result), refusal with pending tool calls, `model_context_window_exceeded`, cancellation mid-stream and mid-tool (history stays valid, reservations settled).
+- **REPL (real `python3`, required in CI, on Python 3.9 and 3.12, Linux and macOS):** cell state persistence, output capture including subprocess and background output, bounded capture under a flood, exceptions, wall-clock timeout, interrupt during a blocked `kyora.agent` call (the child is cancelled), interrupt arriving between cells, REPL crash and restart notice, staged `final` discarded on a failed cell, every error code mapped to its Python exception, `ValueTooLarge` raised locally, stale-cell rejection for a thread outliving its cell, threads calling `kyora.llm` concurrently, user code writing to fds 1 and 2.
+- **Recursion end to end:** scripted trees: root spawns N children that each call `llm_batch`; depth limit; live and total agent limits; budget exhaustion in one subtree while siblings finish; cancellation of a subtree; node-owned handles awaited in a later cell; deterministic trace shape regardless of scheduling (assert on the tree, not on event order).
 - **CLI:** `assert_cmd` runs `kyora run --fake-script ...` with `KYORA_HOME` in a temp dir; snapshot tests (`insta`) of `kyora trace` output and of `--json` event streams with timestamps and durations redacted.
 - **Python unit tests** for the `kyora` package run with `python3 -m unittest` against an in-process fake host, invoked from a Rust test so `cargo test` covers them.
-- **CI:** fmt, clippy `-D warnings`, tests on ubuntu-latest and macos-latest (Python 3.12 installed explicitly), `cargo deny` from M2.
+- **CI:** fmt, clippy `-D warnings`, tests on ubuntu-latest and macos-latest, `cargo deny` from M2.
 
 ## 20. npm distribution
 
@@ -706,12 +785,17 @@ M5, following Codex's model (R§3) without publishing anything until the owner d
 
 ## 21. Milestones
 
-**M1: core loop and recursion (local, Anthropic).**
-Workspace and CI (done in the scaffold PR); protocol types; Anthropic provider (streaming, retries, caching, thinking and opaque replay, model info); stateless scripted fake provider; agent loop with parallel read-only tools; built-in tools (`shell`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`); JSONL sessions with resume; `kyora run`, `resume`, `sessions`, `trace`; the `python` tool with the IPC protocol and the `kyora` module (`llm`, `llm_batch`, `agent`, `spawn`, `gather`, `final`, `budget`, `log`); ledger and limits (depth, agents, calls, tokens, turns, compute timeout); cancellation tree; process isolation; the test suite of section 19 (minus later features); docs. Exit criterion: a scripted three-level recursion runs end to end in CI, and a manual smoke run against the real API succeeds.
+**M1: core loop and recursion (local, Anthropic).** Delivered in three stages, each a small set of PRs with its own tests:
 
-**M2: providers and context.** OpenAI Responses, Chat Completions for compatible and local servers, `apply_patch` for GPT models; config file; compaction (Anthropic server-side, client-side elsewhere); task budget passthrough; `kyora fork`; `cargo deny`.
+- **M1.1 Loop.** Stateless scripted fake provider; Anthropic provider (streaming, SSE, retries with per-attempt settlement, caching, thinking configuration and opaque replay, `usage.iterations`, model info); `kyora-core` with the runtime, the sequential agent loop and admission rules of 5.2, the ledger with atomic admission and the reservation bound, run and node deadlines, the cancellation tree, the trace sink and JSONL session writer with the session lock; tools `shell`, `read_file`, `write_file`, `edit_file`; `kyora run` and `kyora sessions`.
+- **M1.2 REPL.** The `python` tool: process spawn and boot, fd remapping and drained output, IPC codec, pumps, watchdog and bounds of 9.5, cells with generations and wall-clock timeouts, `kyora.llm`, `llm_batch`, `final`, `budget`, `log`; variable preloading (`--context-file`, `--var`).
+- **M1.3 Recursion.** `kyora.agent`, `spawn`, handles and `gather`; cell-owned and node-owned children; node shutdown sequence; depth, live and total agent limits; subtree budgets; `kyora trace` tree view; the three-level scripted recursion test; a manual smoke run against the real API.
 
-**M3: isolation and integrations.** OS sandbox (Seatbelt, bubblewrap with seccomp, Landlock fallback) for shell and REPL; permission modes; MCP client (stdio and Streamable HTTP via `rmcp`); structured outputs (`kyora.llm(schema=...)`, `kyora.agent(schema=...)`); dollar budgets with a price table; content-addressed blobs for large values over IPC; project config trust.
+Exit criterion for M1: a scripted three-level recursion (root, children with `llm_batch`, grandchildren) runs end to end in CI with exact budget accounting, and a manual smoke run against the real API succeeds.
+
+**M2: providers, context and sessions.** OpenAI Responses, Chat Completions for compatible and local servers, `apply_patch` for GPT models; config file; compaction (Anthropic server-side, client-side elsewhere); `kyora resume` and `fork`; parallel read-only tool dispatch; `glob` and `grep`; refusal fallback with replay projection; task budget passthrough; `trace --node/--cells`; `cargo deny`.
+
+**M3: isolation and integrations.** OS sandbox and path policy (13.2); permission modes; MCP client (stdio and Streamable HTTP via `rmcp`); structured outputs (`schema=` for `llm` and `agent`); dollar budgets with a price table; content-addressed blobs for large values over IPC; project config with trust classes.
 
 **M4: TUI.** Interactive sessions, live recursion tree, node inspection and cancellation, interactive approvals, `kyora` without arguments opens it.
 
@@ -727,8 +811,8 @@ Not built now; recorded so current interfaces do not block it.
 ## 23. Open questions
 
 1. **Default models.** Proposal: root `claude-opus-5-5`, `kyora.llm` defaults to `claude-sonnet-5-5`, sub-agents inherit the parent's model. Acceptable, or should sub-calls default to the root model?
-2. **Default limits.** Proposal: `max_depth` 2, `budget_tokens` 2M per run (cache reads not counted), 100 agents total, 16 live. The research suggests depth 1 is the safe baseline and deeper recursion is model dependent (R§1).
-3. **Milestone order.** M2 (OpenAI and local providers, compaction) before M3 (OS sandbox and MCP), or sandbox first?
+2. **Default limits.** Proposal: `max_depth` 2, `budget_tokens` 20M processed tokens per session (cache reads included, so the bound is hard), 100 agents total, 16 live, 2 h run timeout. The research suggests depth 1 is the safe baseline and deeper recursion is model dependent (R§1).
+3. **Milestone order.** M2 (OpenAI and local providers, compaction, resume) before M3 (OS sandbox and MCP), or sandbox first? M1 runs model-written code without a sandbox (13.1).
 4. **npm names.** Per-platform package names, for example `@kyora-sh/kyora-darwin-arm64`, and whether `kyora` should later also dispatch to the switch and vms CLIs as proposed in section 22.
 5. **Data directory.** Share `~/.kyora` with kyora-switch (sessions under `~/.kyora/sessions`), or use a separate directory?
 6. **Auth.** M1 uses API keys from the environment only. Should subscription logins (as managed by kyora-switch for other tools) ever be a provider auth source? This needs a terms-of-service check first.

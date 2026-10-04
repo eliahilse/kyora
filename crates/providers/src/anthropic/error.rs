@@ -31,7 +31,11 @@ pub(super) fn http(status: u16, headers: &HeaderMap, body: &[u8], key: &str) -> 
     let error = parsed.as_ref().and_then(|value| value.get("error"));
     let kind = error
         .and_then(|value| value["type"].as_str())
-        .unwrap_or("unknown_error");
+        .unwrap_or(match status {
+            429 => "rate_limit_error",
+            529 => "overloaded_error",
+            _ => "unknown_error",
+        });
     let detail = error
         .and_then(|value| value["message"].as_str())
         .unwrap_or("unsuccessful HTTP response");

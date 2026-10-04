@@ -179,7 +179,8 @@ impl AddAssign for Usage {
 /// Reported tokens can include unbilled refusals, so this is not a bill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageIteration {
-    /// The model that ran this attempt.
+    /// The model that ran this attempt; empty when the provider omits it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     /// The provider's iteration kind, such as `message` or `fallback_message`.
     #[serde(rename = "type")]
@@ -336,6 +337,9 @@ pub struct ModelResponse {
     /// Token counters; defaults to zero in fixture JSON.
     #[serde(default)]
     pub usage: Usage,
+    /// Per-model attempts reported by the provider, including possibly unbilled refusals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_iterations: Vec<UsageIteration>,
 }
 
 /// The initial information for a streamed content block.
@@ -423,6 +427,15 @@ pub enum StreamEvent {
         stop_reason: Option<StopReason>,
         /// Latest cumulative counters; zero fields mean no update.
         usage: Usage,
+    },
+    /// Replaces usage with an authoritative snapshot for the serving model.
+    UsageSnapshot {
+        /// The serving model, which may change after a fallback.
+        model: String,
+        /// Complete counters for that model only, including zero values.
+        usage: Usage,
+        /// Separate attempts; these counters must not be added to serving usage.
+        iterations: Vec<UsageIteration>,
     },
     /// Ends the response.
     MessageStop,

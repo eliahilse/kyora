@@ -29,6 +29,7 @@ fn response(text: &str) -> ModelResponse {
         content: vec![ContentBlock::Text { text: text.into() }],
         stop_reason: StopReason::EndTurn,
         usage: Usage::default(),
+        usage_iterations: vec![],
     }
 }
 
@@ -254,6 +255,7 @@ async fn canned_blocks_and_usage_survive_chunked_streaming() {
             },
         ],
         stop_reason: StopReason::Other("future_reason".into()),
+        usage_iterations: vec![],
         usage: Usage {
             input_tokens: 10,
             output_tokens: 20,
@@ -313,7 +315,7 @@ async fn usage_is_synthesized_from_text_byte_lengths_with_minimum_one() {
 }
 
 #[tokio::test]
-async fn cancellation_before_and_during_stream_reports_cancelled() {
+async fn cancellation_before_stream_is_not_sent_and_during_stream_is_cancelled() {
     let provider = ScriptedProvider::new(vec![Rule {
         matcher: None,
         responses: vec![response("one response")],
@@ -323,7 +325,7 @@ async fn cancellation_before_and_during_stream_reports_cancelled() {
     cancelled.cancel();
     assert!(matches!(
         provider.stream(request("task"), cancelled).await,
-        Err(ProviderError::Cancelled)
+        Err(ProviderError::NotSent(_))
     ));
     let cancel = CancellationToken::new();
     let mut events = provider
@@ -343,7 +345,7 @@ async fn cancellation_before_and_during_stream_reports_cancelled() {
     let provider = FnProvider::new(|_: &ModelRequest| Ok(response("unused")));
     assert!(matches!(
         provider.stream(request("task"), cancel).await,
-        Err(ProviderError::Cancelled)
+        Err(ProviderError::NotSent(_))
     ));
 }
 

@@ -164,7 +164,7 @@ impl AnthropicProvider {
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(error::transport)?;
+            .map_err(|err| error::classify_dispatch(error::transport(err), false))?;
         Ok(Self { config, client })
     }
 
@@ -205,7 +205,7 @@ impl ModelProvider for AnthropicProvider {
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         if cancel.is_cancelled() {
-            return Err(ProviderError::cancelled(false));
+            return Err(error::classify_dispatch(ProviderError::Cancelled, false));
         }
         let deadline = Instant::now() + self.config.request_timeout;
         let caps = models::resolve(&self.config.model_caps, &req.model);
@@ -273,19 +273,23 @@ async fn send_request(
     deadline: Instant,
 ) -> Result<reqwest::Response, ProviderError> {
     let send_started = Arc::new(AtomicBool::new(false));
-    let (client, request) = request.build_split();
-    let mut request = request.map_err(error::transport)?;
-    let body = request.body_mut().take().unwrap_or_default();
-    *request.body_mut() = Some(reqwest::Body::wrap(SendTrackedBody {
-        inner: body,
-        send_started: send_started.clone(),
-    }));
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(ProviderError::cancelled(send_started.load(Ordering::Acquire))),
-        _ = tokio::time::sleep_until(deadline) => Err(ProviderError::Transport("request timeout".into())),
-        response = client.execute(request) => response.map_err(error::transport),
+    let result = async {
+        let (client, request) = request.build_split();
+        let mut request = request.map_err(error::transport)?;
+        let body = request.body_mut().take().unwrap_or_default();
+        *request.body_mut() = Some(reqwest::Body::wrap(SendTrackedBody {
+            inner: body,
+            send_started: send_started.clone(),
+        }));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ProviderError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => Err(ProviderError::Transport("request timeout".into())),
+            response = client.execute(request) => response.map_err(error::transport),
+        }
     }
+    .await;
+    result.map_err(|err| error::classify_dispatch(err, send_started.load(Ordering::Acquire)))
 }
 
 /// Track HTTP dispatch rather than polling the connection setup future.
@@ -327,9 +331,170 @@ mod tests {
 
     use super::*;
     use crate::AttemptCharge;
-    use tokio::{io::AsyncReadExt, net::TcpListener};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn read_client_hello(socket: &mut TcpStream) {
+        assert_eq!(socket.read_u8().await.unwrap(), 0x16, "expected TLS");
+        assert_eq!(socket.read_u16().await.unwrap() >> 8, 3);
+        let length = socket.read_u16().await.unwrap();
+        let mut hello = vec![0; usize::from(length)];
+        socket.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello[0], 1, "expected ClientHello");
+    }
+
+    #[tokio::test]
+    async fn timeouts_during_tls_are_not_sent() {
+        let short = Duration::from_millis(150);
+        let long = Duration::from_secs(2);
+        // Exercise the provider deadline, reqwest's whole-request timeout,
+        // and reqwest's connect timeout independently, then the review case.
+        for (deadline, request_timeout, connect_timeout) in [
+            (short, long, long),
+            (long, short, long),
+            (long, long, short),
+            (short, short, long),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("https://{}/v1/messages", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_client_hello(&mut socket).await;
+                // Stall TLS and verify the timeout closes before HTTP dispatch.
+                let mut remaining = Vec::new();
+                socket.read_to_end(&mut remaining).await.unwrap();
+                assert!(remaining.is_empty(), "only ClientHello should be sent");
+            });
+            let request = Client::builder()
+                .no_proxy()
+                .timeout(request_timeout)
+                .connect_timeout(connect_timeout)
+                .build()
+                .unwrap()
+                .post(url)
+                .body("test-only-body");
+            let error = send_request(
+                request,
+                &CancellationToken::new(),
+                Instant::now() + deadline,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, ProviderError::NotSent(message) if message == "request timeout"),
+                "{error:?}"
+            );
+            assert_eq!(error.charge(), AttemptCharge::Zero);
+            tokio::time::timeout(TEST_TIMEOUT, server)
+                .await
+                .expect("timed out connection should close")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_failure_is_not_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/v1/messages", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_client_hello(&mut socket).await;
+            // A fatal TLS handshake_failure alert, without accepting HTTP.
+            socket.write_all(&[21, 3, 3, 0, 2, 2, 40]).await.unwrap();
+            let mut remaining = Vec::new();
+            socket.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty(), "only ClientHello should be sent");
+        });
+        let request = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url)
+            .body("test-only-body");
+        let error = send_request(
+            request,
+            &CancellationToken::new(),
+            Instant::now() + TEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::NotSent(_)), "{error:?}");
+        assert_eq!(error.charge(), AttemptCharge::Zero);
+        tokio::time::timeout(TEST_TIMEOUT, server)
+            .await
+            .expect("failed TLS connection should close")
+            .unwrap();
+    }
+
+    struct FailingDns;
+
+    impl reqwest::dns::Resolve for FailingDns {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            assert_eq!(name.as_str(), "dispatch-test.invalid");
+            Box::pin(async {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "test DNS failure").into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_failure_is_not_sent() {
+        let request = Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(FailingDns))
+            .build()
+            .unwrap()
+            .post("http://dispatch-test.invalid/v1/messages")
+            .body("test-only-body");
+        let error = send_request(
+            request,
+            &CancellationToken::new(),
+            Instant::now() + TEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::NotSent(_)), "{error:?}");
+        assert_eq!(error.charge(), AttemptCharge::Zero);
+    }
+
+    #[tokio::test]
+    async fn reqwest_timeout_after_dispatch_reserves_usage() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), b'P', "expected POST");
+            let mut remaining = Vec::new();
+            socket.read_to_end(&mut remaining).await.unwrap();
+        });
+        let request = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(150))
+            .build()
+            .unwrap()
+            .post(url)
+            .body("test-only-body");
+        let error = send_request(
+            request,
+            &CancellationToken::new(),
+            Instant::now() + TEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ProviderError::Transport(message) if message == "request timeout"),
+            "{error:?}"
+        );
+        assert_eq!(error.charge(), AttemptCharge::Reserved);
+        tokio::time::timeout(TEST_TIMEOUT, server)
+            .await
+            .expect("timed out connection should close")
+            .unwrap();
+    }
 
     async fn cancel_pending_connect<F: Future>(
         connecting: F,
@@ -383,17 +548,11 @@ mod tests {
         let server_cancel = cancel.clone();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let first = socket.read_u8().await.unwrap();
             if tls {
-                assert_eq!(first, 0x16, "expected a TLS handshake record");
-                assert_eq!(socket.read_u16().await.unwrap() >> 8, 3);
-                let length = socket.read_u16().await.unwrap();
-                let mut hello = vec![0; usize::from(length)];
-                socket.read_exact(&mut hello).await.unwrap();
-                assert_eq!(hello[0], 1, "expected ClientHello");
+                read_client_hello(&mut socket).await;
                 // Do not reply, leaving the client's TLS handshake pending.
             } else {
-                assert_eq!(first, b'P', "expected the first byte of POST");
+                assert_eq!(socket.read_u8().await.unwrap(), b'P', "expected POST");
             }
             server_cancel.cancel();
             // Keep the socket alive until the cancelled attempt closes it.

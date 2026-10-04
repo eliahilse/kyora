@@ -15,13 +15,28 @@ pub(super) fn redact(message: &str, key: &str) -> String {
 
 pub(super) fn transport(error: reqwest::Error) -> ProviderError {
     // Do not format reqwest errors: they can contain URLs and credentials.
-    if error.is_connect() || error.is_builder() {
-        ProviderError::NotSent("connection or request setup failed".into())
-    } else if error.is_timeout() {
-        ProviderError::Transport("request timeout".into())
+    let message = if error.is_timeout() {
+        "request timeout"
+    } else if error.is_connect() || error.is_builder() {
+        "connection or request setup failed"
     } else {
-        ProviderError::Transport("HTTP transport failed".into())
+        "HTTP transport failed"
+    };
+    ProviderError::Transport(message.into())
+}
+
+/// Classify failures by HTTP dispatch, never by the transport error kind.
+/// Connection setup can fail through either a connect or whole-request timeout.
+pub(super) fn classify_dispatch(error: ProviderError, send_started: bool) -> ProviderError {
+    if send_started {
+        return error;
     }
+    let message = match error {
+        ProviderError::NotSent(message) | ProviderError::Transport(message) => message,
+        ProviderError::Cancelled => "cancelled before sending".into(),
+        error => error.to_string(),
+    };
+    ProviderError::NotSent(message)
 }
 
 pub(super) fn http(status: u16, headers: &HeaderMap, body: &[u8], key: &str) -> ProviderError {

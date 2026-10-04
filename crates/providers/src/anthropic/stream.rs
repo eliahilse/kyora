@@ -56,7 +56,9 @@ pub(super) fn response_stream(
                     // Close the connection before yielding a terminal error, even
                     // if the caller keeps the stream without polling it again.
                     drop(response.take());
-                    yield Err(error);
+                    // Receiving a response proves HTTP dispatch for every
+                    // stream failure, including cancellation and idle timeout.
+                    yield Err(error::classify_dispatch(error, true));
                     return;
                 }
             }

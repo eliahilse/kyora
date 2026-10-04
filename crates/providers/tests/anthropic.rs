@@ -728,13 +728,13 @@ async fn idle_timeout_closes_connection_before_yielding_error() {
         stream.next().await.unwrap(),
         Ok(StreamEvent::MessageStart { .. })
     ));
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), stream.next())
-            .await
-            .unwrap()
-            .unwrap(),
-        Err(ProviderError::IdleTimeout)
-    ));
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::IdleTimeout));
+    assert_eq!(error.charge(), AttemptCharge::Reserved);
     server.closed().await;
     assert!(stream.next().await.is_none());
 }
@@ -749,13 +749,13 @@ async fn cancellation_mid_stream_closes_connection() {
         .unwrap();
     assert!(stream.next().await.unwrap().is_ok());
     cancel.cancel();
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .unwrap()
-            .unwrap(),
-        Err(ProviderError::Cancelled)
-    ));
+    let error = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Cancelled));
+    assert_eq!(error.charge(), AttemptCharge::Reserved);
     server.closed().await;
     assert!(stream.next().await.is_none());
 }
@@ -843,9 +843,9 @@ async fn whole_attempt_timeout_during_stream() {
         .await
         .unwrap();
     assert!(stream.next().await.unwrap().is_ok());
-    assert!(
-        matches!(stream.next().await.unwrap(), Err(ProviderError::Transport(message)) if message == "request timeout")
-    );
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(matches!(&error, ProviderError::Transport(message) if message == "request timeout"));
+    assert_eq!(error.charge(), AttemptCharge::Reserved);
     server.closed().await;
 }
 
@@ -854,14 +854,14 @@ async fn whole_attempt_timeout_before_headers() {
     let mut server = StallServer::start(None).await;
     let mut cfg = config(&server.url);
     cfg.request_timeout = Duration::from_millis(200);
-    match AnthropicProvider::new(cfg)
+    let error = AnthropicProvider::new(cfg)
         .unwrap()
         .stream(request(), CancellationToken::new())
         .await
-    {
-        Err(ProviderError::Transport(message)) => assert_eq!(message, "request timeout"),
-        _ => panic!("expected whole attempt timeout"),
-    }
+        .err()
+        .unwrap();
+    assert!(matches!(&error, ProviderError::Transport(message) if message == "request timeout"));
+    assert_eq!(error.charge(), AttemptCharge::Reserved);
     server.closed().await;
 }
 
@@ -885,12 +885,45 @@ async fn refused_connection_is_not_sent() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    assert!(matches!(
-        provider(&url)
-            .stream(request(), CancellationToken::new())
-            .await,
-        Err(ProviderError::NotSent(_))
-    ));
+    let error = provider(&url)
+        .stream(request(), CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, ProviderError::NotSent(_)));
+    assert_eq!(error.charge(), AttemptCharge::Zero);
+}
+
+#[tokio::test]
+async fn retry_that_fails_before_dispatch_is_not_sent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = provider(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // Refuse subsequent connections, and drop the first after receiving HTTP.
+        drop(listener);
+        assert_eq!(socket.read_u8().await.unwrap(), b'P', "expected POST");
+    });
+    let first = provider
+        .stream(request(), CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(first, ProviderError::Transport(_)), "{first:?}");
+    assert_eq!(first.charge(), AttemptCharge::Reserved);
+    assert!(first.is_retryable());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let retry = provider
+        .stream(request(), CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(retry, ProviderError::NotSent(_)), "{retry:?}");
+    assert_eq!(retry.charge(), AttemptCharge::Zero);
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use kyora_protocol::{
-    ContentBlock, Message, ModelRequest, ModelResponse, RequestMeta, StopReason, StreamEvent, Usage,
+    ContentBlock, Message, ModelRequest, ModelResponse, StopReason, StreamEvent, Usage,
 };
 use kyora_providers::{
     ModelProvider, ProviderError, collect,
@@ -18,7 +18,7 @@ fn request(task: &str) -> ModelRequest {
         messages: vec![Message::user_text(task)],
         tools: vec![],
         max_tokens: 100,
-        metadata: RequestMeta::default(),
+        ..ModelRequest::default()
     }
 }
 
@@ -44,59 +44,98 @@ async fn run(provider: &impl ModelProvider, request: ModelRequest) -> ModelRespo
 }
 
 #[tokio::test]
-async fn first_matching_rule_uses_all_filters_and_last_user_text() {
+async fn first_matching_rule_with_a_response_for_the_turn_wins() {
     let provider = ScriptedProvider::new(vec![
         Rule {
             matcher: Some(Matcher {
                 depth: Some(2),
+                first_user_contains: Some("first".into()),
                 last_user_contains: Some("follow-up".into()),
                 system_contains: Some("system".into()),
             }),
-            responses: vec![response("specific")],
+            responses: vec![response("specific turn 0"), response("specific turn 1")],
         },
         Rule {
             matcher: None,
-            responses: vec![response("fallback")],
+            responses: vec![
+                response("fallback 0"),
+                response("fallback 1"),
+                response("fallback 2"),
+            ],
         },
     ]);
     let mut req = request("first task");
     req.system = Some("system prompt".into());
     req.metadata.depth = 2;
-    req.messages.extend([
-        Message::user_text("follow-up task"),
-        Message::assistant_text("latest assistant"),
-    ]);
+    req.messages
+        .push(Message::assistant_text("latest assistant"));
+    req.messages.push(Message::user_text("follow-up task"));
     assert_eq!(
         run(&provider, req.clone()).await.content,
-        response("specific").content
+        response("specific turn 1").content
     );
     assert_eq!(
         run(&provider, req.clone()).await.content,
-        response("fallback").content
+        response("specific turn 1").content,
+        "the provider is stateless"
     );
+    req.messages.push(Message::assistant_text("again"));
+    req.messages.push(Message::user_text("follow-up again"));
+    assert_eq!(
+        run(&provider, req.clone()).await.content,
+        response("fallback 2").content,
+        "a matching rule without a response for the turn falls through"
+    );
+    req.messages.push(Message::assistant_text("more"));
+    req.messages.push(Message::user_text("follow-up more"));
     let error = provider
         .stream(req, CancellationToken::new())
         .await
         .err()
         .unwrap();
     assert!(
-        matches!(error, ProviderError::Other(ref text) if text.starts_with("fake provider: no scripted response for ") && text.contains("follow-up task"))
+        matches!(error, ProviderError::Other(ref text) if text.starts_with("fake provider: no scripted response for turn 3") && text.contains("follow-up more") && text.contains("first task"))
     );
 
     for (task, depth, system) in [
         ("no substring", 2, Some("system")),
-        ("follow-up", 1, Some("system")),
-        ("follow-up", 2, Some("other")),
-        ("follow-up", 2, None),
+        ("first", 1, Some("system")),
+        ("first", 2, Some("other")),
+        ("first", 2, None),
     ] {
         let mut req = request(task);
         req.metadata.depth = depth;
         req.system = system.map(str::to_owned);
+        req.messages.push(Message::assistant_text("a"));
+        req.messages.push(Message::user_text("follow-up"));
         assert_eq!(
             run(&provider, req).await.content,
-            response("fallback").content
+            response("fallback 1").content
         );
     }
+}
+
+#[tokio::test]
+async fn first_user_text_selects_a_conversation_script() {
+    let script = r#"{"rules": [
+        {"match": {"first_user_contains": "alpha"}, "responses": [
+            {"content": [{"type": "text", "text": "alpha 0"}], "stop_reason": "end_turn"}]},
+        {"match": {"first_user_contains": "beta"}, "responses": [
+            {"content": [{"type": "text", "text": "beta 0"}], "stop_reason": "end_turn"}]}
+    ]}"#;
+    let provider = ScriptedProvider::from_json(script).unwrap();
+    assert_eq!(
+        run(&provider, request("task beta")).await.content,
+        response("beta 0").content
+    );
+    assert_eq!(
+        run(&provider, request("task alpha")).await.content,
+        response("alpha 0").content
+    );
+    assert!(matches!(
+        ScriptedProvider::from_json(r#"{"rules": [{"match": {"unknown": 1}, "responses": []}]}"#),
+        Err(ProviderError::Protocol(_))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -128,31 +167,28 @@ async fn concurrent_conversations_each_consume_their_own_sequence() {
     }
 }
 
-#[tokio::test]
-async fn system_and_complete_first_message_define_conversation_keys() {
-    let provider = ScriptedProvider::new(vec![Rule {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_concurrent_conversations_get_identical_scripts() {
+    let provider = Arc::new(ScriptedProvider::new(vec![Rule {
         matcher: None,
         responses: vec![response("one"), response("two")],
-    }]);
-    let req = request("same task");
-    let mut other_system = req.clone();
-    other_system.system = Some("different system".into());
-    let mut other_first_block = req.clone();
-    other_first_block.messages[0]
-        .content
-        .push(ContentBlock::Opaque {
-            provider: "test".into(),
-            kind: "context".into(),
-            raw: json!({"id": 1}),
-        });
-    for conversation in [req, other_system, other_first_block] {
+    }]));
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let provider = Arc::clone(&provider);
+        tasks.push(tokio::spawn(async move {
+            let mut req = request("same task");
+            let first = run(provider.as_ref(), req.clone()).await;
+            req.messages.push(Message::assistant_text("one"));
+            req.messages.push(Message::user_text("continue"));
+            let second = run(provider.as_ref(), req).await;
+            (first.content, second.content)
+        }));
+    }
+    for task in tasks {
         assert_eq!(
-            run(&provider, conversation.clone()).await.content,
-            response("one").content
-        );
-        assert_eq!(
-            run(&provider, conversation).await.content,
-            response("two").content
+            task.await.unwrap(),
+            (response("one").content, response("two").content)
         );
     }
 }
@@ -172,6 +208,12 @@ async fn fixture_loads_minimal_responses_and_uses_request_model() {
             input: json!({"text": "hello"})
         }]
     );
+    let mut req = req;
+    req.messages.push(Message {
+        role: kyora_protocol::Role::Assistant,
+        content: first.content.clone(),
+    });
+    req.messages.push(Message::user_text("tool result"));
     assert_eq!(run(&provider, req).await.content, response("done").content);
     assert!(matches!(
         ScriptedProvider::from_json("not json"),
@@ -271,7 +313,7 @@ async fn usage_is_synthesized_from_text_byte_lengths_with_minimum_one() {
 }
 
 #[tokio::test]
-async fn cancellation_before_stream_preserves_queue_and_during_stream_reports_error() {
+async fn cancellation_before_and_during_stream_reports_cancelled() {
     let provider = ScriptedProvider::new(vec![Rule {
         matcher: None,
         responses: vec![response("one response")],

@@ -119,7 +119,7 @@ pub enum ToolResultPart {
 }
 
 /// A tool definition made available to the model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     /// The tool name.
     pub name: String,
@@ -127,6 +127,10 @@ pub struct ToolSpec {
     pub description: String,
     /// The JSON schema for the tool's input.
     pub input_schema: Value,
+    /// The tool takes large inputs (code, file contents), so providers should
+    /// stream its input as generated instead of buffering it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub large_input: bool,
 }
 
 /// Token counters, with omitted JSON fields defaulting to zero.
@@ -171,6 +175,20 @@ impl AddAssign for Usage {
     }
 }
 
+/// Usage for one provider-reported attempt, kept separate across models.
+/// Reported tokens can include unbilled refusals, so this is not a bill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageIteration {
+    /// The model that ran this attempt.
+    pub model: String,
+    /// The provider's iteration kind, such as `message` or `fallback_message`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Token counters for this attempt only.
+    #[serde(flatten)]
+    pub usage: Usage,
+}
+
 /// Why a model stopped, preserving unknown provider strings verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
@@ -186,6 +204,8 @@ pub enum StopReason {
     PauseTurn,
     /// The provider refused the request.
     Refusal,
+    /// The response filled the model's context window.
+    ModelContextWindowExceeded,
     /// An unrecognized provider stop reason.
     Other(String),
 }
@@ -199,6 +219,7 @@ impl Serialize for StopReason {
             Self::StopSequence => "stop_sequence",
             Self::PauseTurn => "pause_turn",
             Self::Refusal => "refusal",
+            Self::ModelContextWindowExceeded => "model_context_window_exceeded",
             Self::Other(reason) => reason,
         })
     }
@@ -213,6 +234,7 @@ impl<'de> Deserialize<'de> for StopReason {
             "stop_sequence" => Self::StopSequence,
             "pause_turn" => Self::PauseTurn,
             "refusal" => Self::Refusal,
+            "model_context_window_exceeded" => Self::ModelContextWindowExceeded,
             reason => Self::Other(reason.to_owned()),
         })
     }
@@ -227,8 +249,60 @@ pub struct RequestMeta {
     pub depth: u32,
 }
 
+/// Requested reasoning effort; providers map it to their own setting or ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    /// Least reasoning.
+    Low,
+    /// Moderate reasoning.
+    Medium,
+    /// Thorough reasoning.
+    High,
+    /// More than high.
+    Xhigh,
+    /// Most reasoning.
+    Max,
+}
+
+/// How provider reasoning is returned to the client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Reasoning blocks are returned without readable text.
+    #[default]
+    Omitted,
+    /// Reasoning blocks carry a readable summary.
+    Summarized,
+}
+
+/// Provider-neutral request options; each provider maps what it supports and ignores the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestOptions {
+    /// Reasoning effort; `None` leaves the provider default.
+    pub effort: Option<Effort>,
+    /// Reasoning display; `None` leaves the provider default.
+    pub thinking_display: Option<ThinkingDisplay>,
+    /// Disables prompt-caching hints when true.
+    pub disable_cache: bool,
+    /// Advisory token budget for the whole agentic loop, sent where supported.
+    pub task_budget_total: Option<u64>,
+}
+
+/// Model limits discovered from a provider; unknown values are `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The model identifier the information describes.
+    pub id: String,
+    /// Maximum input tokens (the context window).
+    pub context_window: Option<u64>,
+    /// Maximum output tokens for one response.
+    pub max_output_tokens: Option<u32>,
+}
+
 /// A provider-neutral model request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {
     /// The requested model identifier.
     pub model: String,
@@ -240,6 +314,9 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     /// The maximum output token count.
     pub max_tokens: u32,
+    /// Provider-neutral options.
+    #[serde(default)]
+    pub options: RequestOptions,
     /// Internal context that must not be sent to a real provider API.
     pub metadata: RequestMeta,
 }
@@ -357,6 +434,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn usage_iteration_retains_model_and_kind() {
+        let raw = json!({"model": "fallback-model", "type": "fallback_message",
+            "input_tokens": 12, "output_tokens": 3,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0});
+        let iteration: UsageIteration = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(iteration.model, "fallback-model");
+        assert_eq!(iteration.kind, "fallback_message");
+        assert_eq!(iteration.usage.input_tokens, 12);
+        assert_eq!(serde_json::to_value(iteration).unwrap(), raw);
+    }
+
+    #[test]
     fn message_and_all_blocks_round_trip() {
         let blocks = vec![
             ContentBlock::Text {
@@ -437,6 +526,10 @@ mod tests {
             (StopReason::StopSequence, "stop_sequence"),
             (StopReason::PauseTurn, "pause_turn"),
             (StopReason::Refusal, "refusal"),
+            (
+                StopReason::ModelContextWindowExceeded,
+                "model_context_window_exceeded",
+            ),
             (StopReason::Other("future_reason".into()), "future_reason"),
             (StopReason::Other(String::new()), ""),
         ] {

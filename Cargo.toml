@@ -22,6 +22,11 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 kyora-protocol = { path = "crates/protocol" }
 kyora-providers = { path = "crates/providers" }
+kyora-tui = { path = "crates/tui" }
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = "0.28"
+tui-textarea = "0.7"
+libc = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

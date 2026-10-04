@@ -1,0 +1,32 @@
+┌Conversation #0───────────────────────────────────────────────────────────────┐┌Recursion | Up/Down inspect───────────┐
+│kyora                                                                         ││#0 agent root idle                    │
+│Explore a recursive run without API keys.                                     ││  fake/root 0t r20000                 │
+│Send a prompt to stream a Python tool call,                                   ││                                      │
+│three child agents and a batch of llm() calls.                                ││                                      │
+│Select tree nodes to inspect their transcripts.                               ││                                      │
+│Offline prototype. Send a prompt to play the scripted run.                    ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+│                                                                              ││                                      │
+└──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+┌Input | Enter send | Shift+Enter newline──────────────────────────────────────────────────────────────────────────────┐
+│ Type a prompt. Enter plays the offline script.                                                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+fake/root | 0 tok | est $0.0000 | 20000 left
+Tab focus  ? help  Esc cancel  q quit*  Ctrl-C quit  PgUp/PgDn scroll

@@ -36,3 +36,26 @@ fn run_is_not_implemented() {
         "error: not implemented yet\n"
     );
 }
+
+#[test]
+fn tui_help_and_nonterminal_error() {
+    let help = Command::new(env!("CARGO_BIN_EXE_kyora"))
+        .args(["tui", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8(help.stdout).unwrap().contains("--demo"));
+    for args in [vec![], vec!["tui"], vec!["tui", "--demo"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kyora"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("requires an interactive terminal")
+        );
+    }
+}

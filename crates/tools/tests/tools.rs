@@ -580,6 +580,37 @@ async fn aliases_apply_only_to_the_root_they_were_computed_for() {
 }
 
 #[tokio::test]
+async fn a_stale_nested_alias_does_not_block_a_valid_spelling() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let nested = canonical.join("self");
+    symlink(".", &nested).unwrap();
+    let config = FileConfig {
+        root_aliases: kyora_tools::workspace_root_aliases(
+            &canonical,
+            None,
+            dir.path(),
+            Some(&nested),
+        ),
+        ..FileConfig::default()
+    };
+    assert!(config.root_aliases.contains(&nested));
+    std::fs::remove_file(&nested).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let (text, error) = invoke(
+        Arc::new(WriteFile::new(config)),
+        json!({"path":nested.join("file"),"content":"x"}),
+        &canonical,
+    )
+    .await;
+    assert!(!error, "{text}");
+    assert_eq!(std::fs::read_to_string(nested.join("file")).unwrap(), "x");
+}
+
+#[tokio::test]
 async fn canonical_spelling_is_accepted_for_a_non_canonical_cwd() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();

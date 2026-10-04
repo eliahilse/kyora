@@ -85,23 +85,31 @@ fn path(input: &Value, root: &Path, aliases: &[PathBuf]) -> Result<PathBuf> {
             Some(first) if *first == canonical => aliases,
             _ => &[],
         };
-        let (alias, relative) = aliases
+        // A startup alias is a trusted symlink spelling whose target could have
+        // changed since startup. Use it only while it still names the root, so a
+        // write through it is never reported against a different directory.
+        let mut stale = false;
+        let relative = aliases
             .iter()
             .map(PathBuf::as_path)
             .chain([root, canonical.as_path()])
             .filter_map(|alias| supplied.strip_prefix(alias).ok().map(|p| (alias, p)))
-            // Prefer the most specific spelling if trusted aliases overlap.
+            .filter(|(alias, _)| {
+                let valid = *alias == root
+                    || *alias == canonical.as_path()
+                    || std::fs::canonicalize(alias).ok().as_deref() == Some(canonical.as_path());
+                stale |= !valid;
+                valid
+            })
+            // Prefer the most specific valid spelling if trusted aliases overlap.
             .max_by_key(|(alias, _)| alias.components().count())
-            .ok_or_else(|| anyhow::anyhow!("absolute path must be inside the workspace root"))?;
-        // A startup alias is a trusted symlink spelling whose target could have
-        // changed since startup. Use it only while it still names the root, so a
-        // write through it is never reported against a different directory.
-        if alias != root
-            && alias != canonical.as_path()
-            && std::fs::canonicalize(alias).ok().as_deref() != Some(canonical.as_path())
-        {
-            bail!("workspace alias no longer refers to the workspace root");
-        }
+            .map(|(_, relative)| relative);
+        let Some(relative) = relative else {
+            if stale {
+                bail!("workspace alias no longer refers to the workspace root");
+            }
+            bail!("absolute path must be inside the workspace root");
+        };
         relative
     } else {
         supplied

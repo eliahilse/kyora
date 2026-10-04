@@ -19,7 +19,11 @@ pub fn workspace_root_aliases(
     // A relative `cd` is resolved against the physical cwd and, when the shell's
     // logical cwd names the same directory, against that spelling too.
     let logical_cwd = pwd.filter(|p| {
-        p.is_absolute() && std::fs::canonicalize(p).ok() == std::fs::canonicalize(current_dir).ok()
+        p.is_absolute()
+            && matches!(
+                (std::fs::canonicalize(p), std::fs::canonicalize(current_dir)),
+                (Ok(a), Ok(b)) if a == b
+            )
     });
     let candidates: Vec<PathBuf> = match cd {
         Some(cd) => std::iter::once(current_dir)
@@ -170,12 +174,13 @@ mod tests {
         let aliases =
             workspace_root_aliases(&root, Some(Path::new("sub")), &physical, Some(&logical));
         assert!(aliases.contains(&logical.join("sub")), "{aliases:?}");
-        let stale = std::fs::canonicalize(dir.path()).unwrap();
+        // A PWD that names another directory is ignored even when PWD/sub
+        // exists and resolves to the root.
+        let other = std::fs::canonicalize(dir.path()).unwrap().join("other");
+        std::fs::create_dir(&other).unwrap();
+        symlink(physical.join("sub"), other.join("sub")).unwrap();
         let aliases =
-            workspace_root_aliases(&root, Some(Path::new("sub")), &physical, Some(&stale));
-        assert!(
-            !aliases.iter().any(|a| a.starts_with(&logical)),
-            "{aliases:?}"
-        );
+            workspace_root_aliases(&root, Some(Path::new("sub")), &physical, Some(&other));
+        assert!(!aliases.contains(&other.join("sub")), "{aliases:?}");
     }
 }

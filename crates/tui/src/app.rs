@@ -5,38 +5,61 @@ use tui_textarea::TextArea;
 
 use crate::event::{NodeId, NodeKind, NodeSpec, Status, UiEvent};
 
+/// Display state and cumulative accounting for one recursion tree node.
 #[derive(Debug, Clone)]
 pub struct Node {
+    /// Identity, topology and display metadata.
     pub spec: NodeSpec,
+    /// Kind of work this node represents.
     pub kind: NodeKind,
+    /// Current lifecycle state.
     pub status: Status,
+    /// Cumulative tokens attributed to this node.
     pub tokens: u64,
+    /// Cumulative estimated cost in millionths of a US dollar.
     pub cost_microusd: u64,
+    /// Remaining node budget, or none to use the shared budget.
     pub remaining: Option<u64>,
 }
 
+/// A transcript entry associated with a node.
 #[derive(Debug, Clone)]
 pub enum Entry {
+    /// A user prompt or REPL cell source.
     User {
+        /// Owning node identifier.
         node: NodeId,
+        /// Displayed text.
         text: String,
     },
+    /// Assistant text or REPL cell output.
     Assistant {
+        /// Owning node identifier.
         node: NodeId,
+        /// Displayed text, including accumulated stream deltas.
         text: String,
     },
+    /// A tool call with optional output and expansion state.
     Tool {
+        /// Node invoking the tool.
         node: NodeId,
+        /// Call identifier within its node.
         id: String,
+        /// Tool name.
         name: String,
+        /// Displayed arguments.
         args: String,
+        /// Completed output, or none while waiting.
         result: Option<String>,
+        /// Current call state.
         status: Status,
+        /// Whether to display full arguments and output.
         expanded: bool,
     },
 }
 
 impl Entry {
+    /// Returns the identifier of the node owning this entry.
     pub fn node(&self) -> NodeId {
         match self {
             Self::User { node, .. } | Self::Assistant { node, .. } | Self::Tool { node, .. } => {
@@ -46,38 +69,60 @@ impl Entry {
     }
 }
 
+/// Pane that receives keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    /// Prompt editor.
     Input,
+    /// Selected node's transcript.
     Conversation,
+    /// Recursion tree.
     Tree,
 }
 
+/// Request returned by keyboard handling to the event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// No external action is needed.
     None,
+    /// Submit the contained prompt as a new turn.
     Submit(String),
+    /// Cancel the active turn.
     Cancel,
+    /// Leave the terminal UI.
     Quit,
 }
 
+/// Event-driven UI state, including transcripts, selections and input.
 pub struct App {
+    /// Admitted nodes indexed by identifier.
     pub nodes: BTreeMap<NodeId, Node>,
+    /// Transcript entries in arrival order.
     pub entries: Vec<Entry>,
+    /// Multiline prompt editor.
     pub input: TextArea<'static>,
+    /// Pane receiving keyboard input.
     pub focus: Focus,
+    /// Node whose transcript is displayed.
     pub selected_node: NodeId,
+    /// Selected tool index within the displayed transcript.
     pub selected_tool: usize,
     /// Lines back from the live end of the selected transcript.
     pub scroll_back: u16,
+    /// Remaining shared token budget.
     pub remaining: u64,
+    /// Whether the help dialog is visible.
     pub help: bool,
+    /// Whether quitting an active turn awaits keyboard confirmation.
     pub confirm_quit: bool,
+    /// Current informational message below the transcript.
     pub notice: String,
+    /// Whether rendering avoids colors.
     pub no_color: bool,
 }
 
 impl App {
+    /// Creates an idle offline UI with the requested color behavior.
     pub fn new(no_color: bool) -> Self {
         let mut app = Self {
             nodes: BTreeMap::new(),
@@ -132,6 +177,7 @@ impl App {
         }
     }
 
+    /// Applies one event to node state, usage or transcript entries.
     pub fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::AgentSpawned(spec) => self.start_node(spec, NodeKind::Agent),
@@ -181,12 +227,14 @@ impl App {
         }
     }
 
+    /// Returns whether any admitted node is running.
     pub fn active(&self) -> bool {
         self.nodes
             .values()
             .any(|node| node.status == Status::Running)
     }
 
+    /// Returns cumulative tokens and estimated cost, excluding REPL cells.
     pub fn totals(&self) -> (u64, u64) {
         self.nodes
             .values()
@@ -232,6 +280,7 @@ impl App {
         rows
     }
 
+    /// Marks running nodes and tool entries cancelled and updates the notice.
     pub fn cancel_running(&mut self) {
         for node in self
             .nodes
@@ -251,6 +300,7 @@ impl App {
         self.notice = "Turn cancelled. Send another prompt to replay.".into();
     }
 
+    /// Records a root prompt and resets selection and scrolling for its turn.
     pub fn begin_turn(&mut self, prompt: String) {
         self.entries.push(Entry::User {
             node: 0,
@@ -262,6 +312,7 @@ impl App {
         self.notice = "Scripted run in progress.".into();
     }
 
+    /// Handles a key, updating local UI state and returning an event loop action.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;

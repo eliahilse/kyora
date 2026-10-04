@@ -21,8 +21,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::event::{NodeId, NodeSpec, Status, UiEvent};
 
+/// Fixed task used by the offline scripted provider.
 pub const PROMPT: &str = "Summarize three incident reports and check their dates.";
+/// Displayed Python source for the scripted tool call; it is never executed.
 pub const CODE: &str = "from concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(max_workers=6) as pool:\n    agents = [pool.submit(kyora.agent, task=f'Review report {i}')\n              for i in range(3)]\n    checks = [pool.submit(kyora.llm, prompt=f'Check date {i}')\n              for i in range(3)]\n    results = [f.result() for f in agents + checks]\nprint(results)";
+/// Fixed token budget displayed by the offline demo.
 pub const TOKEN_BUDGET: u64 = 20_000;
 
 struct Driver {

@@ -1,8 +1,13 @@
 //! Configurable defaults for built-in Unix tools.
-use std::time::Duration;
-/// Bounds and default page size for file reads.
+use std::{path::PathBuf, time::Duration};
+/// Trusted workspace spellings and bounds for file reads.
 #[derive(Debug, Clone)]
 pub struct FileConfig {
+    /// Additional absolute workspace spellings, computed once from trusted inputs
+    /// with [`crate::workspace_root_aliases`] (canonical root first). They are
+    /// used only by nodes whose cwd canonicalizes to that first entry, and each
+    /// alias is re-checked against the root when a path uses it.
+    pub root_aliases: Vec<PathBuf>,
     /// Default number of lines returned.
     pub lines: usize,
     /// Maximum bytes examined, including skipped lines.
@@ -11,9 +16,11 @@ pub struct FileConfig {
     pub line_chars: usize,
 }
 impl Default for FileConfig {
-    /// Returns 2000 lines, a 4 MiB bounded read and 2000 characters per line.
+    /// Returns no additional root aliases, 2000 lines, a 4 MiB bounded read
+    /// and 2000 characters per line. The runtime cwd is always accepted.
     fn default() -> Self {
         Self {
+            root_aliases: Vec::new(),
             lines: 2000,
             max_bytes: 4 * 1024 * 1024,
             line_chars: 2000,

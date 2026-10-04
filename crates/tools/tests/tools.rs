@@ -67,7 +67,7 @@ async fn invoke(tool: Arc<dyn Tool>, input: Value, cwd: &std::path::Path) -> (St
 async fn file_round_trip_pages_edits_and_atomic_failure() {
     let dir = tempfile::tempdir().unwrap();
     let (text, error) = invoke(
-        Arc::new(WriteFile),
+        Arc::new(WriteFile::default()),
         json!({"path":"nested/file.txt","content":"one\ntwo\nthree\n"}),
         dir.path(),
     )
@@ -150,6 +150,7 @@ async fn reads_refuse_binary_clip_long_lines_and_bound_bytes() {
         max_bytes: 100,
         line_chars: 40,
         lines: 2,
+        ..FileConfig::default()
     }));
     let (_, error) = invoke(reader.clone(), json!({"path":"binary"}), dir.path()).await;
     assert!(error);
@@ -325,7 +326,7 @@ async fn file_tools_refuse_workspace_escapes_and_symlinks() {
         "linked-file".into(),
     ] {
         for tool in [
-            Arc::new(WriteFile) as Arc<dyn Tool>,
+            Arc::new(WriteFile::default()) as Arc<dyn Tool>,
             Arc::new(EditFile::default()),
             Arc::new(ReadFile::new(FileConfig::default())),
         ] {
@@ -343,7 +344,7 @@ async fn file_tools_refuse_workspace_escapes_and_symlinks() {
         }
     }
     let (_, error) = invoke(
-        Arc::new(WriteFile),
+        Arc::new(WriteFile::default()),
         json!({"path":"linked-parent/new/file","content":"escape"}),
         &root,
     )
@@ -351,7 +352,7 @@ async fn file_tools_refuse_workspace_escapes_and_symlinks() {
     assert!(error);
     assert!(!outside.join("new").exists());
     let (_, error) = invoke(
-        Arc::new(WriteFile),
+        Arc::new(WriteFile::default()),
         json!({"path":"nested/../safe","content":"ok"}),
         &root,
     )
@@ -368,7 +369,7 @@ async fn file_tools_refuse_fifos_without_a_writer() {
     for tool in [
         Arc::new(ReadFile::new(FileConfig::default())) as Arc<dyn Tool>,
         Arc::new(EditFile::default()),
-        Arc::new(WriteFile),
+        Arc::new(WriteFile::default()),
     ] {
         let input = match tool.spec().name.as_str() {
             "write_file" => json!({"path":"pipe","content":"replacement"}),
@@ -388,46 +389,259 @@ async fn file_tools_refuse_fifos_without_a_writer() {
 async fn absolute_workspace_paths_and_root_aliases_are_accepted() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("private/tmp/workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    symlink(dir.path().join("private/tmp"), dir.path().join("tmp")).unwrap();
+    let alias = dir.path().join("tmp/workspace");
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    for (cd, pwd) in [(Some(alias.as_path()), None), (None, Some(alias.as_path()))] {
+        let config = FileConfig {
+            root_aliases: kyora_tools::workspace_root_aliases(&canonical, cd, dir.path(), pwd),
+            ..FileConfig::default()
+        };
+        assert!(config.root_aliases.contains(&alias));
+        for prefix in &config.root_aliases {
+            let path = prefix.join("nested/file");
+            let (text, error) = invoke(
+                Arc::new(WriteFile::new(config.clone())),
+                json!({"path":path,"content":"one"}),
+                &canonical,
+            )
+            .await;
+            assert!(!error, "{text}");
+            let (text, error) = invoke(
+                Arc::new(EditFile::new(config.clone())),
+                json!({"path":path,"old":"one","new":"two"}),
+                &canonical,
+            )
+            .await;
+            assert!(!error, "{text}");
+            let (text, error) = invoke(
+                Arc::new(ReadFile::new(config.clone())),
+                json!({"path":path}),
+                &canonical,
+            )
+            .await;
+            assert!(!error, "{text}");
+            assert_eq!(text, "1: two\n");
+            assert_eq!(
+                std::fs::read_to_string(root.join("nested/file")).unwrap(),
+                "two"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_aliases_refuse_escapes_unrelated_paths_and_untrusted_symlinks() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let trusted = dir.path().join("trusted");
+    let untrusted = dir.path().join("untrusted");
+    symlink(&root, &trusted).unwrap();
+    symlink(&root, &untrusted).unwrap();
+    std::fs::write(root.join("file"), "original").unwrap();
+    let outside = dir.path().join("file");
+    std::fs::write(&outside, "original").unwrap();
+    let config = FileConfig {
+        root_aliases: kyora_tools::workspace_root_aliases(
+            &canonical,
+            Some(&trusted),
+            dir.path(),
+            None,
+        ),
+        ..FileConfig::default()
+    };
+    let mut paths = vec![
+        outside.clone(),
+        untrusted.join("file"),
+        dir.path().join("trusted-other/file"),
+    ];
+    for alias in &config.root_aliases {
+        paths.extend([alias.join("../file"), alias.join("nested/../../file")]);
+    }
+    for path in paths {
+        for tool in [
+            Arc::new(WriteFile::new(config.clone())) as Arc<dyn Tool>,
+            Arc::new(EditFile::new(config.clone())),
+            Arc::new(ReadFile::new(config.clone())),
+        ] {
+            let input = match tool.spec().name.as_str() {
+                "write_file" => json!({"path":path,"content":"changed"}),
+                "edit_file" => json!({"path":path,"old":"original","new":"changed"}),
+                _ => json!({"path":path}),
+            };
+            let (text, error) = invoke(tool, input, &canonical).await;
+            assert!(error, "accepted {}: {text}", path.display());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+            assert_eq!(
+                std::fs::read_to_string(root.join("file")).unwrap(),
+                "original"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retargeted_startup_alias_is_refused() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    let config = FileConfig {
+        root_aliases: kyora_tools::workspace_root_aliases(
+            &canonical,
+            Some(&alias),
+            dir.path(),
+            None,
+        ),
+        ..FileConfig::default()
+    };
+    std::fs::remove_file(&alias).unwrap();
+    symlink(&outside, &alias).unwrap();
+    std::fs::write(outside.join("file"), "outside").unwrap();
+    std::fs::write(root.join("file"), "inside").unwrap();
+    for tool in [
+        Arc::new(WriteFile::new(config.clone())) as Arc<dyn Tool>,
+        Arc::new(EditFile::new(config.clone())),
+        Arc::new(ReadFile::new(config.clone())),
+    ] {
+        let path = alias.join("file");
+        let input = match tool.spec().name.as_str() {
+            "write_file" => json!({"path":path,"content":"one"}),
+            "edit_file" => json!({"path":path,"old":"inside","new":"two"}),
+            _ => json!({"path":path}),
+        };
+        let (text, error) = invoke(tool, input, &canonical).await;
+        assert!(error, "{text}");
+        assert_eq!(
+            text,
+            "workspace alias no longer refers to the workspace root"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.join("file")).unwrap(),
+        "outside"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("file")).unwrap(),
+        "inside"
+    );
+}
+
+#[tokio::test]
+async fn aliases_apply_only_to_the_root_they_were_computed_for() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    let config = FileConfig {
+        root_aliases: kyora_tools::workspace_root_aliases(
+            &canonical,
+            Some(&alias),
+            dir.path(),
+            None,
+        ),
+        ..FileConfig::default()
+    };
+    let sub_cwd = std::fs::canonicalize(&sub).unwrap();
+    for path in [alias.join("top"), canonical.join("top")] {
+        let (text, error) = invoke(
+            Arc::new(WriteFile::new(config.clone())),
+            json!({"path":path,"content":"x"}),
+            &sub_cwd,
+        )
+        .await;
+        assert!(error, "{text}");
+        assert_eq!(text, "absolute path must be inside the workspace root");
+    }
+    assert!(!sub.join("top").exists());
+    assert!(!root.join("top").exists());
+    let (text, error) = invoke(
+        Arc::new(WriteFile::new(config.clone())),
+        json!({"path":sub_cwd.join("inner"),"content":"x"}),
+        &sub_cwd,
+    )
+    .await;
+    assert!(!error, "{text}");
+    assert_eq!(std::fs::read_to_string(sub.join("inner")).unwrap(), "x");
+}
+
+#[tokio::test]
+async fn a_stale_nested_alias_does_not_block_a_valid_spelling() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let nested = canonical.join("self");
+    symlink(".", &nested).unwrap();
+    let config = FileConfig {
+        root_aliases: kyora_tools::workspace_root_aliases(
+            &canonical,
+            None,
+            dir.path(),
+            Some(&nested),
+        ),
+        ..FileConfig::default()
+    };
+    assert!(config.root_aliases.contains(&nested));
+    std::fs::remove_file(&nested).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let (text, error) = invoke(
+        Arc::new(WriteFile::new(config)),
+        json!({"path":nested.join("file"),"content":"x"}),
+        &canonical,
+    )
+    .await;
+    assert!(!error, "{text}");
+    assert_eq!(std::fs::read_to_string(nested.join("file")).unwrap(), "x");
+}
+
+#[tokio::test]
+async fn canonical_spelling_is_accepted_for_a_non_canonical_cwd() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
     let alias = dir.path().join("alias");
     symlink(&root, &alias).unwrap();
     let canonical = std::fs::canonicalize(&root).unwrap();
-    for (cwd, prefix) in [(&root, &root), (&alias, &alias), (&alias, &canonical)] {
+    for (cwd, prefix) in [(&alias, &alias), (&alias, &canonical)] {
         let path = prefix.join("nested/file");
         let (text, error) = invoke(
-            Arc::new(WriteFile),
+            Arc::new(WriteFile::default()),
             json!({"path":path,"content":"one"}),
             cwd,
         )
         .await;
         assert!(!error, "{text}");
-        let (text, error) = invoke(
-            Arc::new(EditFile::default()),
-            json!({"path":path,"old":"one","new":"two"}),
-            cwd,
-        )
-        .await;
-        assert!(!error, "{text}");
-        let (text, error) = invoke(
-            Arc::new(ReadFile::new(FileConfig::default())),
-            json!({"path":path}),
-            cwd,
-        )
-        .await;
-        assert!(!error, "{text}");
-        assert_eq!(text, "1: two\n");
     }
-    #[cfg(target_os = "macos")]
-    {
-        let short = std::path::Path::new("/").join(canonical.strip_prefix("/private").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/file")).unwrap(),
+        "one"
+    );
+    for supplied in [alias.clone(), alias.join(""), alias.join(".")] {
         let (text, error) = invoke(
-            Arc::new(ReadFile::new(FileConfig::default())),
-            json!({"path":short.join("nested/file")}),
-            &short,
+            Arc::new(WriteFile::default()),
+            json!({"path":supplied,"content":"x"}),
+            &alias,
         )
         .await;
-        assert!(!error, "{text}");
+        assert!(error, "{text}");
+        assert_eq!(text, "path must name a file");
     }
 }
 

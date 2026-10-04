@@ -190,16 +190,24 @@ fn prepare(run: &Run) -> Result<(Limits, PathBuf, kyora_core::Toolset)> {
         limits.run_timeout = v;
     }
     limits.validate()?;
-    let cwd = std::fs::canonicalize(run.cwd.clone().unwrap_or(std::env::current_dir()?))
+    let current_dir = std::env::current_dir()?;
+    let cwd = std::fs::canonicalize(run.cwd.as_ref().unwrap_or(&current_dir))
         .context("working directory")?;
     if !cwd.is_dir() {
         bail!("working directory is not a directory");
     }
-    let tools = kyora_tools::toolset(
-        kyora_tools::ShellConfig::default(),
-        kyora_tools::defaults::FileConfig::default(),
-    )?
-    .select(&ToolSelection(run.tools.clone()))?;
+    let pwd = std::env::var_os("PWD").map(PathBuf::from);
+    let files = kyora_tools::defaults::FileConfig {
+        root_aliases: kyora_tools::workspace_root_aliases(
+            &cwd,
+            run.cwd.as_deref(),
+            &current_dir,
+            pwd.as_deref(),
+        ),
+        ..kyora_tools::defaults::FileConfig::default()
+    };
+    let tools = kyora_tools::toolset(kyora_tools::ShellConfig::default(), files)?
+        .select(&ToolSelection(run.tools.clone()))?;
     Ok((limits, cwd, tools))
 }
 async fn execute_runtime(

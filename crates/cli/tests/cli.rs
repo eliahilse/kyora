@@ -41,6 +41,67 @@ fn version_and_help() {
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("sessions"));
 }
+#[cfg(unix)]
+#[test]
+fn logical_workspace_spelling_can_write_with_cd_or_pwd() {
+    use std::os::unix::fs::symlink;
+    for spelling in ["absolute", "relative", "pwd"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let alias = dir.path().join("logical");
+        symlink(&root, &alias).unwrap();
+        let script = dir.path().join("script.json");
+        std::fs::write(
+            &script,
+            json!({"rules":[{"responses":[
+                {"content":[{"type":"tool_use","id":"write","name":"write_file",
+                    "input":{"path":alias.join("file"),"content":"logical write"}},
+                    {"type":"tool_use","id":"cwd","name":"shell",
+                    "input":{"command":"pwd -P"}}],"stop_reason":"tool_use"},
+                {"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}
+            ]}]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut cmd = command(&dir);
+        cmd.args(["run", "task", "--fake-script"]).arg(&script);
+        match spelling {
+            "absolute" => {
+                cmd.arg("-C").arg(&alias).env("PWD", dir.path());
+            }
+            "relative" => {
+                cmd.current_dir(dir.path())
+                    .arg("-C")
+                    .arg("./logical/")
+                    .env("PWD", dir.path());
+            }
+            _ => {
+                cmd.current_dir(&root).env("PWD", &alias);
+            }
+        }
+        cmd.assert().success().stdout("done\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("file")).unwrap(),
+            "logical write"
+        );
+        let (_, events) = records(&dir);
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(events[0]["cwd"], canonical.to_str().unwrap());
+        for call in ["write", "cwd"] {
+            let result = events
+                .iter()
+                .find(|e| e["type"] == "tool_result" && e["call"] == call)
+                .unwrap();
+            assert_eq!(result["is_error"], false);
+            if call == "cwd" {
+                let output: Value =
+                    serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+                assert_eq!(output["stdout"], format!("{}\n", canonical.display()));
+            }
+        }
+    }
+}
 #[test]
 fn provider_wiring_placeholder_fails_clearly() {
     let dir = tempfile::tempdir().unwrap();

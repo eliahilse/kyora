@@ -880,6 +880,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
+ "http-body",
  "kyora-protocol",
  "reqwest",
  "serde",
@@ -887,6 +888,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "wiremock",
 ]

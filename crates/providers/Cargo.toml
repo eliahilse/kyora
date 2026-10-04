@@ -17,12 +17,14 @@ thiserror.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+http-body = "1"
 async-stream.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util"] }
 wiremock.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

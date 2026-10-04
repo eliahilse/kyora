@@ -3,7 +3,12 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Mutex, OnceLock},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -267,27 +272,169 @@ async fn send_request(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<reqwest::Response, ProviderError> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let send_started = AtomicBool::new(false);
-    let sending = async {
-        // Before the first poll no bytes can have been sent. Once polled,
-        // reqwest may send them, so cancellation must reserve unknown usage.
-        send_started.store(true, Ordering::Relaxed);
-        request.send().await
-    };
+    let send_started = Arc::new(AtomicBool::new(false));
+    let (client, request) = request.build_split();
+    let mut request = request.map_err(error::transport)?;
+    let body = request.body_mut().take().unwrap_or_default();
+    *request.body_mut() = Some(reqwest::Body::wrap(SendTrackedBody {
+        inner: body,
+        send_started: send_started.clone(),
+    }));
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => Err(ProviderError::cancelled(send_started.load(Ordering::Relaxed))),
+        _ = cancel.cancelled() => Err(ProviderError::cancelled(send_started.load(Ordering::Acquire))),
         _ = tokio::time::sleep_until(deadline) => Err(ProviderError::Transport("request timeout".into())),
-        response = sending => response.map_err(error::transport),
+        response = client.execute(request) => response.map_err(error::transport),
+    }
+}
+
+/// Track HTTP dispatch rather than polling the connection setup future.
+struct SendTrackedBody {
+    inner: reqwest::Body,
+    send_started: Arc<AtomicBool>,
+}
+
+impl http_body::Body for SendTrackedBody {
+    type Data = <reqwest::Body as http_body::Body>::Data;
+    type Error = reqwest::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.send_started.store(true, Ordering::Release);
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Reqwest/Hyper query this when dispatching the HTTP request on an
+        // established connection, immediately before writing its headers.
+        // Track headers too: body polling alone can miss a sent HTTP/2 HEADERS
+        // frame or HTTP/1 headers flushed before the body is polled.
+        // DNS, TCP, proxy CONNECT and TLS setup do not query this body.
+        self.send_started.store(true, Ordering::Release);
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
     use super::*;
     use crate::AttemptCharge;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn cancel_pending_connect<F: Future>(
+        connecting: F,
+        cancel: CancellationToken,
+    ) -> F::Output {
+        tokio::pin!(connecting);
+        // Start a real loopback connection, then hold the connector at its
+        // first Pending poll so the cancellation cannot race HTTP dispatch.
+        let pending =
+            futures::future::poll_fn(|cx| Poll::Ready(connecting.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(pending, "connection setup should initially be pending");
+        cancel.cancel();
+        std::future::pending::<()>().await;
+        connecting.await
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_connect_is_not_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cancel = CancellationToken::new();
+        let connector_cancel = cancel.clone();
+        let client = Client::builder()
+            .no_proxy()
+            .connector_layer(tower::util::MapFutureLayer::new(move |connecting| {
+                cancel_pending_connect(connecting, connector_cancel.clone())
+            }))
+            .build()
+            .unwrap();
+        let request = client
+            .post(format!(
+                "http://{}/v1/messages",
+                listener.local_addr().unwrap()
+            ))
+            .body("test-only-body");
+        let error = send_request(request, &cancel, Instant::now() + TEST_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::NotSent(_)), "{error:?}");
+        assert_eq!(error.charge(), AttemptCharge::Zero);
+    }
+
+    async fn cancel_after_first_byte(tls: bool) -> ProviderError {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "{}://{}/v1/messages",
+            if tls { "https" } else { "http" },
+            listener.local_addr().unwrap()
+        );
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let first = socket.read_u8().await.unwrap();
+            if tls {
+                assert_eq!(first, 0x16, "expected a TLS handshake record");
+                assert_eq!(socket.read_u16().await.unwrap() >> 8, 3);
+                let length = socket.read_u16().await.unwrap();
+                let mut hello = vec![0; usize::from(length)];
+                socket.read_exact(&mut hello).await.unwrap();
+                assert_eq!(hello[0], 1, "expected ClientHello");
+                // Do not reply, leaving the client's TLS handshake pending.
+            } else {
+                assert_eq!(first, b'P', "expected the first byte of POST");
+            }
+            server_cancel.cancel();
+            // Keep the socket alive until the cancelled attempt closes it.
+            let mut remaining = Vec::new();
+            socket.read_to_end(&mut remaining).await.unwrap();
+            if tls {
+                assert!(
+                    remaining.is_empty(),
+                    "no HTTP bytes should follow ClientHello"
+                );
+            }
+        });
+        let request = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url)
+            .body("test-only-body");
+        let error = send_request(request, &cancel, Instant::now() + TEST_TIMEOUT)
+            .await
+            .unwrap_err();
+        tokio::time::timeout(TEST_TIMEOUT, server)
+            .await
+            .expect("cancelled connection should close")
+            .unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_tls_is_not_sent() {
+        let error = cancel_after_first_byte(true).await;
+        assert!(matches!(error, ProviderError::NotSent(_)), "{error:?}");
+        assert_eq!(error.charge(), AttemptCharge::Zero);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_first_request_byte_reserves_usage() {
+        let error = cancel_after_first_byte(false).await;
+        assert!(matches!(error, ProviderError::Cancelled), "{error:?}");
+        assert_eq!(error.charge(), AttemptCharge::Reserved);
+    }
 
     #[tokio::test]
     async fn cancellation_after_precheck_before_send_poll_is_not_sent() {

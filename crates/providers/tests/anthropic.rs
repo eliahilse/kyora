@@ -3,7 +3,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use kyora_protocol::{ContentBlock, Message, ModelRequest, StopReason, StreamEvent, Usage};
 use kyora_providers::{
-    ModelProvider, ProviderError,
+    AttemptCharge, ModelProvider, ProviderError,
     anthropic::{AnthropicConfig, AnthropicProvider, ModelCaps},
     collect,
 };
@@ -219,10 +219,22 @@ async fn thinking_signature_and_opaque_blocks_collect_verbatim() {
     .into_iter()
     .enumerate()
     {
-        let raw = json!({"type": kind, "data": "verbatim", "extra": {"a": [1, 2]}});
+        let mut raw = if kind == "server_tool_use" {
+            json!({"type": kind, "id": "srvtoolu_1", "name": "web_search", "input": {}})
+        } else {
+            json!({"type": kind, "data": "verbatim", "extra": {"a": [1, 2]}})
+        };
         body += &event(
             json!({"type": "content_block_start", "index": offset + 1, "content_block": raw}),
         );
+        if kind == "server_tool_use" {
+            // Documented web-search deltas include an empty fragment and split keys.
+            for fragment in ["", "{\"query", "\":", " \"weather", " NY", "C to", "day\"}"] {
+                body += &event(json!({"type": "content_block_delta", "index": offset + 1,
+                    "delta": {"type": "input_json_delta", "partial_json": fragment}}));
+            }
+            raw["input"] = json!({"query": "weather NYC today"});
+        }
         body += &event(json!({"type": "content_block_stop", "index": offset + 1}));
         expected.push(ContentBlock::Opaque {
             provider: "anthropic".into(),
@@ -249,22 +261,109 @@ async fn thinking_signature_and_opaque_blocks_collect_verbatim() {
 }
 
 #[tokio::test]
-async fn usage_iterations_are_summed_and_cumulative_updates_replace() {
+async fn fallback_iterations_keep_models_and_serving_usage_without_summing_refusals() {
+    // Cover a pre-output handoff, a mid-output handoff and sticky routing.
+    for (mid_output, sticky, refused, partial_usage) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (false, true, false, false),
+        (true, false, true, false),
+        (true, false, false, true),
+    ] {
+        let server = MockServer::start().await;
+        let serving = "claude-opus-4-8";
+        let initial_model = if mid_output {
+            "claude-fable-5"
+        } else {
+            serving
+        };
+        let mut iterations = vec![];
+        if !sticky {
+            iterations.push(json!({"type": "message", "model": "claude-fable-5",
+                "input_tokens": u64::MAX, "output_tokens": if mid_output { 10 } else { 0 },
+                "cache_creation_input_tokens": 30, "cache_read_input_tokens": 40}));
+        }
+        iterations.push(json!({"type": "fallback_message", "model": serving,
+            "input_tokens": 412, "output_tokens": 264,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}));
+        let mut body = event(json!({"type": "message_start", "message": {
+            "id": "msg", "model": initial_model, "usage": {
+                "input_tokens": 999, "output_tokens": 1,
+                "cache_creation_input_tokens": 30, "cache_read_input_tokens": 40}}}));
+        if !sticky {
+            let mut index = 0;
+            if mid_output {
+                body += &event(
+                    json!({"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}),
+                );
+                body += &event(
+                    json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": "Partial output"}}),
+                );
+                body += &event(json!({"type": "content_block_stop", "index": index}));
+                index += 1;
+            }
+            body += &event(
+                json!({"type": "content_block_start", "index": index, "content_block": {
+                "type": "fallback", "from": {"model": "claude-fable-5"}, "to": {"model": serving}}}),
+            );
+            body += &event(json!({"type": "content_block_stop", "index": index}));
+        }
+        let final_usage = if partial_usage {
+            json!({"output_tokens": 264, "iterations": iterations})
+        } else {
+            json!({"input_tokens": 412, "output_tokens": 264,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "iterations": iterations})
+        };
+        body += &finish(final_usage, if refused { "refusal" } else { "end_turn" });
+        mock_stream(&server, body).await;
+        let response = collect(
+            provider(&server.uri())
+                .stream(request(), CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.model, serving);
+        assert_eq!(
+            response.usage,
+            Usage {
+                input_tokens: 412,
+                output_tokens: 264,
+                ..Usage::default()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&response.usage_iterations).unwrap(),
+            json!(iterations)
+        );
+        assert_eq!(
+            response.stop_reason,
+            if refused {
+                StopReason::Refusal
+            } else {
+                StopReason::EndTurn
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_iterations_without_model_remain_separate_from_reply_usage() {
     let server = MockServer::start().await;
-    let initial = json!({"input_tokens": 999, "output_tokens": 999, "iterations": [
-        {"input_tokens": 2, "output_tokens": 1, "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4},
-        {"input_tokens": 5, "output_tokens": 2, "cache_creation_input_tokens": 6, "cache_read_input_tokens": 7}
-    ]});
-    let final_usage = json!({"input_tokens": 888, "output_tokens": 888, "iterations": [
-        {"input_tokens": 2, "output_tokens": 10, "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4},
-        {"input_tokens": 5, "output_tokens": 20, "cache_creation_input_tokens": 6, "cache_read_input_tokens": 7}
-    ]});
-    let body = event(
-        json!({"type": "message_start", "message": {"id": "msg", "model": "claude-haiku-4-5", "usage": initial}}),
-    ) + &event(
-        json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 8}}),
-    ) + &finish(final_usage, "end_turn");
-    mock_stream(&server, body).await;
+    let iteration = json!({"type": "compaction", "input_tokens": 144, "output_tokens": 276,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0});
+    mock_stream(
+        &server,
+        start()
+            + &finish(
+                json!({"input_tokens": 0, "output_tokens": 0,
+        "iterations": [iteration]}),
+                "compaction",
+            ),
+    )
+    .await;
     let response = collect(
         provider(&server.uri())
             .stream(request(), CancellationToken::new())
@@ -273,14 +372,11 @@ async fn usage_iterations_are_summed_and_cumulative_updates_replace() {
     )
     .await
     .unwrap();
+    assert_eq!(response.usage, Usage::default());
+    assert_eq!(response.model, "claude-haiku-4-5");
     assert_eq!(
-        response.usage,
-        Usage {
-            input_tokens: 7,
-            output_tokens: 30,
-            cache_creation_input_tokens: 9,
-            cache_read_input_tokens: 11
-        }
+        serde_json::to_value(&response.usage_iterations).unwrap(),
+        json!([iteration])
     );
 }
 
@@ -491,6 +587,15 @@ impl StallServer {
     }
 
     async fn script(initial_body: Option<String>, frames: Vec<(Duration, String)>) -> Self {
+        Self::http_script(initial_body, frames, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".into(), false).await
+    }
+
+    async fn http_script(
+        initial_body: Option<String>,
+        frames: Vec<(Duration, String)>,
+        headers: String,
+        truncate: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (ready_tx, ready) = tokio::sync::oneshot::channel();
@@ -521,7 +626,7 @@ impl StallServer {
             }
             let _ = ready_tx.send(());
             if let Some(body) = initial_body {
-                socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
+                socket.write_all(headers.as_bytes()).await.unwrap();
                 socket
                     .write_all(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes())
                     .await
@@ -536,6 +641,9 @@ impl StallServer {
                 {
                     return;
                 }
+            }
+            if truncate {
+                return;
             }
             // Treat a reset as closure too. No more bytes are expected after
             // the complete request body has been drained.
@@ -559,6 +667,50 @@ impl StallServer {
             .expect("connection did not close promptly")
             .unwrap();
         self.task.take();
+    }
+}
+
+#[tokio::test]
+async fn error_status_and_retry_after_survive_truncated_or_stalled_bodies() {
+    for status in [429, 529] {
+        for (truncate, idle_timeout) in [(true, false), (false, false), (false, true)] {
+            let headers = format!(
+                "HTTP/1.1 {status} Error\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nretry-after: 7\r\nconnection: close\r\n\r\n"
+            );
+            let mut server =
+                StallServer::http_script(Some("{\"error\":".into()), vec![], headers, truncate)
+                    .await;
+            let mut cfg = config(&server.url);
+            if idle_timeout {
+                cfg.idle_timeout = Duration::from_millis(200);
+                cfg.request_timeout = Duration::from_secs(2);
+            } else {
+                cfg.request_timeout = Duration::from_millis(200);
+            }
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                AnthropicProvider::new(cfg)
+                    .unwrap()
+                    .stream(request(), CancellationToken::new()),
+            )
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+            assert!(
+                matches!(error, ProviderError::Http { status: actual, .. } if actual == status)
+            );
+            assert_eq!(error.charge(), AttemptCharge::Zero);
+            assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+            assert!(error.is_retryable());
+            let kind = if status == 429 {
+                "rate_limit_error"
+            } else {
+                "overloaded_error"
+            };
+            assert!(error.to_string().contains(kind));
+            server.closed().await;
+        }
     }
 }
 
@@ -662,7 +814,9 @@ async fn cancellation_while_waiting_for_headers() {
         _ = &mut sending => panic!("server should stall before headers"),
     }
     cancel.cancel();
-    assert!(matches!(sending.await, Err(ProviderError::Cancelled)));
+    let error = sending.await.err().unwrap();
+    assert!(matches!(error, ProviderError::Cancelled));
+    assert_eq!(error.charge(), AttemptCharge::Reserved);
     server.closed().await;
 }
 
@@ -716,10 +870,13 @@ async fn cancellation_before_dispatch_does_not_send() {
     let server = MockServer::start().await;
     let cancel = CancellationToken::new();
     cancel.cancel();
-    assert!(matches!(
-        provider(&server.uri()).stream(request(), cancel).await,
-        Err(ProviderError::Cancelled)
-    ));
+    let error = provider(&server.uri())
+        .stream(request(), cancel)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, ProviderError::NotSent(_)));
+    assert_eq!(error.charge(), AttemptCharge::Zero);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -737,15 +894,11 @@ async fn refused_connection_is_not_sent() {
 }
 
 #[tokio::test]
-async fn malformed_json_truncated_stream_and_usage_overflow_are_protocol_errors() {
+async fn malformed_json_truncated_stream_and_invalid_iterations_are_protocol_errors() {
     for body in [
         start(),
         "event: message_start\ndata: invalid\n\n".into(),
-        start()
-            + &finish(
-                json!({"iterations": [{"input_tokens": u64::MAX}, {"input_tokens": 1}]}),
-                "end_turn",
-            ),
+        start() + &finish(json!({"iterations": "invalid"}), "end_turn"),
     ] {
         let server = MockServer::start().await;
         mock_stream(&server, body).await;

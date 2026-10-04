@@ -135,7 +135,7 @@ impl ModelProvider for ScriptedProvider {
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
+            return Err(ProviderError::cancelled(false));
         }
         response_stream(self.respond(&req)?, &req, self.chunk_size, cancel)
     }
@@ -181,7 +181,7 @@ where
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
+            return Err(ProviderError::cancelled(false));
         }
         response_stream((self.respond)(&req)?, &req, self.chunk_size, cancel)
     }
@@ -251,7 +251,7 @@ fn response_stream(
     }
     let mut events = vec![StreamEvent::MessageStart {
         id: response.id,
-        model: response.model,
+        model: response.model.clone(),
         usage: Usage {
             output_tokens: 0,
             ..response.usage
@@ -326,6 +326,13 @@ fn response_stream(
             ..Usage::default()
         },
     });
+    if !response.usage_iterations.is_empty() {
+        events.push(StreamEvent::UsageSnapshot {
+            model: response.model,
+            usage: response.usage,
+            iterations: response.usage_iterations,
+        });
+    }
     events.push(StreamEvent::MessageStop);
     Ok(Box::pin(stream::unfold(
         (events.into_iter(), cancel, false),

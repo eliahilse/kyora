@@ -200,7 +200,7 @@ impl ModelProvider for AnthropicProvider {
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         if cancel.is_cancelled() {
-            return Err(ProviderError::Cancelled);
+            return Err(ProviderError::cancelled(false));
         }
         let deadline = Instant::now() + self.config.request_timeout;
         let caps = models::resolve(&self.config.model_caps, &req.model);
@@ -209,22 +209,24 @@ impl ModelProvider for AnthropicProvider {
         if !betas.is_empty() {
             request = request.header("anthropic-beta", betas.join(","));
         }
-        let response = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => return Err(ProviderError::Transport("request timeout".into())),
-            response = request.send() => response.map_err(error::transport)?,
-        };
+        let response = send_request(request, &cancel, deadline).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let headers = response.headers().clone();
             let bytes = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                _ = tokio::time::sleep_until(deadline) => return Err(ProviderError::Transport("request timeout".into())),
-                bytes = response.bytes() => bytes.map_err(error::transport)?,
+                _ = cancel.cancelled() => None,
+                _ = tokio::time::sleep_until(deadline) => None,
+                _ = tokio::time::sleep(self.config.idle_timeout) => None,
+                bytes = response.bytes() => bytes.ok(),
             };
-            return Err(error::http(status, &headers, &bytes, &self.config.api_key));
+            // The body only enriches an error whose status and headers are known.
+            return Err(error::http(
+                status,
+                &headers,
+                bytes.as_deref().unwrap_or_default(),
+                &self.config.api_key,
+            ));
         }
         Ok(stream::response_stream(
             response,
@@ -257,5 +259,46 @@ impl ModelProvider for AnthropicProvider {
             return Ok(info);
         }
         Ok(models::resolve(&self.config.model_caps, model).info(model))
+    }
+}
+
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<reqwest::Response, ProviderError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let send_started = AtomicBool::new(false);
+    let sending = async {
+        // Before the first poll no bytes can have been sent. Once polled,
+        // reqwest may send them, so cancellation must reserve unknown usage.
+        send_started.store(true, Ordering::Relaxed);
+        request.send().await
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ProviderError::cancelled(send_started.load(Ordering::Relaxed))),
+        _ = tokio::time::sleep_until(deadline) => Err(ProviderError::Transport("request timeout".into())),
+        response = sending => response.map_err(error::transport),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AttemptCharge;
+
+    #[tokio::test]
+    async fn cancellation_after_precheck_before_send_poll_is_not_sent() {
+        let cancel = CancellationToken::new();
+        assert!(!cancel.is_cancelled());
+        let request = Client::new().post("http://127.0.0.1:1/v1/messages");
+        cancel.cancel();
+        let error = send_request(request, &cancel, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::NotSent(_)));
+        assert_eq!(error.charge(), AttemptCharge::Zero);
     }
 }

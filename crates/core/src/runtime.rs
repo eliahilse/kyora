@@ -674,13 +674,20 @@ impl Runtime {
                         // Keep polling the same future so the provider can classify an
                         // unsent request. An unresponsive provider costs the reservation.
                         attempt_cancel.cancel();
-                        tokio::time::timeout(defaults::PROVIDER_CANCEL_GRACE, &mut future)
+                        let result = tokio::time::timeout(defaults::PROVIDER_CANCEL_GRACE, &mut future)
                             .await
                             .unwrap_or(Err(if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
                                 ProviderError::Cancelled
                             } else {
                                 ProviderError::IdleTimeout
-                            }))
+                            }));
+                        if matches!(result, Err(ProviderError::Cancelled))
+                            && !cx.cancel.is_cancelled() && Instant::now() < cx.deadline
+                        {
+                            Err(ProviderError::IdleTimeout)
+                        } else {
+                            result
+                        }
                     },
                 }
             };

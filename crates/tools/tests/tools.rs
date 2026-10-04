@@ -29,6 +29,7 @@ async fn invoke(tool: Arc<dyn Tool>, input: Value, cwd: &std::path::Path) -> (St
                 StopReason::EndTurn
             },
             usage: Usage::default(),
+            usage_iterations: vec![],
         })
     });
     let trace = TraceSink::ephemeral();
@@ -393,26 +394,26 @@ async fn absolute_workspace_paths_and_root_aliases_are_accepted() {
     let alias = dir.path().join("alias");
     symlink(&root, &alias).unwrap();
     let canonical = std::fs::canonicalize(&root).unwrap();
-    for prefix in [&root, &alias, &canonical] {
+    for (cwd, prefix) in [(&root, &root), (&alias, &alias), (&alias, &canonical)] {
         let path = prefix.join("nested/file");
         let (text, error) = invoke(
             Arc::new(WriteFile),
             json!({"path":path,"content":"one"}),
-            &root,
+            cwd,
         )
         .await;
         assert!(!error, "{text}");
         let (text, error) = invoke(
             Arc::new(EditFile::default()),
             json!({"path":path,"old":"one","new":"two"}),
-            &root,
+            cwd,
         )
         .await;
         assert!(!error, "{text}");
         let (text, error) = invoke(
             Arc::new(ReadFile::new(FileConfig::default())),
             json!({"path":path}),
-            &root,
+            cwd,
         )
         .await;
         assert!(!error, "{text}");
@@ -424,7 +425,7 @@ async fn absolute_workspace_paths_and_root_aliases_are_accepted() {
         let (text, error) = invoke(
             Arc::new(ReadFile::new(FileConfig::default())),
             json!({"path":short.join("nested/file")}),
-            &canonical,
+            &short,
         )
         .await;
         assert!(!error, "{text}");
@@ -477,5 +478,41 @@ async fn concurrent_case_and_unicode_alias_edits_preserve_all_updates() {
                 format!("ALPHA BETA GAMMA{padding}")
             );
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staggered_concurrent_edits_preserve_every_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let editor = Arc::new(EditFile::default());
+    let padding = "x".repeat(8 * 1024 * 1024);
+    for _ in 0..4 {
+        let initial = (0..12).map(|i| format!("old{i:02} ")).collect::<String>();
+        std::fs::write(dir.path().join("file"), format!("{initial}{padding}")).unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..12 {
+            let editor = editor.clone();
+            let cwd = dir.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(i * 2)).await;
+                invoke(
+                    editor,
+                    json!({"path":"file", "old":format!("old{i:02}"), "new":format!("new{i:02}")}),
+                    &cwd,
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            let (text, error) = task.await.unwrap();
+            assert!(!error, "{text}");
+        }
+        let expected = (0..12).map(|i| format!("new{i:02} ")).collect::<String>();
+        let actual = std::fs::read_to_string(dir.path().join("file")).unwrap();
+        assert!(
+            actual == format!("{expected}{padding}"),
+            "lost a concurrent replacement: {}",
+            &actual[..72]
+        );
     }
 }

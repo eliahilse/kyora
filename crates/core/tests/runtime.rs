@@ -31,6 +31,7 @@ fn response(content: Vec<ContentBlock>, stop: StopReason) -> ModelResponse {
             output_tokens: 20,
             ..Usage::default()
         },
+        usage_iterations: vec![],
     }
 }
 fn text(value: &str) -> ContentBlock {
@@ -1117,4 +1118,106 @@ async fn started_mutation_reports_real_outcome_before_session_end() {
         .position(|event| matches!(event, TraceEvent::SessionEnd { .. }))
         .unwrap();
     assert!(result < end);
+}
+
+#[tokio::test]
+async fn total_timeout_cancels_cooperative_providers_and_retries_with_send_charges() {
+    struct TimeoutProvider {
+        sent: bool,
+        cancelled: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ModelProvider for TimeoutProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        async fn stream(
+            &self,
+            _: ModelRequest,
+            cancel: CancellationToken,
+        ) -> Result<EventStream, ProviderError> {
+            let cancelled = self.cancelled.clone();
+            if !self.sent {
+                cancel.cancelled().await;
+                cancelled.fetch_add(1, Ordering::SeqCst);
+                return Err(ProviderError::cancelled(false));
+            }
+            let prefix = stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: None,
+                    model: "test".into(),
+                    usage: Usage::default(),
+                }),
+                Ok(StreamEvent::BlockStart {
+                    index: 0,
+                    block: BlockStart::Text,
+                }),
+            ]);
+            let deltas = stream::unfold(
+                (cancel, cancelled, false),
+                |(cancel, cancelled, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    let event = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled.fetch_add(1, Ordering::SeqCst);
+                            Err(ProviderError::cancelled(true))
+                        },
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => Ok(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "x".into(),
+                        }),
+                    };
+                    let done = event.is_err();
+                    Some((event, (cancel, cancelled, done)))
+                },
+            );
+            Ok(Box::pin(prefix.chain(deltas)))
+        }
+        async fn model_info(&self, _: &str) -> Result<ModelInfo, ProviderError> {
+            Ok(ModelInfo::default())
+        }
+    }
+    for sent in [false, true] {
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let (rt, rx) = runtime(
+            Arc::new(TimeoutProvider {
+                sent,
+                cancelled: cancelled.clone(),
+            }),
+            vec![],
+            Limits {
+                request_idle: Duration::from_secs(1),
+                request_total: Duration::from_millis(50),
+                ..Limits::default()
+            },
+        );
+        assert_eq!(rt.run(spec()).await.unwrap().status, Status::Failed);
+        // A timeout alone cannot satisfy this assertion: the provider must see
+        // the attempt token fire on every retry, including pre-send attempts.
+        assert_eq!(cancelled.load(Ordering::SeqCst), 5);
+        let ends = drain(rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                TraceEvent::AttemptEnd {
+                    outcome, charged, ..
+                } => Some((outcome, charged)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ends.len(), 5);
+        for (outcome, charged) in ends {
+            if sent {
+                assert_eq!(outcome, ProviderError::IdleTimeout.to_string());
+                assert!(charged > 0);
+            } else {
+                assert!(outcome.starts_with("not sent:"), "{outcome}");
+                assert_eq!(charged, 0);
+            }
+        }
+        assert_eq!(rt.ledger().snapshot(0).reserved, 0);
+        assert_eq!(rt.ledger().snapshot(0).used == 0, !sent);
+    }
 }

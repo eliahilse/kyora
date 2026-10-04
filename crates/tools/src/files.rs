@@ -74,17 +74,35 @@ fn path(input: &Value, root: &Path, aliases: &[PathBuf]) -> Result<PathBuf> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let supplied = Path::new(p);
-    // Aliases are validated at startup. Never probe model-supplied paths.
+    // Only trusted spellings are canonicalized: the runtime cwd and the startup
+    // aliases. Model-supplied paths are matched lexically and never probed.
     let supplied = if supplied.is_absolute() {
-        // Prefer the most specific spelling if trusted aliases overlap.
-        aliases
+        let canonical = std::fs::canonicalize(root)?;
+        // Aliases apply only to the root they were computed for (the canonical
+        // root comes first, see workspace_root_aliases). A node running in a
+        // different cwd accepts just its own two spellings.
+        let aliases = match aliases.first() {
+            Some(first) if *first == canonical => aliases,
+            _ => &[],
+        };
+        let (alias, relative) = aliases
             .iter()
             .map(PathBuf::as_path)
-            .chain(std::iter::once(root))
+            .chain([root, canonical.as_path()])
             .filter_map(|alias| supplied.strip_prefix(alias).ok().map(|p| (alias, p)))
+            // Prefer the most specific spelling if trusted aliases overlap.
             .max_by_key(|(alias, _)| alias.components().count())
-            .map(|(_, relative)| relative)
-            .ok_or_else(|| anyhow::anyhow!("absolute path must be inside the workspace root"))?
+            .ok_or_else(|| anyhow::anyhow!("absolute path must be inside the workspace root"))?;
+        // A startup alias is a trusted symlink spelling whose target could have
+        // changed since startup. Use it only while it still names the root, so a
+        // write through it is never reported against a different directory.
+        if alias != root
+            && alias != canonical.as_path()
+            && std::fs::canonicalize(alias).ok().as_deref() != Some(canonical.as_path())
+        {
+            bail!("workspace alias no longer refers to the workspace root");
+        }
+        relative
     } else {
         supplied
     };

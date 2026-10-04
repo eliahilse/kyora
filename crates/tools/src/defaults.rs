@@ -4,7 +4,9 @@ use std::{path::PathBuf, time::Duration};
 #[derive(Debug, Clone)]
 pub struct FileConfig {
     /// Additional absolute workspace spellings, computed once from trusted inputs
-    /// with [`crate::workspace_root_aliases`]. All must refer to the runtime cwd.
+    /// with [`crate::workspace_root_aliases`] (canonical root first). They are
+    /// used only by nodes whose cwd canonicalizes to that first entry, and each
+    /// alias is re-checked against the root when a path uses it.
     pub root_aliases: Vec<PathBuf>,
     /// Default number of lines returned.
     pub lines: usize,

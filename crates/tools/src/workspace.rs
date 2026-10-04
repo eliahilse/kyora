@@ -16,27 +16,29 @@ pub fn workspace_root_aliases(
     pwd: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut aliases = vec![canonical_root.to_path_buf()];
-    let candidate = if let Some(cd) = cd {
-        let mut normalized = PathBuf::new();
-        for component in current_dir.join(cd).components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    normalized.pop();
-                }
-                _ => normalized.push(component.as_os_str()),
-            }
-        }
-        Some(normalized)
-    } else {
-        pwd.filter(|p| p.is_absolute()).map(Path::to_path_buf)
+    // A relative `cd` is resolved against the physical cwd and, when the shell's
+    // logical cwd names the same directory, against that spelling too.
+    let logical_cwd = pwd.filter(|p| {
+        p.is_absolute() && std::fs::canonicalize(p).ok() == std::fs::canonicalize(current_dir).ok()
+    });
+    let candidates: Vec<PathBuf> = match cd {
+        Some(cd) => std::iter::once(current_dir)
+            .chain(logical_cwd.filter(|_| cd.is_relative()))
+            .map(|base| normalize(&base.join(cd)))
+            .collect(),
+        None => pwd
+            .filter(|p| p.is_absolute())
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect(),
     };
-    if let Some(candidate) = candidate
-        && candidate.is_absolute()
-        && std::fs::canonicalize(&candidate).is_ok_and(|p| p == canonical_root)
-        && !aliases.contains(&candidate)
-    {
-        aliases.push(candidate);
+    for candidate in candidates {
+        if candidate.is_absolute()
+            && std::fs::canonicalize(&candidate).is_ok_and(|p| p == canonical_root)
+            && !aliases.contains(&candidate)
+        {
+            aliases.push(candidate);
+        }
     }
     // Consider the canonical root and the validated user spelling, never paths
     // discovered from file tool inputs. Probe only these startup candidates.
@@ -51,6 +53,21 @@ pub fn workspace_root_aliases(
         }
     }
     aliases
+}
+
+/// Removes `.` and resolves `..` lexically, without touching the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -140,5 +157,25 @@ mod tests {
         assert!(aliases.contains(&short));
         let aliases = workspace_root_aliases(&root, Some(&short), &root, None);
         assert_eq!(aliases.iter().filter(|p| *p == &short).count(), 1);
+    }
+
+    #[test]
+    fn relative_cd_is_also_resolved_against_a_matching_logical_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let physical = std::fs::canonicalize(dir.path()).unwrap().join("project");
+        std::fs::create_dir_all(physical.join("sub")).unwrap();
+        let logical = std::fs::canonicalize(dir.path()).unwrap().join("link");
+        symlink(&physical, &logical).unwrap();
+        let root = std::fs::canonicalize(physical.join("sub")).unwrap();
+        let aliases =
+            workspace_root_aliases(&root, Some(Path::new("sub")), &physical, Some(&logical));
+        assert!(aliases.contains(&logical.join("sub")), "{aliases:?}");
+        let stale = std::fs::canonicalize(dir.path()).unwrap();
+        let aliases =
+            workspace_root_aliases(&root, Some(Path::new("sub")), &physical, Some(&stale));
+        assert!(
+            !aliases.iter().any(|a| a.starts_with(&logical)),
+            "{aliases:?}"
+        );
     }
 }

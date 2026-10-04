@@ -394,3 +394,88 @@ fn ctrl_c_cancels_gracefully_and_kills_the_shell_group() {
     }
     panic!("child survived cancellation");
 }
+
+#[cfg(unix)]
+#[test]
+fn fifo_read_does_not_block_run_timeout_or_first_ctrl_c() {
+    use nix::{
+        sys::{
+            signal::{Signal, kill},
+            stat::Mode,
+        },
+        unistd::{Pid, mkfifo},
+    };
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    struct Cleanup(std::process::Child);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for interrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        mkfifo(&dir.path().join("pipe"), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let script = dir.path().join("fifo.json");
+        // Both calls belong to one turn. The shell marks that the FIFO read has
+        // returned, then keeps the run active for timeout or the first SIGINT.
+        std::fs::write(&script, json!({"rules":[{"responses":[{
+            "content":[
+                {"type":"tool_use","id":"fifo","name":"read_file","input":{"path":"pipe"}},
+                {"type":"tool_use","id":"wait","name":"shell","input":{"command":"echo ready > ready; sleep 60"}}
+            ],"stop_reason":"tool_use"
+        }]}]}).to_string()).unwrap();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kyora"));
+        command
+            .args(["run", "task", "--fake-script"])
+            .arg(script)
+            .arg("-C")
+            .arg(dir.path())
+            .env("HOME", dir.path())
+            .env("KYORA_HOME", dir.path().join("home"))
+            .env_remove("KYORA_FAKE_SCRIPT")
+            .env_remove("KYORA_MODEL")
+            .env_remove("KYORA_LLM_MODEL")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.args(["--timeout", if interrupt { "60s" } else { "300ms" }]);
+        let mut cleanup = Cleanup(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        if interrupt {
+            while !dir.path().join("ready").exists() {
+                assert!(Instant::now() < deadline, "FIFO read blocked the executor");
+                assert!(
+                    cleanup.0.try_wait().unwrap().is_none(),
+                    "run exited before SIGINT"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            kill(Pid::from_raw(cleanup.0.id() as i32), Signal::SIGINT).unwrap();
+        }
+        loop {
+            if let Some(status) = cleanup.0.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(if interrupt { 130 } else { 3 }));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "FIFO read prevented run termination"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (_, events) = records(&dir);
+        let result = events
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["call"] == "fifo")
+            .unwrap();
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"].as_str().unwrap().contains("non-regular"));
+        assert_eq!(
+            events.last().unwrap()["status"],
+            if interrupt { "cancelled" } else { "timeout" }
+        );
+    }
+}

@@ -143,3 +143,42 @@ fn absent_sessions_does_not_create_files_and_crashed_tail_is_readable() {
     .unwrap();
     assert_eq!(list(home.path()).unwrap()[0].status, "interrupted");
 }
+
+#[test]
+fn interrupted_utf8_tail_does_not_hide_other_sessions() {
+    let home = tempfile::tempdir().unwrap();
+    let interrupted = home.path().join("sessions/interrupted");
+    let completed = home.path().join("sessions/completed");
+    std::fs::create_dir_all(&interrupted).unwrap();
+    std::fs::create_dir_all(&completed).unwrap();
+    let mut bytes = b"{\"type\":\"session_start\",\"ts\":\"test\"}\n{\"text\":\"".to_vec();
+    bytes.extend_from_slice(&"€".as_bytes()[..2]);
+    std::fs::write(interrupted.join("events.jsonl"), &bytes).unwrap();
+    std::fs::write(
+        completed.join("events.jsonl"),
+        b"{\"type\":\"session_end\",\"status\":\"completed\"}\n",
+    )
+    .unwrap();
+    let summaries = list(home.path()).unwrap();
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|s| s.id == "interrupted")
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|s| s.id == "completed")
+            .unwrap()
+            .status,
+        "completed"
+    );
+    // Invalid UTF-8 in a finished record remains an error.
+    bytes.push(b'\n');
+    std::fs::write(interrupted.join("events.jsonl"), bytes).unwrap();
+    assert!(list(home.path()).is_err());
+}

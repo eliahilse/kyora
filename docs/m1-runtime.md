@@ -82,7 +82,15 @@ The root consumes one total and live agent slot. Admission counters and ancestor
 
 `Ledger::reserve` is a low-level accounting API: its caller must already hold a model semaphore permit. Runtime enforces that order and flushes `attempt_start` before dispatch. Retries release the model slot during backoff and reserve separately. Malformed input ending at `max_tokens` gets one additional, charged attempt before admission.
 
-Root runs and leaf calls execute in owned tasks. Dropping their waiting futures cancels them; their tasks finish settlement. Node cancellation cancels leaf calls, and root shutdown joins them before reporting subtree usage. A leaf is owned by both its node token and the explicit caller token. Child-agent spawning is omitted until M1.3; `NodeCtx` already retains the runtime, parent identity, model and inherited deadline.
+Root runs and leaf calls execute in owned tasks. Dropping their waiting futures cancels them; their tasks finish settlement. Each attempt has a drop guard that releases an undispatched reservation or conservatively charges a dispatched reservation if its future unwinds or is dropped. Root and leaf boundaries catch panics, complete shutdown and report failure. A leaf panic marks the root failed even when a tool handles the leaf error. Node cancellation cancels leaf calls, and root shutdown joins them before reporting subtree usage. A leaf is owned by both its node token and the explicit caller token. Child-agent spawning is omitted until M1.3; `NodeCtx` already retains the runtime, parent identity, model and inherited deadline.
+
+## File access
+
+File tools are confined to the workspace root supplied as `AgentSpec::cwd`. Paths must be relative. Absolute paths and parent traversal above the root are rejected; `.` and parent components that stay within the root are normalized. No additional roots are enabled. Any future support for extra roots must require explicit caller configuration.
+
+Each directory component is opened relative to an already opened directory descriptor with `O_DIRECTORY | O_NOFOLLOW`. Tool-supplied symlinks are refused, including symlinks whose targets are inside the workspace. Reads and edits refuse non-regular files before opening and check the opened descriptor again. `O_NONBLOCK` prevents a replacement FIFO from blocking between those checks. Writes create an exclusive temporary file relative to the held parent descriptor and replace the target entry with `renameat`. Parent symlink swaps cannot redirect reads, edits or writes to an external target.
+
+Filesystem operations run on the blocking pool. Waiting for them observes node cancellation and the run deadline, so the run timeout and first Ctrl-C can end the invocation. FIFOs, devices and other special files are refused instead of starting a blocking read. The shell tool retains its existing process and filesystem access; file-tool confinement is not a shell sandbox.
 
 ## Sessions and CLI
 
@@ -96,9 +104,9 @@ Exit codes are 0 for completion, 1 for failure, 2 for usage errors, 3 for a limi
 
 - Leaf nodes retain their owning agent's depth and consume the LLM-call counter, without consuming agent slots.
 - File offsets are 1-based. Reads refuse NUL-containing or non-UTF-8 files, inspect at most 4 MiB by default and clip long lines. These bounds are configurable.
-- Exact edits use the D7 `old` and `new` arguments and canonicalize existing paths before locking. Atomic file replacements preserve existing permissions; new files use the temporary file's private permissions.
+- Exact edits use the D7 `old` and `new` arguments and share locks for normalized paths under the canonical workspace root. Atomic file replacements preserve existing permission bits; new files use private permissions.
 - Without discovered output-cap information, the configured agent output cap is the fallback ceiling. Numerical overshoot bounds depend on the provider's context and output ceilings as specified by D10.2.
-- A listing with no final session record reports `interrupted`; M2 recovery will determine and persist recovered node statuses. A missing newline on the last record is ignored when listing. Corrupt complete records produce an error.
+- A listing with no final session record reports `interrupted`; M2 recovery will determine and persist recovered node statuses. A missing newline on the last record is ignored at the byte level before decoding, including a tail cut inside a UTF-8 character. Corrupt complete records produce an error.
 - Schema failures preserve serialized arguments in `INVALID_JSON`; strict JSON parse failures preserve the original streamed bytes. Unknown tools receive an error without a truncation retry.
 - M1 performs no compaction. Tool dispatch is sequential, and shell process-group cleanup includes background children in that group. Deliberately detached processes remain outside M1 tracking, as in D10.4.
 
@@ -115,4 +123,4 @@ RUSTDOCFLAGS='-D warnings -W missing_docs' nice -n 10 cargo doc --workspace --no
 
 The Linux API check is `nice -n 10 cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu --locked`. Linux execution tests and the declared Rust 1.89 MSRV need separate runners when those toolchains are available.
 
-All four required checks passed on macOS with Rust 1.98. The workspace suite passed 78 tests: core 29, tools 10, CLI 11, protocol 4 and providers 24. Both proptest properties, the NDJSON snapshot, the 100 MB shell flood, process-group timeout and graceful Ctrl-C checks passed. The Linux all-target cross-check also passed. Linux test execution and the Rust 1.89 MSRV were not run.
+All four required checks passed on macOS with Rust 1.98. The workspace suite passed 85 tests: core 32, tools 13, CLI 12, protocol 4 and providers 24. Both proptest properties, the NDJSON snapshot, the 100 MB shell flood, process-group timeout and graceful Ctrl-C checks passed. Regressions cover workspace traversal and symlink escapes, a parent symlink swap, root and leaf provider panics, FIFO refusal with run timeout and first Ctrl-C, and a session tail cut inside a UTF-8 character. The Linux all-target cross-check also passed. Linux test execution and the Rust 1.89 MSRV were not run.

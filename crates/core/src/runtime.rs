@@ -2,12 +2,12 @@
 use crate::{
     Limits, ModelRef, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink,
     defaults,
-    ledger::{Charge, Ledger, NodeId, estimate},
+    ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
     prompts,
     tool::truncate,
 };
 use anyhow::{Result, bail};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use kyora_protocol::{
     ContentBlock, Message, ModelRequest, ModelResponse, RequestMeta, RequestOptions, Role,
     StopReason, StreamEvent, ToolResultPart, Usage,
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use std::{
     collections::BTreeMap,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
         Arc,
@@ -149,6 +150,7 @@ struct RuntimeInner {
     slots: Semaphore,
     cancel: CancellationToken,
     started: AtomicBool,
+    panicked: AtomicBool,
     leaves: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 /// Shared runtime for one invocation. `run` may be called exactly once.
@@ -228,6 +230,7 @@ impl Runtime {
             slots,
             cancel: CancellationToken::new(),
             started: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
             leaves: std::sync::Mutex::new(Vec::new()),
         })))
     }
@@ -267,7 +270,7 @@ impl Runtime {
         let timer = tokio::spawn(async move {
             tokio::select! { _ = tokio::time::sleep_until(deadline) => run_cancel.cancel(), _ = run_cancel.cancelled() => {} }
         });
-        let result = async {
+        let result = AssertUnwindSafe(async {
             self.emit(TraceEvent::SessionStart {
                 session: self.0.config.session.clone(),
                 cwd: spec.cwd.clone(),
@@ -276,8 +279,13 @@ impl Runtime {
             })
             .await?;
             self.agent(&cx, spec).await
-        }
-        .await;
+        })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            self.0.panicked.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!("root task panicked"))
+        });
         cx.cancel.cancel();
         loop {
             let leaves =
@@ -286,7 +294,9 @@ impl Runtime {
                 break;
             }
             for leaf in leaves {
-                let _ = leaf.await;
+                if leaf.await.is_err() {
+                    self.0.panicked.store(true, Ordering::SeqCst);
+                }
             }
         }
         self.0.ledger.shutdown(0);
@@ -294,6 +304,9 @@ impl Runtime {
         let _ = timer.await;
         match result {
             Ok(mut outcome) => {
+                if self.0.panicked.load(Ordering::SeqCst) {
+                    outcome.status = Status::Failed;
+                }
                 (outcome.usage_self, outcome.usage_subtree) = self.0.ledger.usage(0);
                 self.emit(TraceEvent::NodeEnd {
                     outcome: outcome.clone(),
@@ -609,21 +622,20 @@ impl Runtime {
                 .ledger
                 .reserve(cx.id, prompt, request.max_tokens)
                 .map_err(|_| CallError::Budget)?;
-            let attempt = reservation.id;
-            let max_tokens = reservation.max_tokens;
+            let mut reservation = ReservationGuard::new(&self.0.ledger, reservation);
+            let attempt = reservation.get().id;
+            let max_tokens = reservation.get().max_tokens;
             if let Err(error) = self
                 .emit(TraceEvent::AttemptStart {
                     node: cx.id,
                     attempt,
                     model: model.to_string(),
-                    reserved: reservation.tokens,
+                    reserved: reservation.get().tokens,
                     max_tokens,
                 })
                 .await
             {
-                self.0
-                    .ledger
-                    .settle(reservation, Charge::Failed(AttemptCharge::Zero));
+                reservation.settle(Charge::Failed(AttemptCharge::Zero));
                 return Err(error.into());
             }
             request.max_tokens = max_tokens;
@@ -632,6 +644,7 @@ impl Runtime {
             let result = if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
                 Err(ProviderError::NotSent("cancelled before dispatch".into()))
             } else {
+                reservation.dispatched = true;
                 tokio::select! {
                     biased;
                     _ = cx.cancel.cancelled() => Err(ProviderError::Cancelled),
@@ -643,7 +656,7 @@ impl Runtime {
                 Ok((resp, _)) => Charge::Usage(resp.usage),
                 Err(e) => Charge::Failed(e.charge()),
             };
-            let settlement = self.0.ledger.settle(reservation, charge);
+            let settlement = reservation.settle(charge);
             drop(permit);
             self.emit(TraceEvent::AttemptEnd {
                 node: cx.id,
@@ -844,7 +857,7 @@ impl NodeCtx {
                 depth: self.depth,
             },
         };
-        let result = async {
+        let result = AssertUnwindSafe(async {
             self.runtime
                 .emit(TraceEvent::NodeStart {
                     node: id,
@@ -860,8 +873,13 @@ impl NodeCtx {
                 })
                 .await?;
             self.runtime.attempts(&cx, &model, request, None).await
-        }
-        .await;
+        })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            self.runtime.0.panicked.store(true, Ordering::SeqCst);
+            Err(CallError::Internal(anyhow::anyhow!("leaf task panicked")))
+        });
         cx.cancel.cancel();
         watcher.abort();
         let _ = watcher.await;
@@ -911,5 +929,43 @@ struct CancelOnDrop(CancellationToken);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
+    }
+}
+
+// Settlement is synchronous so unwinding or dropping an attempt future cannot
+// leave tokens reserved. Once dispatch begins, unknown usage is charged in full.
+struct ReservationGuard<'a> {
+    ledger: &'a Ledger,
+    reservation: Option<Reservation>,
+    dispatched: bool,
+}
+impl<'a> ReservationGuard<'a> {
+    fn new(ledger: &'a Ledger, reservation: Reservation) -> Self {
+        Self {
+            ledger,
+            reservation: Some(reservation),
+            dispatched: false,
+        }
+    }
+    fn get(&self) -> &Reservation {
+        self.reservation.as_ref().expect("unsettled reservation")
+    }
+    fn settle(mut self, charge: Charge) -> Settlement {
+        self.ledger.settle(
+            self.reservation.take().expect("unsettled reservation"),
+            charge,
+        )
+    }
+}
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            let charge = if self.dispatched {
+                AttemptCharge::Reserved
+            } else {
+                AttemptCharge::Zero
+            };
+            self.ledger.settle(reservation, Charge::Failed(charge));
+        }
     }
 }

@@ -305,3 +305,81 @@ async fn concurrent_edits_preserve_both_changes() {
         "ALPHA BETA"
     );
 }
+
+#[tokio::test]
+async fn file_tools_refuse_workspace_escapes_and_symlinks() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("file"), "original").unwrap();
+    symlink(&outside, root.join("linked-parent")).unwrap();
+    symlink(outside.join("file"), root.join("linked-file")).unwrap();
+    for path in [
+        outside.join("file").to_string_lossy().into_owned(),
+        "../outside/file".into(),
+        "nested/../../outside/file".into(),
+        "linked-parent/file".into(),
+        "linked-file".into(),
+    ] {
+        for tool in [
+            Arc::new(WriteFile) as Arc<dyn Tool>,
+            Arc::new(EditFile::default()),
+            Arc::new(ReadFile::new(FileConfig::default())),
+        ] {
+            let input = match tool.spec().name.as_str() {
+                "write_file" => json!({"path":path,"content":"changed"}),
+                "edit_file" => json!({"path":path,"old":"original","new":"changed"}),
+                _ => json!({"path":path}),
+            };
+            let (text, error) = invoke(tool, input, &root).await;
+            assert!(error, "accepted {path}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(outside.join("file")).unwrap(),
+                "original"
+            );
+        }
+    }
+    let (_, error) = invoke(
+        Arc::new(WriteFile),
+        json!({"path":"linked-parent/new/file","content":"escape"}),
+        &root,
+    )
+    .await;
+    assert!(error);
+    assert!(!outside.join("new").exists());
+    let (_, error) = invoke(
+        Arc::new(WriteFile),
+        json!({"path":"nested/../safe","content":"ok"}),
+        &root,
+    )
+    .await;
+    assert!(!error);
+    assert_eq!(std::fs::read_to_string(root.join("safe")).unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn file_tools_refuse_fifos_without_a_writer() {
+    use nix::{sys::stat::Mode, unistd::mkfifo};
+    let dir = tempfile::tempdir().unwrap();
+    mkfifo(&dir.path().join("pipe"), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    for tool in [
+        Arc::new(ReadFile::new(FileConfig::default())) as Arc<dyn Tool>,
+        Arc::new(EditFile::default()),
+        Arc::new(WriteFile),
+    ] {
+        let input = match tool.spec().name.as_str() {
+            "write_file" => json!({"path":"pipe","content":"replacement"}),
+            "edit_file" => json!({"path":"pipe","old":"a","new":"b"}),
+            _ => json!({"path":"pipe"}),
+        };
+        let (text, error) =
+            tokio::time::timeout(Duration::from_secs(2), invoke(tool, input, dir.path()))
+                .await
+                .unwrap();
+        assert!(error);
+        assert!(text.contains("non-regular"), "{text}");
+    }
+}

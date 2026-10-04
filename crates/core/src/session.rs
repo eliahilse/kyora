@@ -169,16 +169,16 @@ pub fn list_with_preview(home: &Path, preview_chars: usize) -> Result<Vec<Sessio
             task_preview: String::new(),
         };
         let mut reader = BufReader::new(File::open(path)?);
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 {
+            if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
-            if !line.ends_with('\n') {
+            if !line.ends_with(b"\n") {
                 break;
             }
-            let record: serde_json::Value = serde_json::from_str(&line)?;
+            let record: serde_json::Value = serde_json::from_slice(&line)?;
             match record["type"].as_str() {
                 Some("session_start") => {
                     summary.start_time = record["ts"].as_str().unwrap_or_default().into()

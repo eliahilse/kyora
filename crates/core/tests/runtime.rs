@@ -839,3 +839,76 @@ async fn total_request_deadline_applies_even_when_deltas_keep_arriving() {
         4
     );
 }
+
+#[tokio::test]
+async fn provider_dispatch_and_stream_panics_settle_root_reservations() {
+    for polling in [false, true] {
+        let provider = StreamProvider(move |_| {
+            assert!(polling, "dispatch panic");
+            Ok(Box::pin(stream::poll_fn(|_| panic!("stream panic"))) as EventStream)
+        });
+        let (rt, rx) = runtime(Arc::new(provider), vec![], Limits::default());
+        assert!(rt.run(spec()).await.is_err());
+        let snapshot = rt.ledger().snapshot(0);
+        assert_eq!(snapshot.reserved, 0);
+        assert!(snapshot.used > 0);
+        assert!(drain(rx).iter().any(|event| matches!(
+            event,
+            TraceEvent::SessionEnd {
+                status: Status::Failed
+            }
+        )));
+    }
+}
+
+#[tokio::test]
+async fn swallowed_leaf_panic_cannot_complete_root_or_leak_reservations() {
+    struct LeafPanicTool;
+    #[async_trait]
+    impl Tool for LeafPanicTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                input_schema: json!({"type":"object"}),
+                ..ToolSpec::default()
+            }
+        }
+        fn effect(&self) -> Effect {
+            Effect::ReadOnly
+        }
+        async fn call(&self, _: Value, cx: ToolCx) -> ToolOutput {
+            assert!(
+                cx.node
+                    .llm(LlmCall::new("panic"), &cx.cancel)
+                    .await
+                    .is_err()
+            );
+            let mut result = ToolOutput::text("handled leaf error");
+            result.final_answer = Some(Answer::Text("done".into()));
+            result
+        }
+    }
+    let provider = FnProvider::new(|req: &ModelRequest| {
+        assert_ne!(req.model, "leaf", "leaf provider panic");
+        Ok(response(vec![call("a")], StopReason::ToolUse))
+    });
+    let (rt, rx) = runtime(
+        Arc::new(provider),
+        vec![Arc::new(LeafPanicTool)],
+        Limits::default(),
+    );
+    let outcome = rt.run(spec()).await.unwrap();
+    assert_eq!(outcome.status, Status::Failed);
+    assert_eq!(rt.ledger().snapshot(0).reserved, 0);
+    assert_eq!(rt.ledger().snapshot(1).reserved, 0);
+    assert!(outcome.usage_subtree.total() > outcome.usage_self.total());
+    let events = drain(rx);
+    assert!(events.iter().any(|event| matches!(event,
+        TraceEvent::NodeEnd { outcome } if outcome.node == 1 && outcome.status == Status::Failed)));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TraceEvent::SessionEnd {
+            status: Status::Failed
+        }
+    )));
+}

@@ -77,7 +77,8 @@ async fn server(response: ResponseTemplate) -> MockServer {
 }
 
 fn sse() -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_raw(TEXT, "text/event-stream")
+    // The fixture stores event lines; terminate its last SSE frame here.
+    ResponseTemplate::new(200).set_body_raw(format!("{TEXT}\n"), "text/event-stream")
 }
 
 #[test]
@@ -136,6 +137,209 @@ fn invalid_configs_report_path_without_source_or_credentials() {
         assert!(error.contains("invalid config"));
         assert_private(&output, &dir);
     }
+}
+
+#[test]
+fn config_diagnostics_never_output_delimiters_or_credential_values() {
+    for (setting, category) in [
+        (format!("effort = '\u{0060}{KEY}'"), "wrong type for effort"),
+        (format!("effort = '\"{KEY}'"), "wrong type for effort"),
+        (
+            format!("effort = \"\\\"{KEY}\\\"\""),
+            "wrong type for effort",
+        ),
+        (format!("effort = \"`\\\"'{KEY}\""), "wrong type for effort"),
+        (format!("'`{KEY}' = 'value'"), "unknown field"),
+        (format!("\"\\\"{KEY}\\\"\" = 'value'"), "unknown field"),
+        (format!("'{KEY}' = 'value'"), "unknown field"),
+        (
+            format!("effort = \"\\\"{KEY}\"unterminated"),
+            "syntax error",
+        ),
+        (format!("model = ['`{KEY}']"), "wrong type for model"),
+        (
+            format!("llm_model = ['\\\"{KEY}']"),
+            "wrong type for llm_model",
+        ),
+        ("providers = 12".into(), "wrong type for providers"),
+        (
+            "[providers]\nanthropic = 12".into(),
+            "wrong type for providers.anthropic",
+        ),
+        (
+            format!("[providers.anthropic]\nbase_url = ['{KEY}']"),
+            "wrong type for providers.anthropic.base_url",
+        ),
+        (
+            format!("[providers.anthropic]\napi_key_env = ['{KEY}']"),
+            "wrong type for providers.anthropic.api_key_env",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let text = if setting.starts_with("[providers.anthropic]\n") {
+            format!("{setting}\napi_key = '{KEY}'")
+        } else if setting.starts_with("providers =") || setting.starts_with("[providers]\n") {
+            // A wrong provider table type cannot also hold a valid credential.
+            setting
+        } else {
+            format!("providers.anthropic.api_key = '{KEY}'\n{setting}")
+        };
+        let path = config(&dir, &text);
+        let output = command(&dir)
+            .args(["run", "task", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("at line ") && error.contains(", column "));
+        assert!(error.contains(category), "expected {category}, got {error}");
+        assert_private(&output, &dir);
+        assert!(output.stdout.is_empty());
+        assert!(!dir.path().join("home/sessions").exists());
+    }
+}
+
+#[test]
+fn invalid_models_report_the_setting_and_winning_source_without_values() {
+    for (setting, flag, variable) in [
+        ("model", "--model", "KYORA_MODEL"),
+        ("llm_model", "--llm-model", "KYORA_LLM_MODEL"),
+    ] {
+        for source in ["config", "env", "flag"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = config(&dir, &format!("{setting} = '/'"));
+            let mut cmd = command(&dir);
+            cmd.args(["run", "task"]);
+            let expected = match source {
+                "flag" => {
+                    cmd.env(variable, "anthropic/env-model").args([flag, "/"]);
+                    format!("flag {flag}")
+                }
+                "env" => {
+                    cmd.env(variable, "/");
+                    format!("environment variable {variable}")
+                }
+                _ => format!("config {} key {setting}", path.display()),
+            };
+            let output = cmd.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!("error: invalid {setting} from {expected}: expected provider/model\n")
+            );
+            assert!(output.stdout.is_empty());
+            assert!(!dir.path().join("home/sessions").exists());
+        }
+    }
+}
+
+#[test]
+fn credential_model_references_are_rejected_before_diagnostics_or_trace() {
+    for (setting, flag, variable) in [
+        ("model", "--model", "KYORA_MODEL"),
+        ("llm_model", "--llm-model", "KYORA_LLM_MODEL"),
+    ] {
+        for source in ["config", "env", "flag"] {
+            for key in [FILE_KEY, KEY] {
+                for reference in [
+                    format!("prefix-{key}/model"),
+                    format!("anthropic/prefix-{key}"),
+                    format!("/{key}"),
+                ] {
+                    for scripted in [false, true] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let model = if source == "config" {
+                            reference.as_str()
+                        } else {
+                            "anthropic/config-model"
+                        };
+                        config(
+                            &dir,
+                            &format!(
+                                "{setting} = '{model}'\n[providers.anthropic]\napi_key = '{FILE_KEY}'\napi_key_env = 'KYORA_TEST_API_KEY'"
+                            ),
+                        );
+                        let mut cmd = command(&dir);
+                        cmd.args(["run", "task", "--json"])
+                            .env("KYORA_TEST_API_KEY", KEY)
+                            // The credential check must precede this diagnostic too.
+                            .env("KYORA_EFFORT", "invalid");
+                        match source {
+                            "env" => {
+                                cmd.env(variable, &reference);
+                            }
+                            "flag" => {
+                                cmd.args([flag, &reference]);
+                            }
+                            _ => {}
+                        }
+                        if scripted {
+                            cmd.arg("--fake-script").arg(
+                                Path::new(env!("CARGO_MANIFEST_DIR"))
+                                    .join("tests/fixtures/final.json"),
+                            );
+                        }
+                        let output = cmd.output().unwrap();
+                        assert_eq!(output.status.code(), Some(2));
+                        assert_eq!(
+                            output.stderr,
+                            b"error: model settings must not contain API credentials\n"
+                        );
+                        assert!(output.stdout.is_empty());
+                        assert_private(&output, &dir);
+                        // No events.jsonl may be created before rejection.
+                        assert!(!dir.path().join("home/sessions").exists());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_environment_key_is_checked_before_other_model_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = command(&dir)
+        .args(["run", "task", "--json", "--model", "/", "--llm-model"])
+        .arg(format!("anthropic/{KEY}"))
+        .arg("--fake-script")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/final.json"))
+        .env("ANTHROPIC_API_KEY", KEY)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        output.stderr,
+        b"error: model settings must not contain API credentials\n"
+    );
+    assert!(output.stdout.is_empty());
+    assert_private(&output, &dir);
+    assert!(!dir.path().join("home").exists());
+}
+
+#[tokio::test]
+async fn base_url_flag_overrides_environment_and_config() {
+    let server = server(sse()).await;
+    let dir = tempfile::tempdir().unwrap();
+    config(
+        &dir,
+        "[providers.anthropic]\nbase_url = 'http://127.0.0.1:1'",
+    );
+    let mut cmd = command(&dir);
+    cmd.args(["run", "task", "--base-url", &server.uri()])
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:2")
+        .env("ANTHROPIC_API_KEY", KEY);
+    let output = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, "Hello 世界\n".as_bytes());
+    assert_private(&output, &dir);
 }
 
 #[cfg(unix)]

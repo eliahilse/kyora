@@ -49,35 +49,21 @@ impl Config {
         file.read_to_string(&mut input)
             .with_context(|| format!("read {}", path.display()))?;
         let config: Self = toml::from_str(&input).map_err(|error: toml::de::Error| {
-            // Source excerpts and quoted diagnostic values can contain credentials,
-            // including in malformed TOML. Retain the error category and location.
-            let mut message = String::new();
-            let mut quote = None;
-            for ch in error.message().chars() {
-                match quote {
-                    Some(end) if ch == end => quote = None,
-                    Some(_) => {}
-                    None if ch == '`' || ch == '"' || ch == '\'' => {
-                        quote = Some(ch);
-                        message.push_str("[redacted]");
-                    }
-                    None => message.push(ch),
-                }
-            }
-            let line = error
-                .span()
-                .map(|span| {
-                    input
-                        .get(..span.start)
-                        .unwrap_or(&input)
-                        .bytes()
-                        .filter(|&b| b == b'\n')
-                        .count()
-                        + 1
-                })
-                .map(|line| format!(" at line {line}"))
-                .unwrap_or_default();
-            anyhow::anyhow!("invalid config {}{line}: {message}", path.display())
+            // Only structured data and source offsets are inspected. Parser and
+            // deserializer messages, excerpts, values and unknown names are never output.
+            let category = toml::from_str::<toml::Value>(&input)
+                .ok()
+                .and_then(|value| diagnostic_category(&value, ""))
+                .unwrap_or_else(|| "syntax error".into());
+            let prefix = input
+                .get(..error.span().map_or(0, |span| span.start))
+                .unwrap_or("");
+            let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+            let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            anyhow::anyhow!(
+                "invalid config {} at line {line}, column {column}: {category}",
+                path.display()
+            )
         })?;
         #[cfg(unix)]
         if config.providers.anthropic.api_key.is_some() {
@@ -94,7 +80,23 @@ impl Config {
         Ok(config)
     }
 
-    pub fn anthropic(&self, path: &Path) -> Result<AnthropicConfig> {
+    /// Refuses credentials copied into resolved references before parsing or output.
+    pub fn reject_model_credentials(&self, references: &[&str]) -> Result<()> {
+        let settings = &self.providers.anthropic;
+        let selected = std::env::var(settings.api_key_env.as_deref().unwrap_or(API_KEY_ENV)).ok();
+        for key in [settings.api_key.as_deref(), selected.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|key| !key.is_empty())
+        {
+            if references.iter().any(|value| value.contains(key)) {
+                bail!("model settings must not contain API credentials");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn anthropic(&self, path: &Path, base_url: Option<&str>) -> Result<AnthropicConfig> {
         let settings = &self.providers.anthropic;
         let variable = settings.api_key_env.as_deref().unwrap_or(API_KEY_ENV);
         let key = std::env::var(variable)
@@ -106,13 +108,46 @@ impl Config {
                 path.display()
             ))?;
         let mut config = AnthropicConfig::new(key);
-        if let Some(url) = &settings.base_url {
-            config.base_url.clone_from(url);
-        }
-        if let Some(url) = env("ANTHROPIC_BASE_URL")? {
+        let url = match base_url {
+            Some(url) => Some(url.to_owned()),
+            None => env("ANTHROPIC_BASE_URL")?.or_else(|| settings.base_url.clone()),
+        };
+        if let Some(url) = url {
             config.base_url = url;
         }
         Ok(config)
+    }
+}
+
+// Paths returned here are schema literals, never names read from the file.
+fn diagnostic_category(value: &toml::Value, setting: &str) -> Option<String> {
+    if matches!(setting, "" | "providers" | "providers.anthropic") {
+        let Some(table) = value.as_table() else {
+            return Some(format!("wrong type for {setting}"));
+        };
+        for (key, value) in table {
+            let path = match (setting, key.as_str()) {
+                ("", "model") => "model",
+                ("", "llm_model") => "llm_model",
+                ("", "effort") => "effort",
+                ("", "providers") => "providers",
+                ("providers", "anthropic") => "providers.anthropic",
+                ("providers.anthropic", "api_key") => "providers.anthropic.api_key",
+                ("providers.anthropic", "api_key_env") => "providers.anthropic.api_key_env",
+                ("providers.anthropic", "base_url") => "providers.anthropic.base_url",
+                _ => return Some("unknown field".into()),
+            };
+            if let Some(category) = diagnostic_category(value, path) {
+                return Some(category);
+            }
+        }
+        None
+    } else if value.as_str().is_none()
+        || (setting == "effort" && value.clone().try_into::<Effort>().is_err())
+    {
+        Some(format!("wrong type for {setting}"))
+    } else {
+        None
     }
 }
 
@@ -126,17 +161,47 @@ pub fn env(name: &str) -> Result<Option<String>> {
 }
 
 pub fn model(
-    flag: Option<defaults::ModelRef>,
-    variable: &str,
+    flag: Option<String>,
+    variable: &'static str,
     configured: Option<&str>,
     fallback: &str,
-) -> Result<defaults::ModelRef> {
-    if let Some(model) = flag {
-        return Ok(model);
+    path: &Path,
+    setting: &'static str,
+) -> Result<ModelSetting> {
+    let (value, source) = if let Some(value) = flag {
+        (value, format!("flag --{}", setting.replace('_', "-")))
+    } else if let Some(value) = env(variable)? {
+        (value, format!("environment variable {variable}"))
+    } else if let Some(value) = configured {
+        (
+            value.to_owned(),
+            format!("config {} key {setting}", path.display()),
+        )
+    } else {
+        (fallback.to_owned(), "built-in default".into())
+    };
+    Ok(ModelSetting {
+        value,
+        setting,
+        source,
+    })
+}
+
+/// A winning model setting, kept unparsed until credential checks finish.
+pub struct ModelSetting {
+    pub value: String,
+    setting: &'static str,
+    source: String,
+}
+
+impl ModelSetting {
+    pub fn parse(&self) -> Result<defaults::ModelRef> {
+        self.value.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid {} from {}: expected provider/model",
+                self.setting,
+                self.source
+            )
+        })
     }
-    env(variable)?
-        .as_deref()
-        .or(configured)
-        .unwrap_or(fallback)
-        .parse()
 }

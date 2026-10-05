@@ -58,16 +58,19 @@ impl From<Reasoning> for Effort {
 }
 #[derive(Parser)]
 #[command(
-    after_help = "Settings: flags override KYORA_MODEL, KYORA_LLM_MODEL and KYORA_EFFORT, then $KYORA_HOME/config.toml, then built-in defaults.\nAnthropic credentials: configured api_key_env (default ANTHROPIC_API_KEY), then providers.anthropic.api_key. Config files containing api_key require chmod 600. ANTHROPIC_BASE_URL overrides providers.anthropic.base_url."
+    after_help = "Settings: flags override KYORA_MODEL, KYORA_LLM_MODEL and KYORA_EFFORT, then $KYORA_HOME/config.toml, then built-in defaults.\nAnthropic credentials: configured api_key_env (default ANTHROPIC_API_KEY), then providers.anthropic.api_key. Config files containing api_key require chmod 600. Base URL: --base-url overrides ANTHROPIC_BASE_URL, then providers.anthropic.base_url, then the provider default."
 )]
 struct Run {
     task: String,
     /// Root model as provider/model (default: built-in root model).
     #[arg(short, long, value_name = "PROVIDER/MODEL")]
-    model: Option<ModelRef>,
+    model: Option<String>,
     /// Default model for leaf completions as provider/model.
     #[arg(long, value_name = "PROVIDER/MODEL")]
-    llm_model: Option<ModelRef>,
+    llm_model: Option<String>,
+    /// Anthropic API origin, including an optional proxy path prefix.
+    #[arg(long, value_name = "URL")]
+    base_url: Option<String>,
     /// Reasoning effort (unset uses the provider default).
     #[arg(long, value_enum)]
     effort: Option<Reasoning>,
@@ -103,13 +106,16 @@ fn provider(
     name: &str,
     config: &config::Config,
     path: &std::path::Path,
+    base_url: Option<&str>,
     scripted: Option<&Arc<dyn ModelProvider>>,
 ) -> Result<Arc<dyn ModelProvider>> {
     if let Some(scripted) = scripted {
         return Ok(scripted.clone());
     }
     match name {
-        "anthropic" => Ok(Arc::new(AnthropicProvider::new(config.anthropic(path)?)?)),
+        "anthropic" => Ok(Arc::new(AnthropicProvider::new(
+            config.anthropic(path, base_url)?,
+        )?)),
         _ => bail!("unknown provider {name}; supported providers: anthropic"),
     }
 }
@@ -119,19 +125,26 @@ struct Resolved {
     effort: Option<Effort>,
 }
 impl Resolved {
-    fn new(run: &mut Run, config: &config::Config) -> Result<Self> {
+    fn new(run: &mut Run, config: &config::Config, path: &std::path::Path) -> Result<Self> {
         let model = config::model(
             run.model.take(),
             "KYORA_MODEL",
             config.model.as_deref(),
             defaults::DEFAULT_MODEL,
+            path,
+            "model",
         )?;
         let llm_model = config::model(
             run.llm_model.take(),
             "KYORA_LLM_MODEL",
             config.llm_model.as_deref(),
             defaults::DEFAULT_LLM_MODEL,
+            path,
+            "llm_model",
         )?;
+        config.reject_model_credentials(&[&model.value, &llm_model.value])?;
+        let model = model.parse()?;
+        let llm_model = llm_model.parse()?;
         let effort = if let Some(effort) = run.effort {
             Some(effort.into())
         } else if let Some(value) = config::env("KYORA_EFFORT")? {
@@ -218,7 +231,7 @@ async fn execute(mut run: Run) -> u8 {
     let prepared = (|| {
         let path = defaults::home(None)?.join(config::FILE_NAME);
         let config = config::Config::load(&path)?;
-        let resolved = Resolved::new(&mut run, &config)?;
+        let resolved = Resolved::new(&mut run, &config, &path)?;
         Ok::<_, anyhow::Error>((prepare(&run)?, resolved, config, path))
     })();
     let ((limits, cwd, toolset), resolved, config, path) = match prepared {
@@ -301,7 +314,13 @@ async fn execute_runtime(
         if !providers.contains_key(name) {
             providers.insert(
                 name.clone(),
-                provider(name, &config, &config_path, scripted.as_ref())?,
+                provider(
+                    name,
+                    &config,
+                    &config_path,
+                    run.base_url.as_deref(),
+                    scripted.as_ref(),
+                )?,
             );
         }
     }
@@ -441,7 +460,7 @@ mod tests {
             let config = if layer == "default" {
                 config::Config::default()
             } else {
-                toml::from_str("model = 'anthropic/config-root'\nllm_model = 'anthropic/config-leaf'\neffort = 'low'").unwrap()
+                toml::from_str("model = 'anthropic/config-root'\nllm_model = 'anthropic/config-leaf'\neffort = 'low'\n[providers.anthropic]\nbase_url = 'http://127.0.0.1/config'").unwrap()
             };
             let mut args = vec!["kyora", "run", "task"];
             if layer == "flag" {
@@ -452,12 +471,29 @@ mod tests {
                     "anthropic/flag-leaf",
                     "--effort",
                     "max",
+                    "--base-url",
+                    "http://127.0.0.1/flag",
                 ]);
             }
             let Some(Command::Run(mut run)) = Cli::parse_from(args).command else {
                 panic!("expected run")
             };
-            let resolved = Resolved::new(&mut run, &config).unwrap();
+            let resolved =
+                Resolved::new(&mut run, &config, std::path::Path::new(config::FILE_NAME)).unwrap();
+            let provider_config = config
+                .anthropic(
+                    std::path::Path::new(config::FILE_NAME),
+                    run.base_url.as_deref(),
+                )
+                .unwrap();
+            assert_eq!(
+                provider_config.base_url,
+                if layer == "default" {
+                    kyora_providers::anthropic::AnthropicConfig::new("test-only-key").base_url
+                } else {
+                    format!("http://127.0.0.1/{layer}")
+                }
+            );
             if layer == "default" {
                 assert_eq!(resolved.model.to_string(), defaults::DEFAULT_MODEL);
                 assert_eq!(resolved.llm_model.to_string(), defaults::DEFAULT_LLM_MODEL);
@@ -492,12 +528,15 @@ mod tests {
                 .env("KYORA_HOME", home.path())
                 .env_remove("KYORA_MODEL")
                 .env_remove("KYORA_LLM_MODEL")
-                .env_remove("KYORA_EFFORT");
+                .env_remove("KYORA_EFFORT")
+                .env_remove("ANTHROPIC_BASE_URL")
+                .env("ANTHROPIC_API_KEY", "test-only-key");
             if layer == "env" || layer == "flag" {
                 command
                     .env("KYORA_MODEL", "anthropic/env-root")
                     .env("KYORA_LLM_MODEL", "anthropic/env-leaf")
-                    .env("KYORA_EFFORT", "high");
+                    .env("KYORA_EFFORT", "high")
+                    .env("ANTHROPIC_BASE_URL", "http://127.0.0.1/env");
             }
             let output = command.output().unwrap();
             assert!(

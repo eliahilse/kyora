@@ -552,6 +552,72 @@ async fn dropping_leaf_wait_on_tool_cancellation_still_settles_before_root_end()
 }
 
 struct LeafTool;
+struct CappedProvider<P>(P);
+#[async_trait]
+impl<P: ModelProvider> ModelProvider for CappedProvider<P> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    async fn model_info(&self, model: &str) -> Result<ModelInfo, ProviderError> {
+        Ok(ModelInfo {
+            id: model.into(),
+            max_output_tokens: Some(128),
+            ..ModelInfo::default()
+        })
+    }
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        assert_eq!(request.max_tokens, 128);
+        self.0.stream(request, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn model_output_cap_applies_to_agents_leaves_and_truncated_input_retry() {
+    let leaf_calls = Arc::new(AtomicUsize::new(0));
+    let saved = leaf_calls.clone();
+    let provider = FnProvider::new(move |req: &ModelRequest| {
+        if req.metadata.node_id.as_deref() == Some("1") {
+            saved.fetch_add(1, Ordering::SeqCst);
+            Ok(response(vec![text("leaf")], StopReason::EndTurn))
+        } else if req.messages.len() == 1 {
+            Ok(response(vec![call("a")], StopReason::ToolUse))
+        } else {
+            Ok(response(vec![text("done")], StopReason::EndTurn))
+        }
+    });
+    let (rt, _) = runtime(
+        Arc::new(CappedProvider(provider)),
+        vec![Arc::new(LeafTool)],
+        Limits::default(),
+    );
+    assert_eq!(rt.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(leaf_calls.load(Ordering::SeqCst), 1);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saved = calls.clone();
+    let provider = StreamProvider(move |_: ModelRequest| {
+        saved.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::iter(raw_events(
+            "{\"text\":",
+            StopReason::MaxTokens,
+        ))) as EventStream)
+    });
+    let (rt, _) = runtime(
+        Arc::new(CappedProvider(provider)),
+        vec![],
+        Limits {
+            max_turns: 1,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(rt.run(spec()).await.unwrap().status, Status::MaxTurns);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 #[async_trait]
 impl Tool for LeafTool {
     fn spec(&self) -> ToolSpec {

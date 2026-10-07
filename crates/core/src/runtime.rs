@@ -687,11 +687,21 @@ impl Runtime {
                         }
                     }
                 };
-                // An answer that breaks the output contract does not finish the node.
+                // An answer that breaks the output contract does not finish the node, and
+                // neither does one committed after the node was stopped: a tool that was
+                // cancelled while running cannot turn that into a completion.
                 if final_answer.is_none()
                     && let Some(committed) = result.final_answer.take()
                 {
-                    match self.accept(settings.output.as_ref(), committed) {
+                    let accepted = if cx.stopped() || Instant::now() >= cx.deadline {
+                        Err(match cx.cancel_status() {
+                            Status::Timeout => "the agent had timed out".to_string(),
+                            _ => "the agent was cancelled".to_string(),
+                        })
+                    } else {
+                        self.accept(settings.output.as_ref(), committed)
+                    };
+                    match accepted {
                         Ok(committed) => final_answer = Some(committed),
                         Err(reason) => {
                             result.is_error = true;

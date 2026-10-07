@@ -234,21 +234,82 @@ async fn execute(mut run: Run) -> u8 {
         let resolved = Resolved::new(&mut run, &config, &path)?;
         Ok::<_, anyhow::Error>((prepare(&run)?, resolved, config, path))
     })();
-    let ((limits, cwd, toolset), resolved, config, path) = match prepared {
+    let ((limits, cwd, builtins), resolved, config, path) = match prepared {
         Ok(p) => p,
         Err(error) => {
             eprintln!("error: {error:#}");
             return 2;
         }
     };
-    let result = execute_runtime(run, resolved, config, path, limits, cwd, toolset).await;
-    match result {
-        Ok(code) => code,
+    let providers = match providers(&run, &resolved, &config, &path) {
+        Ok(providers) => providers,
         Err(error) => {
             eprintln!("error: {error:#}");
-            1
+            return 1;
         }
+    };
+    // Servers none of whose tools `--tools` could select are not started.
+    let mcp = kyora_mcp::McpConfig {
+        servers: config
+            .mcp
+            .servers
+            .iter()
+            .filter(|(name, server)| {
+                let prefix = format!("mcp__{name}__");
+                server.enabled
+                    && run
+                        .tools
+                        .as_ref()
+                        .is_none_or(|tools| tools.iter().any(|tool| tool.starts_with(&prefix)))
+            })
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .collect(),
+    };
+    let (servers, failures) = if !mcp.servers.is_empty() {
+        // Ctrl-C drops the unfinished start, which kills every server it spawned.
+        tokio::select! {
+            started = kyora_mcp::Servers::start(&mcp, &cwd) => started,
+            _ = tokio::signal::ctrl_c() => return 130,
+        }
+    } else {
+        (kyora_mcp::Servers::default(), Vec::new())
+    };
+    for failure in failures {
+        eprintln!("warning: {failure:#}; continuing without its tools");
     }
+    let servers = Arc::new(servers);
+    let toolsets = kyora_mcp::McpToolsets::new(&builtins, servers.clone());
+    // `--tools` may name MCP tools, so it is checked once the servers are up.
+    let selection = ToolSelection(run.tools.clone());
+    let code = match toolsets
+        .snapshot()
+        .and_then(|tools| tools.select(&selection))
+    {
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            2
+        }
+        Ok(_) => {
+            let tools = Tools {
+                factory: toolsets,
+                selection,
+            };
+            match execute_runtime(run, resolved, providers, limits, cwd, tools).await {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("error: {error:#}");
+                    1
+                }
+            }
+        }
+    };
+    servers.shutdown().await;
+    code
+}
+/// The node toolset factory and the root's `--tools` selection.
+struct Tools {
+    factory: kyora_mcp::McpToolsets,
+    selection: ToolSelection,
 }
 fn prepare(run: &Run) -> Result<(Limits, PathBuf, kyora_core::Toolset)> {
     let mut limits = Limits::default();
@@ -287,19 +348,15 @@ fn prepare(run: &Run) -> Result<(Limits, PathBuf, kyora_core::Toolset)> {
         ),
         ..kyora_tools::defaults::FileConfig::default()
     };
-    let tools = kyora_tools::toolset(kyora_tools::ShellConfig::default(), files)?
-        .select(&ToolSelection(run.tools.clone()))?;
+    let tools = kyora_tools::toolset(kyora_tools::ShellConfig::default(), files)?;
     Ok((limits, cwd, tools))
 }
-async fn execute_runtime(
-    run: Run,
-    resolved: Resolved,
-    config: config::Config,
-    config_path: PathBuf,
-    limits: Limits,
-    cwd: PathBuf,
-    tools: kyora_core::Toolset,
-) -> Result<u8> {
+fn providers(
+    run: &Run,
+    resolved: &Resolved,
+    config: &config::Config,
+    config_path: &std::path::Path,
+) -> Result<BTreeMap<String, Arc<dyn ModelProvider>>> {
     let scripted: Option<Arc<dyn ModelProvider>> = run
         .fake_script
         .as_ref()
@@ -316,14 +373,24 @@ async fn execute_runtime(
                 name.clone(),
                 provider(
                     name,
-                    &config,
-                    &config_path,
+                    config,
+                    config_path,
                     run.base_url.as_deref(),
                     scripted.as_ref(),
                 )?,
             );
         }
     }
+    Ok(providers)
+}
+async fn execute_runtime(
+    run: Run,
+    resolved: Resolved,
+    providers: BTreeMap<String, Arc<dyn ModelProvider>>,
+    limits: Limits,
+    cwd: PathBuf,
+    tools: Tools,
+) -> Result<u8> {
     let store = if run.no_session {
         None
     } else {
@@ -335,7 +402,7 @@ async fn execute_runtime(
     let session = store.as_ref().map_or_else(uuid_id, |s| s.id.clone());
     let runtime = Runtime::new(RuntimeConfig {
         providers,
-        toolsets: Arc::new(tools),
+        toolsets: Arc::new(tools.factory),
         limits,
         retry: RetryPolicy::default(),
         llm_model: resolved.llm_model,
@@ -362,6 +429,7 @@ async fn execute_runtime(
             control.cancel();
             if last.is_some_and(|then| now.duration_since(then) <= defaults::INTERRUPT_WINDOW) {
                 kyora_tools::cancel_processes();
+                kyora_mcp::kill_servers();
                 std::process::exit(130);
             }
             last = Some(now);
@@ -369,6 +437,7 @@ async fn execute_runtime(
     });
     let mut spec = AgentSpec::new(run.task, cwd);
     spec.model = resolved.model;
+    spec.tools = tools.selection;
     spec.options = RequestOptions {
         effort: resolved.effort,
         thinking_display: Some(if run.show_thinking {

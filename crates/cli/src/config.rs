@@ -19,6 +19,7 @@ pub struct Config {
     pub llm_model: Option<String>,
     pub effort: Option<Effort>,
     pub providers: Providers,
+    pub mcp: kyora_mcp::McpConfig,
 }
 
 #[derive(Default, Deserialize)]
@@ -65,6 +66,10 @@ impl Config {
                 path.display()
             )
         })?;
+        config
+            .mcp
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid config {}: {error}", path.display()))?;
         #[cfg(unix)]
         if config.providers.anthropic.api_key.is_some() {
             use std::os::unix::fs::PermissionsExt;
@@ -121,7 +126,10 @@ impl Config {
 
 // Paths returned here are schema literals, never names read from the file.
 fn diagnostic_category(value: &toml::Value, setting: &str) -> Option<String> {
-    if matches!(setting, "" | "providers" | "providers.anthropic") {
+    if matches!(
+        setting,
+        "" | "providers" | "providers.anthropic" | "mcp" | "mcp.servers" | "mcp.servers.*"
+    ) {
         let Some(table) = value.as_table() else {
             return Some(format!("wrong type for {setting}"));
         };
@@ -131,10 +139,28 @@ fn diagnostic_category(value: &toml::Value, setting: &str) -> Option<String> {
                 ("", "llm_model") => "llm_model",
                 ("", "effort") => "effort",
                 ("", "providers") => "providers",
+                ("", "mcp") => "mcp",
                 ("providers", "anthropic") => "providers.anthropic",
                 ("providers.anthropic", "api_key") => "providers.anthropic.api_key",
                 ("providers.anthropic", "api_key_env") => "providers.anthropic.api_key_env",
                 ("providers.anthropic", "base_url") => "providers.anthropic.base_url",
+                ("mcp", "servers") => "mcp.servers",
+                // Server names are user data, so all entries share one path.
+                ("mcp.servers", _) => "mcp.servers.*",
+                ("mcp.servers.*", "command") => "mcp.servers.*.command",
+                ("mcp.servers.*", "args") => "mcp.servers.*.args",
+                ("mcp.servers.*", "env") => "mcp.servers.*.env",
+                ("mcp.servers.*", "env_vars") => "mcp.servers.*.env_vars",
+                ("mcp.servers.*", "cwd") => "mcp.servers.*.cwd",
+                ("mcp.servers.*", "url") => "mcp.servers.*.url",
+                ("mcp.servers.*", "bearer_token_env") => "mcp.servers.*.bearer_token_env",
+                ("mcp.servers.*", "headers") => "mcp.servers.*.headers",
+                ("mcp.servers.*", "env_headers") => "mcp.servers.*.env_headers",
+                ("mcp.servers.*", "startup_timeout_s") => "mcp.servers.*.startup_timeout_s",
+                ("mcp.servers.*", "tool_timeout_s") => "mcp.servers.*.tool_timeout_s",
+                ("mcp.servers.*", "allow_tools") => "mcp.servers.*.allow_tools",
+                ("mcp.servers.*", "deny_tools") => "mcp.servers.*.deny_tools",
+                ("mcp.servers.*", "enabled") => "mcp.servers.*.enabled",
                 _ => return Some("unknown field".into()),
             };
             if let Some(category) = diagnostic_category(value, path) {
@@ -142,12 +168,24 @@ fn diagnostic_category(value: &toml::Value, setting: &str) -> Option<String> {
             }
         }
         None
-    } else if value.as_str().is_none()
-        || (setting == "effort" && value.clone().try_into::<Effort>().is_err())
-    {
-        Some(format!("wrong type for {setting}"))
     } else {
-        None
+        let strings = |items: &toml::value::Array| items.iter().all(toml::Value::is_str);
+        let valid = match setting {
+            "effort" => value.clone().try_into::<Effort>().is_ok(),
+            "mcp.servers.*.args"
+            | "mcp.servers.*.env_vars"
+            | "mcp.servers.*.allow_tools"
+            | "mcp.servers.*.deny_tools" => value.as_array().is_some_and(strings),
+            "mcp.servers.*.env" | "mcp.servers.*.headers" | "mcp.servers.*.env_headers" => value
+                .as_table()
+                .is_some_and(|table| table.values().all(toml::Value::is_str)),
+            "mcp.servers.*.startup_timeout_s" | "mcp.servers.*.tool_timeout_s" => {
+                value.is_float() || value.is_integer()
+            }
+            "mcp.servers.*.enabled" => value.is_bool(),
+            _ => value.is_str(),
+        };
+        (!valid).then(|| format!("wrong type for {setting}"))
     }
 }
 

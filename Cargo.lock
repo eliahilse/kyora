@@ -1074,6 +1074,7 @@ dependencies = [
  "humantime",
  "insta",
  "kyora-core",
+ "kyora-mcp",
  "kyora-protocol",
  "kyora-providers",
  "kyora-tools",

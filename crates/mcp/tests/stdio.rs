@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 const SERVER: &str = env!("CARGO_BIN_EXE_kyora-mcp-test-server");
 const STDIO_SECRET: &str = "test-only-stdio-secret";
+/// Escaped differently inside JSON text than on its own.
+const QUOTED_SECRET: &str = "quoted\"secret";
 
 fn server_config(log: &Path, settings: &[(&str, &str)]) -> ServerConfig {
     let mut env = BTreeMap::from([("KYORA_MCP_TEST_LOG".to_owned(), log.display().to_string())]);
@@ -41,6 +43,7 @@ fn environment() -> Vec<(OsString, OsString)> {
         ("KYORA_TEST_UNLISTED", "dropped"),
         ("KYORA_MCP_TEST_SECRET", STDIO_SECRET),
         ("KYORA_TEST_SHORT", "abc"),
+        ("KYORA_TEST_QUOTED", QUOTED_SECRET),
     ] {
         env.push((name.into(), value.into()));
     }
@@ -344,6 +347,27 @@ fn described_schema() -> Value {
             },
         },
     })
+}
+
+#[tokio::test]
+async fn credentials_are_redacted_inside_json_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = server_config(&dir.path().join("log.jsonl"), &[]);
+    config.env_vars = vec!["KYORA_TEST_QUOTED".into()];
+    let server = start(dir.path(), &config).await;
+    let cancel = CancellationToken::new();
+    let structured = server
+        .call("structured", json!({"password": QUOTED_SECRET}), &cancel)
+        .await;
+    let embedded = json!({"password": QUOTED_SECRET}).to_string();
+    let echoed = server
+        .call("echo", json!({"text": embedded}), &cancel)
+        .await;
+    for output in [structured, echoed] {
+        let text = output.text_content();
+        assert_eq!(text, r#"{"password":"[redacted]"}"#);
+    }
+    server.shutdown().await;
 }
 
 #[tokio::test]

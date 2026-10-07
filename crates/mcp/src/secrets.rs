@@ -43,6 +43,12 @@ impl Secrets {
                 }
                 continue;
             }
+            // Text that embeds JSON carries the escaped form, as in "pa\"ss".
+            let escaped = serde_json::to_string(&value).expect("strings serialize");
+            let escaped = &escaped[1..escaped.len() - 1];
+            if escaped != value {
+                values.push(escaped.to_owned());
+            }
             values.push(value);
         }
         values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
@@ -177,6 +183,20 @@ mod tests {
         let warnings = secrets.warnings();
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].contains("V0") && !warnings.concat().contains("abcde"));
+    }
+
+    #[test]
+    fn json_escaped_values_are_redacted_in_text() {
+        let secrets = secrets(&["pa\"ss\\word"]);
+        let json = serde_json::to_string(&serde_json::json!({"password": "pa\"ss\\word"}));
+        assert_eq!(
+            secrets.redact(&json.unwrap()),
+            r#"{"password":"[redacted]"}"#
+        );
+        assert_eq!(secrets.redact("raw pa\"ss\\word"), "raw [redacted]");
+        let mut value = serde_json::json!({"nested": ["pa\"ss\\word"]});
+        secrets.redact_json(&mut value);
+        assert_eq!(value, serde_json::json!({"nested": ["[redacted]"]}));
     }
 
     #[test]

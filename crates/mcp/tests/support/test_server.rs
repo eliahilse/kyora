@@ -129,11 +129,18 @@ fn main() {
                         json!({"content": [{"type": "text", "text": "boom"}], "isError": true}),
                     ),
                     "mixed" => reply(&out, &id, mixed()),
-                    "structured" => reply(
-                        &out,
-                        &id,
-                        json!({"content": [], "structuredContent": {"answer": 42}}),
-                    ),
+                    "structured" => {
+                        // Echoes non-empty arguments as structured content.
+                        let structured = match arguments.as_object() {
+                            Some(map) if !map.is_empty() => arguments.clone(),
+                            _ => json!({"answer": 42}),
+                        };
+                        reply(
+                            &out,
+                            &id,
+                            json!({"content": [], "structuredContent": structured}),
+                        );
+                    }
                     "look" | "dotted.name" => reply(&out, &id, text("looked")),
                     "slow" | "slow_read" => {
                         let out = out.clone();

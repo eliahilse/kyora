@@ -120,7 +120,12 @@ impl Connection {
         ));
         match self.request(request, cancel, deadline).await {
             Ok(Ok(result)) => match serde_json::to_value(&result) {
-                Ok(value) => render_result(&value),
+                Ok(mut value) => {
+                    // Redact decoded strings: once rendered, structured content is
+                    // JSON text in which a value may appear only in escaped form.
+                    self.secrets.redact_json(&mut value);
+                    render_result(&value)
+                }
                 Err(error) => ToolOutput::error(format!("invalid tool result: {error}")),
             },
             Ok(Err(error)) => ToolOutput::error(self.describe(error)),

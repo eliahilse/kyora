@@ -15,7 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Linux jobs run on a fresh kyora VM (kyora-2x4-apac: 2 vCPU / 4 GB, in apac, else us). Fork pull
+# Linux jobs run on a fresh kyora VM (kyora-2x4-apac: 2 vCPU / 4 GB, in apac only). Fork pull
 # requests stay on GitHub-hosted runners, so they never wait for a runner that won't come. macOS has
 # no kyora runner and stays on GitHub's, as does the ci-ok gate (one shell test, no VM needed).
 

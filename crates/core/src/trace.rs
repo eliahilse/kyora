@@ -230,6 +230,44 @@ impl TraceSink {
             join: tokio::sync::Mutex::new(None),
         }))
     }
+    /// Creates a durable sink over caller-provided storage. `store` receives each
+    /// persistent record in sequence order and returns its acknowledgement; `emit`
+    /// for that event returns, with the acknowledgement's result, once it completes.
+    /// Acknowledgements may complete in any order, so storage can confirm records
+    /// asynchronously. Records are broadcast to subscribers as they are handed over.
+    pub fn with_store<F, Fut>(mut store: F) -> Self
+    where
+        F: FnMut(TraceRecord) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let (live, _) = broadcast::channel(defaults::TRACE_CAPACITY);
+        let (writer, mut rx) = mpsc::channel(defaults::WRITER_CAPACITY);
+        let broadcast = live.clone();
+        let join = tokio::spawn(async move {
+            let mut seq = 0;
+            let mut acks = tokio::task::JoinSet::new();
+            while let Some(command) = rx.recv().await {
+                while acks.try_join_next().is_some() {}
+                match command {
+                    WriteCommand::Event(event, ack) => {
+                        let record = TraceRecord::new(*event, Some(seq));
+                        seq += 1;
+                        let _ = broadcast.send(record.clone());
+                        let stored = store(record);
+                        acks.spawn(async move {
+                            let _ = ack.send(stored.await);
+                        });
+                    }
+                    WriteCommand::Finish(ack) => {
+                        while acks.join_next().await.is_some() {}
+                        let _ = ack.send(Ok(()));
+                        break;
+                    }
+                }
+            }
+        });
+        Self::writer(live, writer, join)
+    }
     pub(crate) fn writer(
         live: broadcast::Sender<TraceRecord>,
         writer: mpsc::Sender<WriteCommand>,

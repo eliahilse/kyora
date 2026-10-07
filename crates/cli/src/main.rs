@@ -244,13 +244,6 @@ async fn execute(mut run: Run) -> u8 {
             return 2;
         }
     };
-    let providers = match providers(&run, &resolved, &config, &path) {
-        Ok(providers) => providers,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            return 1;
-        }
-    };
     // Servers none of whose tools `--tools` could select are not started.
     let mcp = kyora_mcp::McpConfig {
         servers: config
@@ -293,17 +286,20 @@ async fn execute(mut run: Run) -> u8 {
     }
     let servers = Arc::new(servers);
     let toolsets = kyora_mcp::McpToolsets::new(&builtins, servers.clone());
-    // `--tools` may name MCP tools, so it is checked once the servers are up.
+    // `--tools` may name MCP tools, so it is checked once the servers are up, and
+    // before providers are built, so a usage error wins over a missing credential.
     let selection = ToolSelection(run.tools.clone());
-    let code = match toolsets
+    let checked = toolsets
         .snapshot()
         .and_then(|tools| tools.select(&selection))
-    {
-        Err(error) => {
+        .map_err(|error| (error, 2))
+        .and_then(|_| providers(&run, &resolved, &config, &path).map_err(|error| (error, 1)));
+    let code = match checked {
+        Err((error, code)) => {
             eprintln!("error: {error:#}");
-            2
+            code
         }
-        Ok(_) => {
+        Ok(providers) => {
             let tools = Tools {
                 factory: toolsets,
                 selection,

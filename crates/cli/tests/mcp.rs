@@ -126,6 +126,25 @@ fn tools_flag_selects_mcp_tools_and_rejects_unavailable_ones() {
 }
 
 #[test]
+fn an_unknown_mcp_tool_is_a_usage_error_before_provider_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    configure(&dir);
+    // No fake script and no credential: building the provider would fail with 1.
+    let output = command(&dir)
+        .args(["run", "task", "--tools", "mcp__py__missing", "-C"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unknown tool: mcp__py__missing"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("home/sessions").exists());
+}
+
+#[test]
 fn a_second_ctrl_c_during_server_shutdown_kills_the_servers_and_exits() {
     use nix::{
         sys::signal::{Signal, kill},

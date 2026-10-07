@@ -16,7 +16,7 @@ Every agent node (the root and each child agent) owns one mailbox. Leaf `llm` ca
 
 A mailbox holds at most `Limits::mailbox_capacity` undelivered plain messages (default 64). A send to a full mailbox fails at once with `MailboxFull`: nothing is queued, nothing already queued is dropped, and the sender never blocks. Terminal notices of children are not counted against the bound. Each child produces exactly one, so the agent limits already bound them, and a result is never refused because a chatty sibling filled the mailbox.
 
-Bodies are text and at most `Limits::message_chars` characters (default 20,000). Longer sends are refused. A child's answer in its terminal notice is shortened to the same cap, head and tail kept; the full answer stays in the child's `node_end` record and on its handle.
+Bodies are text and at most `Limits::message_chars` characters (default 20,000). Messages are never cut once accepted: the results of `receive`, `wait` and `cancel_agent` hold whole messages and are exempt from `Limits::tool_output_chars`. The mailbox bounds them instead, at `mailbox_capacity` messages plus one notice per child, each at most `message_chars` and a header. Longer sends are refused. A child's answer in its terminal notice is shortened to the same cap, head and tail kept; the full answer stays in the child's `node_end` record and on its handle.
 
 ## Envelope
 

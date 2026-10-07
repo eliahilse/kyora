@@ -1621,3 +1621,98 @@ async fn ending_a_turn_without_submitting_is_reminded_once_then_fails() {
         TraceEvent::Error { node: 1, message } if message == "ended without calling submit_result"
     )));
 }
+
+#[tokio::test]
+async fn messaging_tools_return_whole_messages() {
+    let (big1, big2) = ("a".repeat(12_000), "b".repeat(12_000));
+    let (answer, partial) = ("z".repeat(20_000), "y".repeat(20_000));
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    calls(vec![
+                        (
+                            "spawn_agent",
+                            json!({"task": "chatty task", "name": "chatty"}),
+                        ),
+                        ("spawn_agent", json!({"task": "slow task", "name": "slow"})),
+                    ]),
+                    call("receive", json!({"yield_after": 30})),
+                    call("wait", json!({"agents": ["chatty"]})),
+                    call("cancel_agent", json!({"to": "slow"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "chatty task",
+                1,
+                vec![
+                    calls(vec![
+                        ("send_message", json!({"to": "parent", "body": big1})),
+                        ("send_message", json!({"to": "parent", "body": big2})),
+                    ]),
+                    text(&answer),
+                ],
+            ),
+            rule(
+                "slow task",
+                1,
+                vec![ModelResponse {
+                    content: vec![
+                        ContentBlock::Text {
+                            text: partial.clone(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "t0".into(),
+                            name: "spawn_agent".into(),
+                            input: json!({"task": "helper task"}),
+                        },
+                    ],
+                    ..call("spawn_agent", json!({}))
+                }],
+            ),
+        ],
+        vec![
+            (at("chatty task", 0), at("root task", 1)),
+            (at("root task", 1), at("chatty task", 1)),
+            (at("chatty task", 1), at("root task", 2)),
+            (at("root task", 3), at("slow task", 1)),
+            (at("slow task", 1), never()),
+            (at("helper task", 0), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits::default(),
+        TraceSink::ephemeral(),
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 5));
+    // Each result is longer than the 20,000 character tool output cap.
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(
+            format!(
+                "[message from agent 1 (chatty)]\n{big1}\n\n[message from agent 1 (chatty)]\n{big2}"
+            ),
+            false
+        )]
+    );
+    assert_eq!(
+        results(&last(&provider.request("root task", 3))),
+        vec![(
+            format!("[result from agent 1 (chatty): completed]\n{answer}"),
+            false
+        )]
+    );
+    assert_eq!(
+        results(&last(&provider.request("root task", 4))),
+        vec![(
+            format!("[cancelled from agent 2 (slow): cancelled]\n{partial}"),
+            false
+        )]
+    );
+}

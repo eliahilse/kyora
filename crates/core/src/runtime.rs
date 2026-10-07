@@ -645,6 +645,7 @@ impl Runtime {
                         .map_or_else(|| input.clone(), |raw| Value::String(raw.clone())),
                 })
                 .await?;
+                let mut whole = false;
                 let mut result = if let Some(raw) = invalid.get(id) {
                     ToolOutput::error(serde_json::json!({"INVALID_JSON": raw}).to_string())
                 } else if response.stop_reason != StopReason::ToolUse {
@@ -662,6 +663,7 @@ impl Runtime {
                     ToolOutput::error(error.to_string())
                 } else {
                     let tool = tools.get(name).expect("validated tool");
+                    whole = !tool.truncated();
                     let tool_cx = ToolCx {
                         node: cx.clone(),
                         call_id: id.into(),
@@ -682,10 +684,10 @@ impl Runtime {
                         }
                     }
                 };
-                let content = truncate(
-                    &result.text_content(),
-                    self.0.config.limits.tool_output_chars,
-                );
+                let content = match result.text_content() {
+                    text if whole => text,
+                    text => truncate(&text, self.0.config.limits.tool_output_chars),
+                };
                 result.content = vec![ToolResultPart::Text {
                     text: content.clone(),
                 }];

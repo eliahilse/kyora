@@ -146,6 +146,10 @@ impl Tool for Receive {
         // Taking messages changes the mailbox, so a started call runs to completion.
         Effect::Mutating
     }
+    fn truncated(&self) -> bool {
+        // Cutting would lose messages already taken from the mailbox.
+        false
+    }
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let yield_after = match seconds(&input, "yield_after") {
             Ok(yield_after) => yield_after.unwrap_or_default(),
@@ -180,6 +184,9 @@ impl Tool for Wait {
     fn effect(&self) -> Effect {
         // Results returned here are taken from the mailbox, as with receive.
         Effect::Mutating
+    }
+    fn truncated(&self) -> bool {
+        false
     }
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let timeout = match seconds(&input, "timeout") {
@@ -238,6 +245,9 @@ impl Tool for CancelAgent {
     }
     fn effect(&self) -> Effect {
         Effect::Mutating
+    }
+    fn truncated(&self) -> bool {
+        false
     }
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let cancelled = match cx.node.resolve(input["to"].as_str().unwrap_or_default()) {

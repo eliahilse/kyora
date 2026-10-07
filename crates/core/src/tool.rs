@@ -85,6 +85,11 @@ pub trait Tool: Send + Sync {
     fn large_input(&self) -> bool {
         self.spec().large_input
     }
+    /// Whether the runtime cuts this tool's result to `Limits::tool_output_chars`.
+    /// A tool that returns whole messages opts out and bounds its result itself.
+    fn truncated(&self) -> bool {
+        true
+    }
     /// Executes one validated call. Implementations must honor cancellation.
     /// Started mutations must finish or stop safely before returning an outcome.
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput;

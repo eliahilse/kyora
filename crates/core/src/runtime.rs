@@ -684,6 +684,20 @@ impl Runtime {
                         }
                     }
                 };
+                // An answer that breaks the output contract does not finish the node.
+                if final_answer.is_none()
+                    && let Some(committed) = result.final_answer.take()
+                {
+                    match self.accept(settings.output.as_ref(), committed) {
+                        Ok(committed) => final_answer = Some(committed),
+                        Err(reason) => {
+                            result.is_error = true;
+                            result.content.push(ToolResultPart::Text {
+                                text: format!("\nfinal answer not accepted: {reason}"),
+                            });
+                        }
+                    }
+                }
                 let content = match result.text_content() {
                     text if whole => text,
                     text => truncate(&text, self.0.config.limits.tool_output_chars),
@@ -691,9 +705,6 @@ impl Runtime {
                 result.content = vec![ToolResultPart::Text {
                     text: content.clone(),
                 }];
-                if final_answer.is_none() {
-                    final_answer = result.final_answer.take();
-                }
                 self.emit(TraceEvent::ToolResult {
                     node: cx.id,
                     call: id.into(),
@@ -795,6 +806,30 @@ impl Runtime {
             }
         };
         Ok(self.outcome(cx.id, status, answer, turns))
+    }
+    /// Checks a committed final answer against the node's output contract: a node
+    /// with an output schema finishes only with a JSON value that the schema accepts
+    /// and that fits one message body.
+    fn accept(
+        &self,
+        output: Option<&Value>,
+        answer: Answer,
+    ) -> std::result::Result<Answer, String> {
+        let Some(schema) = output else {
+            return Ok(answer);
+        };
+        let Answer::Value(raw) = &answer else {
+            return Err("a task with an output schema finishes only through submit_result".into());
+        };
+        let value: Value = serde_json::from_str(raw.get())
+            .map_err(|error| format!("result is not JSON: {error}"))?;
+        tool::validate(schema, &value)
+            .map_err(|error| format!("result does not match the output schema: {error}"))?;
+        let cap = self.0.config.limits.message_chars;
+        if raw.get().chars().count() > cap {
+            return Err(format!("result exceeds {cap} characters"));
+        }
+        Ok(answer)
     }
     /// Records a user message, appending pending messages when `deliver` is set.
     async fn user_turn(

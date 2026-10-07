@@ -1716,3 +1716,82 @@ async fn messaging_tools_return_whole_messages() {
         )]
     );
 }
+
+#[tokio::test]
+async fn only_a_valid_result_finishes_a_contract_child() {
+    // An inherited tool tries to finish the child with answers the contract refuses.
+    let python = tool(|input, _| async move {
+        let mut output = ToolOutput::text("ok");
+        output.final_answer = Some(match input["answer"].as_str().unwrap() {
+            "text" => Answer::Text("not json".into()),
+            "mismatch" => {
+                Answer::Value(serde_json::value::to_raw_value(&json!({"dates": "2026"})).unwrap())
+            }
+            _ => Answer::Value(
+                serde_json::value::to_raw_value(&json!({"dates": ["x".repeat(300)]})).unwrap(),
+            ),
+        });
+        output
+    });
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "extract task", "name": "extract", "output": dates_schema()}),
+                    ),
+                    call("wait", json!({})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "extract task",
+                1,
+                vec![
+                    call("python", json!({"answer": "text"})),
+                    call("python", json!({"answer": "mismatch"})),
+                    call("python", json!({"answer": "big"})),
+                    call("submit_result", json!({"dates": ["2026-10-07"]})),
+                ],
+            ),
+        ],
+        vec![(at("extract task", 0), at("root task", 1))],
+    );
+    let runtime = setup(
+        provider.clone(),
+        python,
+        Limits {
+            message_chars: 200,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!(outcome.status, Status::Completed);
+    for (turn, reason) in [
+        (
+            1,
+            "a task with an output schema finishes only through submit_result",
+        ),
+        (
+            2,
+            "result does not match the output schema: invalid input type, expected \"array\"",
+        ),
+        (3, "result exceeds 200 characters"),
+    ] {
+        assert_eq!(
+            results(&last(&provider.request("extract task", turn))),
+            vec![(format!("ok\nfinal answer not accepted: {reason}"), true)]
+        );
+    }
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(
+            "[result from agent 1 (extract): completed]\n{\"dates\":[\"2026-10-07\"]}".into(),
+            false
+        )]
+    );
+}

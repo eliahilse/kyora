@@ -1,6 +1,6 @@
 # kyora
 
-Recursive agent runtime: a Rust agent harness whose Python REPL lets the model call itself from code.
+kyora is a recursive agent runtime: a Rust harness whose Python REPL lets the model call itself from code, so one agent can fan a task out to many. On kyora vms each of those agents gets its own machine, which takes recursive runs from a laptop to fleet scale.
 
 Status: early development. Design: docs/design.md.
 

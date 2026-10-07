@@ -6,7 +6,9 @@ fn command(dir: &tempfile::TempDir) -> Command {
         .env("HOME", dir.path())
         .env_remove("KYORA_FAKE_SCRIPT")
         .env_remove("KYORA_MODEL")
-        .env_remove("KYORA_LLM_MODEL");
+        .env_remove("KYORA_LLM_MODEL")
+        .env_remove("KYORA_EFFORT")
+        .env_remove("ANTHROPIC_API_KEY");
     cmd
 }
 fn fixture(name: &str) -> String {
@@ -103,13 +105,13 @@ fn logical_workspace_spelling_can_write_with_cd_or_pwd() {
     }
 }
 #[test]
-fn provider_wiring_placeholder_fails_clearly() {
+fn missing_api_key_fails_clearly() {
     let dir = tempfile::tempdir().unwrap();
     command(&dir)
         .args(["run", "task"])
         .assert()
         .code(1)
-        .stderr("error: the anthropic provider is not wired in yet\n");
+        .stderr(format!("error: no API key for provider anthropic: set ANTHROPIC_API_KEY or providers.anthropic.api_key in {}\n", dir.path().join("home/config.toml").display()));
     assert!(!dir.path().join("home").exists());
 }
 #[test]

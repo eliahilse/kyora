@@ -2519,3 +2519,56 @@ async fn cancel_agent_defers_a_notice_that_does_not_fit() {
         vec!["[cancelled from agent 1 (slow): cancelled]"]
     );
 }
+
+#[tokio::test]
+async fn a_senders_messages_are_queued_in_send_order() {
+    let (trace, acks) = Acks::new(
+        |event| matches!(event, TraceEvent::MessageSent { message } if message.body == "A"),
+    );
+    let order = Arc::new(Mutex::new(None));
+    let (seen, gate) = (order.clone(), acks.clone());
+    let python = tool(move |_, cx| {
+        let (seen, acks) = (seen.clone(), gate.clone());
+        async move {
+            if cx.node.depth == 1 {
+                let parent = cx.node.resolve("parent").unwrap();
+                {
+                    // A is accepted and its record held; its waiter is dropped.
+                    let mut a = pin!(cx.node.send(parent, "A"));
+                    assert!(futures::poll!(a.as_mut()).is_pending());
+                }
+                let mut b = pin!(cx.node.send(parent, "B"));
+                // Give B every chance to overtake A while A's record is held.
+                let early = tokio::time::timeout(Duration::from_millis(100), b.as_mut()).await;
+                acks.release();
+                match early {
+                    Ok(sent) => sent.unwrap(),
+                    Err(_) => tokio::time::timeout(LIMIT, b).await.unwrap().unwrap(),
+                };
+                return ToolOutput::text("sent");
+            }
+            cx.node
+                .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                .unwrap();
+            eventually(&cx, "both messages", || cx.node.pending_messages() == 2).await;
+            let got = cx.node.receive(Duration::ZERO).await.unwrap();
+            *seen.lock().unwrap() = Some(got.iter().map(|m| m.body.clone()).collect::<Vec<_>>());
+            let mut result = ToolOutput::text("ok");
+            result.final_answer = Some(Answer::Text("final".into()));
+            result
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule("root task", 0, vec![call("python", json!({}))]),
+            rule("child task", 1, vec![call("python", json!({}))]),
+        ],
+        vec![(at("child task", 1), never())],
+    );
+    let runtime = setup(provider, python, Limits::default(), trace);
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(
+        *order.lock().unwrap(),
+        Some(vec!["A".to_string(), "B".to_string()])
+    );
+}

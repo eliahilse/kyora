@@ -36,7 +36,7 @@ An agent can address its parent, its children and its siblings, and nothing else
 
 ## Delivery
 
-A send returns a message id once the message is queued in the recipient's mailbox, or an error, in which case nothing was queued. Recording and queueing an accepted send run as owned work that the sender's shutdown joins, so a caller that stops waiting cannot leave it half done: it is still recorded, then queued or recorded as undelivered. Inside the process an accepted message leaves its mailbox exactly once, in one of two ways:
+A send returns a message id once the message is queued in the recipient's mailbox, or an error, in which case nothing was queued. Recording and queueing an accepted send run as owned work that the sender's shutdown joins, so a caller that stops waiting cannot leave it half done: it is still recorded, then queued or recorded as undelivered. A sender's accepted sends are queued one after another in acceptance order, whatever order their records are acknowledged in. Inside the process an accepted message leaves its mailbox exactly once, in one of two ways:
 
 - delivered: appended to the recipient's conversation at a turn boundary, returned by `receive`, or taken by `wait` or `cancel_agent`, which return a finished child's unread messages together with its notice, so the child's order is kept;
 - undelivered: still queued when the recipient ended, and recorded in the trace.

@@ -185,6 +185,8 @@ struct Work {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Turns true once this node's latest delivery record is written.
     recorded: Option<watch::Receiver<bool>>,
+    /// Turns true once this node's latest accepted send is queued or refused.
+    sent: Option<watch::Receiver<bool>>,
 }
 #[derive(Default)]
 struct NodeState {
@@ -1559,9 +1561,20 @@ impl NodeCtx {
                 status: None,
             };
             let runtime = self.runtime.clone();
+            // Each send goes after this sender's previous one, whatever order their
+            // records are acknowledged in, so a sender's messages keep their order.
+            let (done, queued) = watch::channel(false);
+            let mut previous = work.sent.replace(queued);
             // Recording and queueing run as owned work that this node's shutdown joins,
             // so a caller that stops waiting cannot leave an accepted send half done.
             work.tasks.push(tokio::spawn(async move {
+                if let Some(previous) = &mut previous {
+                    while !*previous.borrow_and_update() {
+                        if previous.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
                 let id = message.id;
                 // The send record precedes any delivery record.
                 let _ = runtime
@@ -1576,6 +1589,7 @@ impl NodeCtx {
                         Err(RecursionError::AgentFinished { agent: to })
                     }
                 };
+                done.send_replace(true);
                 let _ = tx.send(result);
             }));
         }

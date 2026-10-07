@@ -289,26 +289,29 @@ impl Tool for CancelAgent {
         };
         match cancelled {
             Ok(cancelled) => {
-                // The child's unread messages and its notice, in arrival order, or
-                // its outcome when the notice was delivered before.
-                let mut report = if cancelled.messages.is_empty() {
-                    cx.node.render_outcome(&cancelled.outcome)
-                } else {
-                    cancelled
-                        .messages
-                        .iter()
-                        .map(|message| cx.node.render(message))
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                };
+                // The child's unread messages and its notice, in arrival order. When
+                // no notice comes with them (a cell-owned child posts none, or it was
+                // delivered before), its outcome follows; when it did not fit, a
+                // line says it follows.
+                let noticed = cancelled
+                    .messages
+                    .iter()
+                    .any(|message| message.kind != MessageKind::Message);
+                let mut parts = cancelled
+                    .messages
+                    .iter()
+                    .map(|message| cx.node.render(message))
+                    .collect::<Vec<_>>();
                 if cancelled.remaining > 0 {
-                    report.push_str("\n\n");
-                    report.push_str(&messages::deferred(
+                    parts.push(messages::deferred(
                         cancelled.outcome.node,
                         cancelled.remaining,
                         "notice",
                     ));
+                } else if !noticed {
+                    parts.push(cx.node.render_outcome(&cancelled.outcome));
                 }
+                let report = parts.join("\n\n");
                 if cancelled.already_finished {
                     ToolOutput::text(format!(
                         "agent {} had already finished\n{report}",

@@ -2607,3 +2607,69 @@ async fn a_failed_message_record_fails_the_run() {
     assert!(runtime.run(spec()).await.is_err());
     assert!(trace.finish().await.is_err());
 }
+
+#[tokio::test]
+async fn cancel_agent_reports_a_cell_owned_childs_outcome_after_its_messages() {
+    let cell = Arc::new(Mutex::new(None));
+    let kept = cell.clone();
+    let python = tool(move |_, cx| {
+        let kept = kept.clone();
+        async move {
+            let token = CancellationToken::new();
+            cx.node
+                .spawn_agent(
+                    ChildSpec {
+                        name: Some("cell".into()),
+                        ..ChildSpec::new("cell task")
+                    },
+                    Owner::Cell(token.clone()),
+                )
+                .unwrap();
+            *kept.lock().unwrap() = Some(token);
+            ToolOutput::text("spawned")
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call("python", json!({})),
+                    call("cancel_agent", json!({"to": "cell"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "cell task",
+                1,
+                vec![call(
+                    "send_message",
+                    json!({"to": "parent", "body": "progress"}),
+                )],
+            ),
+        ],
+        vec![
+            // The progress message is queued after the parent's boundary.
+            (at("cell task", 0), at("root task", 1)),
+            (at("root task", 1), at("cell task", 1)),
+            (at("cell task", 1), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        python,
+        Limits::default(),
+        TraceSink::ephemeral(),
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    // A cell-owned child posts no notice, so its outcome follows its messages.
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(
+            "[message from agent 1 (cell)]\nprogress\n\n[cancelled from agent 1 (cell): cancelled]"
+                .into(),
+            false
+        )]
+    );
+}

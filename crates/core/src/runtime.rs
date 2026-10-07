@@ -732,12 +732,14 @@ impl Runtime {
                     );
                 self.user_turn(cx, &mut history, results, continues).await?;
             }
-            if cx.stopped() || Instant::now() >= cx.deadline {
-                break cx.cancel_status();
-            }
+            // An accepted final answer is the terminal decision. A cancellation that
+            // arrives while its result is being recorded does not replace it.
             if let Some(value) = final_answer {
                 answer = value;
                 break Status::Completed;
+            }
+            if cx.stopped() || Instant::now() >= cx.deadline {
+                break cx.cancel_status();
             }
             match response.stop_reason {
                 StopReason::ToolUse | StopReason::PauseTurn => {}

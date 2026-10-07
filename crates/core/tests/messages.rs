@@ -72,6 +72,56 @@ async fn eventually(cx: &ToolCx, what: &str, ready: impl Fn() -> bool) {
     }
 }
 
+/// A durable trace that acknowledges every record at once, except those `hold`
+/// selects, whose acknowledgement waits for `release` (or `LIMIT`).
+struct Acks {
+    held: watch::Sender<usize>,
+    open: watch::Sender<bool>,
+}
+impl Acks {
+    fn new(hold: impl Fn(&TraceEvent) -> bool + Send + 'static) -> (TraceSink, Arc<Self>) {
+        let acks = Arc::new(Self {
+            held: watch::Sender::new(0),
+            open: watch::Sender::new(false),
+        });
+        let state = acks.clone();
+        let trace = TraceSink::with_store(move |record| {
+            let state = state.clone();
+            let hold = hold(&record.event) && !*state.open.borrow();
+            async move {
+                if hold {
+                    state.held.send_modify(|held| *held += 1);
+                    let mut open = state.open.subscribe();
+                    let _ = tokio::time::timeout(LIMIT, async {
+                        while !*open.borrow_and_update() {
+                            if open.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                }
+                Ok(())
+            }
+        });
+        (trace, acks)
+    }
+    /// Waits until `count` acknowledgements are being held.
+    async fn held(&self, count: usize) {
+        let mut held = self.held.subscribe();
+        tokio::time::timeout(LIMIT, async {
+            while *held.borrow_and_update() < count {
+                held.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("held acknowledgements");
+    }
+    fn release(&self) {
+        self.open.send_replace(true);
+    }
+}
+
 type Pred = Box<dyn Fn(&ModelRequest) -> bool + Send + Sync>;
 /// Scripted responses that record every request. A gated request is held until
 /// a request matching its release predicate has been seen, or it is cancelled;
@@ -1793,5 +1843,59 @@ async fn only_a_valid_result_finishes_a_contract_child() {
             "[result from agent 1 (extract): completed]\n{\"dates\":[\"2026-10-07\"]}".into(),
             false
         )]
+    );
+}
+
+#[tokio::test]
+async fn an_accepted_result_survives_a_later_cancel() {
+    let (trace, acks) = Acks::new(|event| {
+        matches!(
+            event,
+            TraceEvent::ToolResult { node: 1, content, .. } if content == "result submitted"
+        )
+    });
+    let ended = Arc::new(Mutex::new(None));
+    let (seen, gate) = (ended.clone(), acks.clone());
+    let python = tool(move |_, cx| {
+        let (seen, acks) = (seen.clone(), gate.clone());
+        async move {
+            let child = cx
+                .node
+                .spawn_agent(
+                    ChildSpec {
+                        name: Some("extract".into()),
+                        output: Some(dates_schema()),
+                        ..ChildSpec::new("extract task")
+                    },
+                    Owner::Node,
+                )
+                .unwrap();
+            // The submission is accepted; its tool result is still being recorded.
+            acks.held(1).await;
+            child.cancel();
+            acks.release();
+            let outcome = tokio::time::timeout(LIMIT, child.result()).await.unwrap();
+            *seen.lock().unwrap() = Some((outcome.status, outcome.answer.text()));
+            let mut result = ToolOutput::text("ok");
+            result.final_answer = Some(Answer::Text("final".into()));
+            result
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule("root task", 0, vec![call("python", json!({}))]),
+            rule(
+                "extract task",
+                1,
+                vec![call("submit_result", json!({"dates": ["2026-10-07"]}))],
+            ),
+        ],
+        vec![],
+    );
+    let runtime = setup(provider, python, Limits::default(), trace);
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(
+        *ended.lock().unwrap(),
+        Some((Status::Completed, "{\"dates\":[\"2026-10-07\"]}".into()))
     );
 }

@@ -3,6 +3,7 @@
 use crate::{config::ServerConfig, defaults};
 use kyora_core::ToolOutput;
 use kyora_protocol::ToolResultPart;
+use serde_json::Value;
 use std::{ffi::OsString, sync::Arc};
 
 /// Replaces a credential value in errors and tool output.
@@ -99,6 +100,32 @@ impl Secrets {
         }
         out.push_str(&text[copied..]);
         out
+    }
+
+    /// Whether `text` contains a value.
+    pub(crate) fn found_in(&self, text: &str) -> bool {
+        self.redact(text) != text
+    }
+
+    /// Redacts every string in `value`, object keys included.
+    pub(crate) fn redact_json(&self, value: &mut Value) {
+        if self.0.values.is_empty() {
+            return;
+        }
+        match value {
+            Value::String(text) => *text = self.redact(text),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.redact_json(item)),
+            Value::Object(map) => {
+                *map = std::mem::take(map)
+                    .into_iter()
+                    .map(|(key, mut value)| {
+                        self.redact_json(&mut value);
+                        (self.redact(&key), value)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn output(&self, mut output: ToolOutput) -> ToolOutput {

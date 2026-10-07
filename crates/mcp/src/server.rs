@@ -84,8 +84,8 @@ impl Connection {
         self.timeout
     }
 
-    pub(crate) fn redact(&self, text: &str) -> String {
-        self.secrets.redact(text)
+    pub(crate) fn secrets(&self) -> &Secrets {
+        &self.secrets
     }
 
     /// Calls `tool` until it answers, `cancel` fires or `deadline` passes. The last two
@@ -478,7 +478,7 @@ struct Listing {
 impl Listing {
     /// Leaves out every tool whose kyora name another tool also maps to, rather than
     /// letting one silently shadow the other, and says so in a warning.
-    fn new(tools: Vec<McpTool>, connection: &Connection) -> Self {
+    fn new(tools: Vec<McpTool>, connection: &Connection, mut warnings: Vec<String>) -> Self {
         let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for tool in &tools {
             names
@@ -486,17 +486,15 @@ impl Listing {
                 .or_default()
                 .push(tool.remote_name().to_owned());
         }
-        let warnings = names
-            .iter()
-            .filter(|(_, remotes)| remotes.len() > 1)
-            .map(|(name, remotes)| {
+        warnings.extend(names.iter().filter(|(_, remotes)| remotes.len() > 1).map(
+            |(name, remotes)| {
                 let warning = format!(
                     "tools {} all map to {name}; none of them is offered",
                     remotes.join(", ")
                 );
                 connection.secrets.redact(&warning)
-            })
-            .collect();
+            },
+        ));
         let tools = tools
             .into_iter()
             .filter(|tool| names[tool.name()].len() == 1)
@@ -546,12 +544,26 @@ async fn list(
         match page.next_cursor {
             Some(next) if !next.is_empty() => cursor = Some(next),
             _ => {
+                let secrets = connection.secrets();
+                let mut warnings = Vec::new();
                 let tools = listed
                     .into_iter()
                     .filter(|tool| config.exposes(&tool.name))
+                    .filter(|tool| {
+                        // A renamed tool would be confusing; one that cannot be named
+                        // without the credential is left out.
+                        let hidden = secrets.found_in(&tool.name);
+                        if hidden {
+                            warnings.push(format!(
+                                "tool {} is left out because its name contains a credential value",
+                                secrets.redact(&tool.name)
+                            ));
+                        }
+                        !hidden
+                    })
                     .map(|tool| McpTool::new(connection.clone(), tool))
                     .collect();
-                return Ok(Listing::new(tools, connection));
+                return Ok(Listing::new(tools, connection, warnings));
             }
         }
     }

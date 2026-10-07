@@ -34,8 +34,10 @@ impl McpTool {
             .map(|description| description.into_owned())
             .or(tool.title)
             .unwrap_or_default();
-        // Descriptions reach the model, so they get the same redaction as results.
-        let description = connection.redact(&description);
+        // The whole spec reaches the model, so it gets the same redaction as results:
+        // descriptions, defaults, enums and every other string in the schema.
+        let description = connection.secrets().redact(&description);
+        connection.secrets().redact_json(&mut input_schema);
         Self {
             spec: ToolSpec {
                 name: tool_name(connection.server(), &tool.name),

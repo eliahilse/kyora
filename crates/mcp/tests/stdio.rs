@@ -330,6 +330,43 @@ async fn colliding_names_leave_both_tools_out_with_a_warning() {
     server.shutdown().await;
 }
 
+/// A schema that repeats the forwarded value in a key, a description, a default and
+/// an enum.
+fn described_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "forwarded": {
+                "type": "string",
+                "description": "Defaults to forwarded.",
+                "default": "forwarded",
+                "enum": ["forwarded", "other"],
+            },
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_tool_named_with_a_credential_is_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = server_config(
+        &dir.path().join("log.jsonl"),
+        &[("KYORA_MCP_TEST_EXTRA_TOOL", "use_forwarded_value")],
+    );
+    config.env_vars = vec!["KYORA_TEST_FORWARD".into()];
+    let server = start(dir.path(), &config).await;
+    let names: Vec<_> = server.tools().iter().map(|tool| tool.spec().name).collect();
+    assert!(
+        names.iter().all(|name| !name.contains("forwarded")),
+        "{names:?}"
+    );
+    assert!(names.contains(&"mcp__fake__echo".to_owned()));
+    let warnings = server.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("left out") && !warnings[0].contains("forwarded"));
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn environment_and_working_directory_are_controlled() {
     let dir = tempfile::tempdir().unwrap();
@@ -340,6 +377,10 @@ async fn environment_and_working_directory_are_controlled() {
             ("MODE", "fast"),
             ("KYORA_MCP_TEST_EXTRA_TOOL", "described"),
             ("KYORA_MCP_TEST_EXTRA_DESCRIPTION", "Uses forwarded."),
+            (
+                "KYORA_MCP_TEST_EXTRA_SCHEMA",
+                &described_schema().to_string(),
+            ),
         ],
     );
     config.env_vars = vec!["KYORA_TEST_FORWARD".into(), "KYORA_TEST_SHORT".into()];
@@ -377,6 +418,10 @@ async fn environment_and_working_directory_are_controlled() {
         described.spec().description,
         format!("Uses {}.", kyora_mcp::REDACTED)
     );
+    // Every string in the schema reaches the model too, keys included.
+    let schema = described.spec().input_schema.to_string();
+    assert!(!schema.contains("forwarded"), "{schema}");
+    assert_eq!(schema.matches(kyora_mcp::REDACTED).count(), 4, "{schema}");
     assert_eq!(
         PathBuf::from(report["cwd"].as_str().unwrap())
             .canonicalize()

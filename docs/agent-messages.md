@@ -2,6 +2,14 @@
 
 Agents in one tree talk to each other asynchronously. A parent spawns a child and keeps working; the child's result arrives in the parent's mailbox as a message. The parent can send follow-ups to a running child, a child can report progress or ask its parent a question without ending, and siblings can message each other. Everything runs inside one process on top of the ownership, ledger and shutdown rules of the recursive runtime.
 
+## How an agent ends
+
+1. **Someone cancels it.** An ancestor's `cancel_agent`, its handle, its owning cell or its parent's shutdown cancels it together with its whole subtree, through the ordered shutdown below.
+2. **Open-ended task.** It keeps running while it has work: ending a turn with children still running, or with messages pending, makes it wait for them (see idle agents). When nothing more can arrive it completes, and its parent receives the result as a message.
+3. **Fixed structured output.** A child spawned with an output schema finishes when it submits a matching result: it ends at once, its running children are cancelled, and the JSON reaches the parent as the result.
+
+A deadline, the turn cap or the budget can still end any agent, with the matching status.
+
 ## Mailboxes
 
 Every agent node (the root and each child agent) owns one mailbox. Leaf `llm` calls have none. A child's mailbox exists from the moment it is admitted, so a parent can message a child right after spawning it, before the child's first request.
@@ -63,6 +71,16 @@ The name is omitted when the agent has none.
 
 When a model ends its turn (`end_turn`) while node-owned children are still running, or while messages are queued or being sent to it, the agent does not end. It waits without holding a model slot or a reservation, and starts its next turn with whatever arrived. It ends when nothing more can arrive: no child is running, no message is queued and no send is in flight. That check and the closing of the mailbox happen atomically, so a message is either delivered or refused to its sender, never accepted and then dropped. Each wait is bounded by the children's deadlines and the agent's own deadline. An agent that has reached its turn cap ends at once. A final answer committed by a tool also ends the agent at once and cancels its running children.
 
+### Structured results
+
+`ChildSpec::output` (the `output` argument of `spawn_agent`) takes a JSON schema of type object. The child then has a `submit_result` tool whose input schema is that schema; the parent cannot hand it out any other way, and children without a schema do not get it.
+
+- A valid submission commits the object as the child's structured answer (`Answer::Value`), ends the child at once and cancels its running children. The parent receives the JSON text as the body of the `result` notice, and the handle's outcome holds the raw JSON.
+- An invalid submission returns an error naming the mismatch, for example `result does not match the output schema: missing property: dates`, and the child can try again. A result longer than `Limits::message_chars` is refused the same way, so the parent always receives the whole JSON.
+- If the child ends a turn without submitting, it first waits for its own children and messages like any agent. When nothing more can arrive, it is reminded once with a user message. If it ends a turn again without submitting, it fails: status `failed`, a trace error `ended without calling submit_result`, and an answer that says so and quotes its last reply. Running out of turns without a submission ends it with `max_turns`.
+
+Schemas are checked with the runtime's light validator, which enforces `type` (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`), `enum`, `required`, `properties`, `additionalProperties: false` and `items`, nested. A schema using a type it cannot enforce, such as a list of types, is refused at spawn. Other keywords are shown to the model but not enforced.
+
 ## Termination and cancellation
 
 An agent's mailbox closes when its loop ends, before its children are cancelled. Later sends to it fail with `AgentFinished`. Messages still queued are recorded as `message_undelivered`. Node shutdown then runs in this order:
@@ -71,6 +89,14 @@ An agent's mailbox closes when its loop ends, before its children are cancelled.
 2. admission closes, children are cancelled and joined; their notices find the mailbox closed and are recorded as undelivered;
 3. `node_end` is written and the live-agent slot is released;
 4. the node's handle resolves, then its own notice is posted to its parent.
+
+Shutdown cancels every child and leaf task it owns directly and synchronously before joining them, so a task that has not started yet begins cancelled and dispatches nothing.
+
+`cancel_agent` cancels a descendant of the caller (a child, or a child of a child) and its subtree, and returns once it has stopped, with its outcome. Parents, siblings and the caller itself cannot be cancelled this way. Each node-owned child still produces exactly one terminal notice:
+
+- When the canceller is the child's parent, `cancel_agent` takes that notice itself (recorded as delivered `via: cancel`) and returns the outcome, so the parent gets no separate message.
+- When the canceller is further up, the notice goes to the child's own parent as usual.
+- Cancelling an agent that has already finished changes nothing and reports its outcome; if its notice was still queued, the call takes it.
 
 Ownership decides who hears about a child's ending:
 
@@ -89,14 +115,16 @@ Sends never block. A wait is only ever on the waiting agent's own children, so w
 
 ## Model-facing tools
 
-`kyora_core::agent_tools::tools()` returns four tools. By default a child receives them when its parent holds them (see `defaults::SUBAGENT_TOOLS`).
+`kyora_core::agent_tools::tools()` returns five tools. By default a child receives them when its parent holds them (see `defaults::SUBAGENT_TOOLS`). The runtime adds `submit_result` to children spawned with an output schema.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `spawn_agent` | `task`, optional `name`, `tools`, `budget`, `timeout` (seconds) | Starts a node-owned child and returns `started agent 3 (name)` at once. |
+| `spawn_agent` | `task`, optional `name`, `tools`, `budget`, `timeout` (seconds), `output` (JSON schema) | Starts a node-owned child and returns `started agent 3 (name)` at once. |
 | `send_message` | `to` (`parent`, an id or a name), `body` | `sent message 7 to agent 3`, or an error such as a full mailbox or a finished agent. |
 | `receive` | optional `yield_after` (seconds, default 0) | The pending messages, rendered as above; waits up to `yield_after` for the first one; `no messages` otherwise. |
 | `wait` | optional `agents` (ids or names), optional `timeout` (seconds) | The results of the named children, or of every child whose result has not been delivered yet, plus the ones still running when the timeout passed. |
+| `cancel_agent` | `to` (an id or a name) | The descendant's outcome once it has stopped, or `agent 3 had already finished` followed by its outcome. |
+| `submit_result` | the output schema | `result submitted`, ending the child, or what to fix. Only for children with an output schema. |
 
 ## Rust API
 
@@ -111,20 +139,22 @@ NodeCtx::receive(&self, yield_after: Duration)
     -> impl Future<Output = Result<Vec<Envelope>, RecursionError>>
 NodeCtx::wait(&self, agents: Option<&[NodeId]>, timeout: Option<Duration>)
     -> impl Future<Output = Result<Waited, RecursionError>>
+NodeCtx::cancel_agent(&self, agent: NodeId)
+    -> impl Future<Output = Result<CancelOutcome, RecursionError>>
 NodeCtx::pending_messages(&self) -> usize
 NodeCtx::render(&self, message: &Envelope) -> String
 NodeCtx::render_outcome(&self, outcome: &AgentOutcome) -> String
 Envelope::render(&self, sender: &str) -> String
 ```
 
-`Waited` lists the outcomes of the waited children that finished and the ids of those still running. `wait` takes the queued notices of the finished children, so their results are not delivered again at the next turn; `AgentHandle::result` is a plain observer and takes nothing. Errors: `MailboxFull` and `AgentFinished` for the recipient's state, `InvalidRequest` for unknown, ambiguous or unrelated addresses, messages to oneself and oversized bodies, and `Cancelled` when the calling agent has ended or is cancelled.
+`ChildSpec::output` sets the output schema. `CancelOutcome` carries the stopped agent's outcome and whether it had already finished. `Waited` lists the outcomes of the waited children that finished and the ids of those still running. `wait` takes the queued notices of the finished children, so their results are not delivered again at the next turn; `AgentHandle::result` is a plain observer and takes nothing. Errors: `MailboxFull` and `AgentFinished` for the recipient's state, `InvalidRequest` for unknown, ambiguous or unrelated addresses, messages to oneself and oversized bodies, and `Cancelled` when the calling agent has ended or is cancelled.
 
 ## Trace events
 
 | Event | Fields |
 |---|---|
 | `message_sent` | The envelope, flattened. Written before the message can be delivered. |
-| `message_delivered` | `node` (recipient), `messages` (ids in delivery order), `via` (`turn`, `receive` or `wait`). |
+| `message_delivered` | `node` (recipient), `messages` (ids in delivery order), `via` (`turn`, `receive`, `wait` or `cancel`). |
 | `message_undelivered` | The envelope, flattened, and a `reason`. |
 
 `message_sent` is written before the message can be delivered, so it precedes the matching `message_delivered`. A notice's `message_sent` follows the child's `node_end`, and every record about a child's messages to its parent precedes the parent's `node_end`. A send refused at once (full mailbox, finished or unknown recipient) writes no record; the caller sees the error. Tree reconstruction ignores message events, so a live view can draw them as edges between existing nodes.

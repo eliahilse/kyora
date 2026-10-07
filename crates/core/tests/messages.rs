@@ -55,9 +55,27 @@ fn idle_tool() -> Arc<dyn Tool> {
     tool(|_, _| async { ToolOutput::text("ok") })
 }
 
+/// Upper bound for every wait in these tests, so a lost message fails a test
+/// instead of hanging it.
+const LIMIT: Duration = Duration::from_secs(10);
+/// Polls `ready` until it holds. Fails when the tool is cancelled first or after
+/// `LIMIT`; a panicking tool fails its agent, which the test then reports.
+async fn eventually(cx: &ToolCx, what: &str, ready: impl Fn() -> bool) {
+    let until = tokio::time::Instant::now() + LIMIT;
+    while !ready() {
+        assert!(!cx.cancel.is_cancelled(), "cancelled waiting for {what}");
+        assert!(
+            tokio::time::Instant::now() < until,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 type Pred = Box<dyn Fn(&ModelRequest) -> bool + Send + Sync>;
 /// Scripted responses that record every request. A gated request is held until
-/// a request matching its release predicate has been seen, or it is cancelled.
+/// a request matching its release predicate has been seen, or it is cancelled;
+/// after `LIMIT` it fails instead.
 struct Gated {
     scripted: ScriptedProvider,
     seen: watch::Sender<Vec<ModelRequest>>,
@@ -73,12 +91,16 @@ impl Gated {
     }
     async fn wait_for(&self, pred: Pred) {
         let mut seen = self.seen.subscribe();
+        let until = tokio::time::Instant::now() + LIMIT;
         loop {
             let found = seen.borrow_and_update().iter().any(&pred);
             if found {
                 return;
             }
-            seen.changed().await.unwrap();
+            tokio::time::timeout_at(until, seen.changed())
+                .await
+                .expect("timed out waiting for a request")
+                .unwrap();
         }
     }
     fn requested(&self, task: &str, turns: usize) -> bool {
@@ -113,6 +135,7 @@ impl ModelProvider for Gated {
                 continue;
             }
             let mut seen = self.seen.subscribe();
+            let until = tokio::time::Instant::now() + LIMIT;
             loop {
                 let released = seen.borrow_and_update().iter().any(release);
                 if released {
@@ -121,6 +144,9 @@ impl ModelProvider for Gated {
                 tokio::select! {
                     _ = seen.changed() => {}
                     _ = cancel.cancelled() => return Err(ProviderError::cancelled(false)),
+                    _ = tokio::time::sleep_until(until) => {
+                        return Err(ProviderError::Other("gate was never released".into()));
+                    }
                 }
             }
         }
@@ -418,9 +444,7 @@ async fn parent_keeps_working_while_child_runs_and_result_arrives_as_message() {
 async fn follow_up_reaches_child_at_its_next_turn_boundary() {
     let probe = tool(|_, cx| async move {
         // Hold the child inside a tool call until the follow-up is queued.
-        while cx.node.pending_messages() == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        eventually(&cx, "the follow-up", || cx.node.pending_messages() > 0).await;
         ToolOutput::text("probed")
     });
     let provider = Gated::new(
@@ -584,9 +608,10 @@ async fn full_mailbox_refuses_plain_messages_but_never_a_result() {
     let python = tool(|_, cx| async move {
         if cx.node.depth == 0 {
             // Two progress messages and the result notice, which ignores the bound.
-            while cx.node.pending_messages() < 3 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            eventually(&cx, "two messages and a result", || {
+                cx.node.pending_messages() == 3
+            })
+            .await;
             return ToolOutput::text("ok");
         }
         let parent = cx.node.resolve("parent").unwrap();

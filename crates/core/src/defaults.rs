@@ -169,3 +169,7 @@ pub fn home(explicit: Option<PathBuf>) -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(HOME_DIRECTORY)))
         .ok_or_else(|| anyhow::anyhow!("HOME or KYORA_HOME must be set"))
 }
+
+/// Default child tools, intersected with the parent's frozen capabilities.
+/// A ChildSpec can override this rule with an explicit ToolSelection.
+pub const SUBAGENT_TOOLS: &[&str] = &["python", "read_file"];

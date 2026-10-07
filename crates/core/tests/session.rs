@@ -107,6 +107,7 @@ async fn concurrent_writer_sequences_and_large_prompt_blobs() {
             kind: "llm".into(),
             name: String::new(),
             model: "fake/test".into(),
+            origin_cell: None,
             system: None,
             tools: vec![],
             limits: Limits::default(),

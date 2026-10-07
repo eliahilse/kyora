@@ -12,6 +12,7 @@ use kyora_providers::anthropic::AnthropicProvider;
 use kyora_providers::{ModelProvider, RetryPolicy, fake::ScriptedProvider};
 use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
 
 mod config;
 
@@ -265,11 +266,17 @@ async fn execute(mut run: Run) -> u8 {
             .map(|(name, server)| (name.clone(), server.clone()))
             .collect(),
     };
+    // One watcher covers server startup, the run and server shutdown.
+    let stop = CancellationToken::new();
+    let interrupts = tokio::spawn(watch_interrupts(stop.clone()));
     let (servers, failures) = if !mcp.servers.is_empty() {
         // Ctrl-C drops the unfinished start, which kills every server it spawned.
         tokio::select! {
             started = kyora_mcp::Servers::start(&mcp, &cwd) => started,
-            _ = tokio::signal::ctrl_c() => return 130,
+            _ = stop.cancelled() => {
+                interrupts.abort();
+                return 130;
+            }
         }
     } else {
         (kyora_mcp::Servers::default(), Vec::new())
@@ -299,7 +306,7 @@ async fn execute(mut run: Run) -> u8 {
                 factory: toolsets,
                 selection,
             };
-            match execute_runtime(run, resolved, providers, limits, cwd, tools).await {
+            match execute_runtime(run, resolved, providers, limits, cwd, tools, stop).await {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("error: {error:#}");
@@ -309,7 +316,27 @@ async fn execute(mut run: Run) -> u8 {
         }
     };
     servers.shutdown().await;
+    interrupts.abort();
+    let _ = interrupts.await;
     code
+}
+/// The first Ctrl-C asks everything to stop; a second within the interrupt window
+/// kills shell and MCP server process groups and exits at once.
+async fn watch_interrupts(stop: CancellationToken) {
+    let mut last = None;
+    loop {
+        if tokio::signal::ctrl_c().await.is_err() {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        stop.cancel();
+        if last.is_some_and(|then| now.duration_since(then) <= defaults::INTERRUPT_WINDOW) {
+            kyora_tools::cancel_processes();
+            kyora_mcp::kill_servers();
+            std::process::exit(130);
+        }
+        last = Some(now);
+    }
 }
 /// The node toolset factory and the root's `--tools` selection.
 struct Tools {
@@ -395,6 +422,7 @@ async fn execute_runtime(
     limits: Limits,
     cwd: PathBuf,
     tools: Tools,
+    interrupted: CancellationToken,
 ) -> Result<u8> {
     let store = if run.no_session {
         None
@@ -425,20 +453,8 @@ async fn execute_runtime(
     ));
     let control = runtime.clone();
     let interrupt = tokio::spawn(async move {
-        let mut last = None;
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            let now = tokio::time::Instant::now();
-            control.cancel();
-            if last.is_some_and(|then| now.duration_since(then) <= defaults::INTERRUPT_WINDOW) {
-                kyora_tools::cancel_processes();
-                kyora_mcp::kill_servers();
-                std::process::exit(130);
-            }
-            last = Some(now);
-        }
+        interrupted.cancelled().await;
+        control.cancel();
     });
     let mut spec = AgentSpec::new(run.task, cwd);
     spec.model = resolved.model;

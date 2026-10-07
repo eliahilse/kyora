@@ -1,6 +1,17 @@
-"""Minimal stdio MCP server for the kyora CLI tests: one echo tool."""
+"""Minimal stdio MCP server for the kyora CLI tests: one echo tool.
+
+With the arguments `linger MARKER` it ignores SIGTERM and, once stdin closes, writes
+its pid to MARKER and keeps running, like a server that will not shut down.
+"""
 import json
+import os
+import signal
 import sys
+import time
+
+LINGER = sys.argv[1:2] == ["linger"]
+if LINGER:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 
 def send(message):
@@ -43,3 +54,8 @@ while True:
         send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "no such method"}})
         continue
     send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+if LINGER:
+    with open(sys.argv[2], "w") as marker:
+        marker.write(str(os.getpid()))
+    time.sleep(60)

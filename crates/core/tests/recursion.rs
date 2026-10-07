@@ -1159,3 +1159,47 @@ async fn independent_cell_child_dispatches_nothing_after_its_parent_ends() {
     assert_order(&live);
     assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
 }
+
+#[tokio::test]
+async fn leaf_owner_cancelled_before_its_task_starts_dispatches_nothing() {
+    let spawn = tool(|_, cx| async move {
+        let owner = CancellationToken::new();
+        let mut call = std::pin::pin!(cx.node.llm(LlmCall::new("leaf"), &owner));
+        // One poll admits the leaf and queues its owned task without running it.
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        owner.cancel();
+        assert!(matches!(call.await, Err(RecursionError::Cancelled)));
+        assert_eq!(cx.node.budget().reserved, 0);
+        finish()
+    });
+    let provider = counting(vec![
+        root_rule(json!({})),
+        rule("leaf", 0, vec![response(None)]),
+    ]);
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(
+        provider.clone(),
+        Arc::new(Toolset::new(vec![spawn]).unwrap()),
+        Limits::default(),
+        trace,
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!(outcome.status, Status::Completed);
+    assert_eq!(*provider.dispatched.lock().unwrap(), vec!["0"]);
+    // The leaf still gets its lifecycle records, with nothing charged.
+    let live = records(rx);
+    assert!(
+        !live
+            .iter()
+            .any(|record| matches!(record.event, TraceEvent::AttemptStart { node: 1, .. }))
+    );
+    let leaf = &reconstruct_tree(&live).unwrap()[0].children[0];
+    assert_eq!(
+        (leaf.kind.as_str(), leaf.status),
+        ("llm", Some(Status::Cancelled))
+    );
+    assert_eq!(leaf.usage_self.total(), 0);
+    assert_eq!(outcome.usage_subtree.total(), outcome.usage_self.total());
+    assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
+}

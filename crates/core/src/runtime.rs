@@ -1171,6 +1171,11 @@ impl NodeCtx {
         let cx = self;
         let id = self.id;
         let model = self.model.clone();
+        // The watcher only runs once this task yields. An owner cancelled before the
+        // task started must stop it before any dispatch, so check it here.
+        if owner.is_cancelled() {
+            cx.cancel.cancel();
+        }
         let child = cx.cancel.clone();
         let watcher = tokio::spawn(async move {
             tokio::select! { _ = owner.cancelled() => child.cancel(), _ = child.cancelled() => {} }

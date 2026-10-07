@@ -14,7 +14,7 @@ use rmcp::{
     ClientHandler, Peer, RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest, Implementation,
-        PaginatedRequestParams, ProtocolVersion, Request,
+        ListToolsRequest, PaginatedRequestParams, ProtocolVersion, Request, ServerResult,
     },
     service::{
         ClientInitializeError, MaybeSendFuture, NotificationContext, PeerRequestOptions,
@@ -114,13 +114,36 @@ impl Connection {
         let request = ClientRequest::CallToolRequest(Request::new(
             CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments),
         ));
+        match self.request(request, cancel, deadline).await {
+            Ok(Ok(result)) => match serde_json::to_value(&result) {
+                Ok(value) => render_result(&value),
+                Err(error) => ToolOutput::error(format!("invalid tool result: {error}")),
+            },
+            Ok(Err(error)) => ToolOutput::error(self.describe(error)),
+            Err(Stopped::Cancelled) => ToolOutput::error("cancelled"),
+            Err(Stopped::TimedOut) => {
+                ToolOutput::error(format!("timed out after {:?}", self.timeout))
+            }
+        }
+    }
+
+    /// Sends `request` and waits for its response until `cancel` fires or `deadline`
+    /// passes. A request stopped that way is cancelled on the server with
+    /// `notifications/cancelled`, which also ends its HTTP request; so is one whose
+    /// future is dropped.
+    async fn request(
+        &self,
+        request: ClientRequest,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<Result<ServerResult, ServiceError>, Stopped> {
         let handle = match self
             .peer
             .send_request_with_option(request, PeerRequestOptions::no_options())
             .await
         {
             Ok(handle) => handle,
-            Err(error) => return self.failure(error),
+            Err(error) => return Ok(Err(error)),
         };
         let mut pending = Pending(Some(handle));
         let response = {
@@ -128,35 +151,30 @@ impl Connection {
             tokio::select! {
                 biased;
                 response = response => Ok(response),
-                _ = cancel.cancelled() => Err("cancelled"),
-                _ = tokio::time::sleep_until(deadline) => Err("timed out"),
+                _ = cancel.cancelled() => Err(Stopped::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => Err(Stopped::TimedOut),
             }
         };
-        let response = match response {
-            Ok(response) => response,
-            Err(reason) => {
-                pending.cancel(reason).await;
-                return ToolOutput::error(if reason == "cancelled" {
-                    reason.to_owned()
-                } else {
-                    format!("{reason} after {:?}", self.timeout)
-                });
-            }
-        };
-        pending.0 = None;
         match response {
-            Ok(Ok(result)) => match serde_json::to_value(&result) {
-                Ok(value) => render_result(&value),
-                Err(error) => ToolOutput::error(format!("invalid tool result: {error}")),
-            },
-            Ok(Err(error)) => self.failure(error),
-            // The connection ended and dropped the pending request.
-            Err(_) => self.failure(ServiceError::TransportClosed),
+            Ok(response) => {
+                pending.0 = None;
+                // A dropped responder means the connection ended.
+                Ok(response.unwrap_or(Err(ServiceError::TransportClosed)))
+            }
+            Err(stopped) => {
+                pending
+                    .cancel(match stopped {
+                        Stopped::Cancelled => "cancelled",
+                        Stopped::TimedOut => "timed out",
+                    })
+                    .await;
+                Err(stopped)
+            }
         }
     }
 
-    fn failure(&self, error: ServiceError) -> ToolOutput {
-        ToolOutput::error(match error {
+    fn describe(&self, error: ServiceError) -> String {
+        match error {
             ServiceError::McpError(error) => format!("error {}: {}", error.code.0, error.message),
             ServiceError::TransportClosed => format!(
                 "mcp server {} closed the connection{}",
@@ -167,8 +185,14 @@ impl Connection {
                 format!("mcp server {}: {}", self.server, chain(&*error.error))
             }
             error => format!("mcp server {}: {error}", self.server),
-        })
+        }
     }
+}
+
+/// Why a request ended without a response.
+enum Stopped {
+    Cancelled,
+    TimedOut,
 }
 
 /// Explains a closed connection caused by an oversized message.
@@ -304,7 +328,10 @@ impl Server {
             });
             // Servers without the tools capability contribute nothing.
             let tools = if info.capabilities.tools.is_some() {
-                list(&connection, config).await?
+                // The startup timeout bounds this too; the deadline lets the listing
+                // cancel itself on the server first.
+                let deadline = Instant::now() + startup;
+                list(&connection, config, &CancellationToken::new(), deadline).await?
             } else {
                 Vec::new()
             };
@@ -378,8 +405,8 @@ impl Server {
     /// Lists the tools again after `notifications/tools/list_changed`. A failed refresh
     /// keeps the previous list.
     async fn refresh(&self) {
-        let listing = list(&self.connection, &self.config);
-        if let Ok(Ok(tools)) = tokio::time::timeout(self.config.startup_timeout(), listing).await {
+        let deadline = Instant::now() + self.config.startup_timeout();
+        if let Ok(tools) = list(&self.connection, &self.config, &self.closed, deadline).await {
             *self.tools.write().expect("tool list poisoned") = tools;
         }
     }
@@ -407,17 +434,27 @@ impl Drop for Server {
     }
 }
 
-/// Follows `nextCursor` until the listing ends.
-async fn list(connection: &Arc<Connection>, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>> {
+/// Follows `nextCursor` until the listing ends, `cancel` fires or `deadline` passes.
+async fn list(
+    connection: &Arc<Connection>,
+    config: &ServerConfig,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<Vec<Arc<dyn Tool>>> {
     let mut listed = Vec::new();
     let mut bytes = 0;
     let mut cursor = None;
     for _ in 0..defaults::MAX_LIST_PAGES {
-        let page = connection
-            .peer
-            .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
-            .await
-            .context("tools/list")?;
+        let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
+            PaginatedRequestParams::default().with_cursor(cursor),
+        ));
+        let page = match connection.request(request, cancel, deadline).await {
+            Ok(Ok(ServerResult::ListToolsResult(page))) => page,
+            Ok(Ok(_)) => bail!("tools/list: unexpected response"),
+            Ok(Err(error)) => bail!("tools/list: {}", connection.describe(error)),
+            Err(Stopped::Cancelled) => bail!("tools/list cancelled"),
+            Err(Stopped::TimedOut) => bail!("tools/list timed out"),
+        };
         // Each page is bounded by the message limit; the listing as a whole by these.
         bytes += page
             .tools

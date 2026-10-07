@@ -525,6 +525,44 @@ async fn list_changed_refreshes_the_tools_later_nodes_receive() {
     servers.shutdown().await;
 }
 
+/// The tools/list requests a server has received.
+fn listings(log: &Path) -> Vec<Value> {
+    messages(log)
+        .into_iter()
+        .filter(|m| m["method"] == "tools/list")
+        .collect()
+}
+
+/// Calls the notify tool and waits until the refresh it triggers reaches the server.
+async fn trigger_refresh(server: &Server, log: &Path) -> Value {
+    let before = listings(log).len();
+    let output = server
+        .call("notify", json!({}), &CancellationToken::new())
+        .await;
+    assert_eq!(output.text_content(), "ok");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(refresh) = listings(log).into_iter().nth(before) {
+            return refresh;
+        }
+        assert!(Instant::now() < deadline, "no refresh listing");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_that_times_out_is_cancelled_on_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let mut config = server_config(&log, &[("KYORA_MCP_TEST_MODE", "stall-list")]);
+    config.startup_timeout_s = Some(1.0);
+    let server = start(dir.path(), &config).await;
+    let refresh = trigger_refresh(&server, &log).await;
+    let notice = cancelled_notice(&log, &refresh["id"]).await;
+    assert_eq!(notice["params"]["reason"], "timed out");
+    server.shutdown().await;
+}
+
 fn scripted(toolsets: McpToolsets, tool: &str, input: Value) -> (Runtime, TraceSink) {
     let tool = tool.to_owned();
     let provider = FnProvider::new(move |request: &ModelRequest| {

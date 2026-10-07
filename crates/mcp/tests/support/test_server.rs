@@ -2,7 +2,8 @@
 //!
 //! KYORA_MCP_TEST_LOG appends every received message (and the pid) as JSON lines.
 //! KYORA_MCP_TEST_MODE selects a startup failure (exit, hang, bad-version, no-tools,
-//! flood, many, bulky) or linger, which keeps running after stdin closes.
+//! flood, many, bulky), linger, which keeps running after stdin closes, or stall-list,
+//! which stops answering tools/list once the notify tool has run.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
 use serde_json::{Value, json};
 use std::{
@@ -96,6 +97,7 @@ fn main() {
                     .insert(params["requestId"].to_string());
             }
             "ping" => reply(&out, &id, json!({})),
+            "tools/list" if mode == "stall-list" && added.load(Ordering::SeqCst) => {}
             "tools/list" => {
                 let tools = tools(&mode, added.load(Ordering::SeqCst));
                 let start: usize = params["cursor"]

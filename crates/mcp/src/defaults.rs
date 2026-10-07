@@ -11,6 +11,8 @@ pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 pub const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Bound on sending a cancellation notice; the call itself has already ended.
 pub const CANCEL_NOTICE: Duration = Duration::from_secs(1);
+/// Bound on deleting an HTTP session that startup or shutdown left open.
+pub const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bytes of server stderr kept for startup diagnostics.
 pub const STDERR_TAIL_BYTES: usize = 2048;
 /// Largest single message accepted from a server: a stdio line, an HTTP JSON body or

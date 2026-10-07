@@ -238,6 +238,7 @@ pub struct Server {
     tools: RwLock<Vec<Arc<dyn Tool>>>,
     service: Mutex<Option<RunningService<RoleClient, Handler>>>,
     process: Mutex<Option<Process>>,
+    http: Option<HttpClient>,
     closed: CancellationToken,
 }
 
@@ -260,6 +261,10 @@ impl Server {
         };
         let mut process = None;
         let oversized = Arc::new(AtomicBool::new(false));
+        let http = match &config.url {
+            Some(_) => Some(http_client(config, env, oversized.clone())?),
+            None => None,
+        };
         let startup = config.startup_timeout();
         let started = tokio::time::timeout(startup, async {
             let service = if let Some(command) = &config.command {
@@ -275,8 +280,11 @@ impl Server {
                     .await
                     .map_err(initialize_error)?
             } else {
+                let (client, transport) = http.clone().expect("http client for a url server");
                 handler
-                    .serve(http_transport(config, env, oversized.clone())?)
+                    .serve(StreamableHttpClientTransport::with_client(
+                        client, transport,
+                    ))
                     .await
                     .map_err(initialize_error)?
             };
@@ -314,6 +322,10 @@ impl Server {
                     Some(process) => process.kill().await,
                     None => String::new(),
                 };
+                // rmcp leaves startup requests running and sessions open on failure.
+                if let Some((client, _)) = &http {
+                    client.close().await;
+                }
                 let mut message = format!("{error:#}{}", limit_note(&oversized));
                 if !stderr.is_empty() {
                     message.push_str(&format!(" (stderr: {stderr})"));
@@ -329,6 +341,7 @@ impl Server {
             tools: RwLock::new(tools),
             service: Mutex::new(Some(service)),
             process: Mutex::new(process),
+            http: http.map(|(client, _)| client),
             closed: CancellationToken::new(),
         });
         let weak = Arc::downgrade(&server);
@@ -380,6 +393,9 @@ impl Server {
         }
         if let Some(process) = self.process.lock().await.take() {
             process.stop().await;
+        }
+        if let Some(http) = &self.http {
+            http.close().await;
         }
     }
 }
@@ -439,11 +455,12 @@ async fn list(connection: &Arc<Connection>, config: &ServerConfig) -> Result<Vec
     )
 }
 
-fn http_transport(
+/// The HTTP client and rmcp transport settings for a url server.
+fn http_client(
     config: &ServerConfig,
     env: &[(OsString, OsString)],
     oversized: Arc<AtomicBool>,
-) -> Result<StreamableHttpClientTransport<HttpClient>> {
+) -> Result<(HttpClient, StreamableHttpClientTransportConfig)> {
     let lookup = |variable: &str| {
         env.iter()
             .find(|(name, _)| name == variable)
@@ -465,24 +482,27 @@ fn http_transport(
         value.set_sensitive(true);
         headers.insert(HeaderName::from_bytes(name.as_bytes())?, value);
     }
-    let url = config.url.as_deref().expect("validated url");
-    let mut transport = StreamableHttpClientTransportConfig::with_uri(url)
-        .custom_headers(headers)
+    let url: Arc<str> = config.url.as_deref().expect("validated url").into();
+    let auth_header = match &config.bearer_token_env {
+        Some(variable) => Some(lookup(variable)?),
+        None => None,
+    };
+    let mut transport = StreamableHttpClientTransportConfig::with_uri(url.clone())
+        .custom_headers(headers.clone())
         .max_sse_event_size(defaults::MAX_MESSAGE_BYTES);
-    if let Some(variable) = &config.bearer_token_env {
-        transport = transport.auth_header(lookup(variable)?);
+    if let Some(token) = &auth_header {
+        transport = transport.auth_header(token.clone());
     }
     // Redirects are refused: following one would send env-sourced headers, and on a
     // scheme downgrade the bearer token, to a location the config never named.
-    let client = HttpClient {
-        http: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
-        oversized,
-    };
-    Ok(StreamableHttpClientTransport::with_client(
-        client, transport,
-    ))
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(config.startup_timeout())
+        .build()?;
+    // A response may take as long as the slowest call or listing it answers.
+    let timeout = config.startup_timeout().max(config.tool_timeout());
+    let client = HttpClient::new(http, timeout, oversized, url, auth_header, headers);
+    Ok((client, transport))
 }
 
 /// Every configured server that started. Failures are returned, never fatal.

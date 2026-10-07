@@ -295,3 +295,69 @@ async fn oversized_http_bodies_are_refused() {
     let message = format!("{:#}", started.err().expect("oversized body accepted"));
     assert!(message.contains("exceeds 16777216 bytes"), "{message}");
 }
+
+/// Answers initialize with a session, then fails or stalls notifications/initialized.
+struct Abandoned {
+    session: &'static str,
+    stall: bool,
+}
+
+impl Respond for Abandoned {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match request.method.as_str() {
+            "GET" => return ResponseTemplate::new(405),
+            "DELETE" => return ResponseTemplate::new(200),
+            _ => {}
+        }
+        let message: Value = serde_json::from_slice(&request.body).unwrap();
+        match message["method"].as_str().unwrap_or_default() {
+            "initialize" => json_reply(
+                &message["id"],
+                json!({
+                    "protocolVersion": message["params"]["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "remote", "version": "1"},
+                }),
+            )
+            .insert_header("mcp-session-id", self.session),
+            _ if self.stall => ResponseTemplate::new(202).set_delay(Duration::from_secs(30)),
+            _ => ResponseTemplate::new(500).set_body_string("not json"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_http_startups_delete_the_session_they_opened() {
+    for (session, stall) in [("stalled-session", true), ("failed-session", false)] {
+        let mock = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(Abandoned { session, stall })
+            .mount(&mock)
+            .await;
+        let config = ServerConfig {
+            url: Some(mock.uri()),
+            startup_timeout_s: Some(1.0),
+            ..ServerConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        assert!(
+            Server::start("remote", &config, dir.path(), &[])
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "{session}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let requests = mock.received_requests().await.unwrap();
+            if requests.iter().any(|request| {
+                request.method.as_str() == "DELETE"
+                    && header(request, "mcp-session-id") == Some(session)
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{session} was not deleted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}

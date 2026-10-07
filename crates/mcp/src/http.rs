@@ -2,7 +2,9 @@
 //!
 //! rmcp's bundled client is written against a newer reqwest with a different TLS
 //! stack. This adapter implements the transport's small client trait instead, so
-//! the binary keeps one HTTP and TLS implementation.
+//! the binary keeps one HTTP and TLS implementation. It also owns every request it
+//! sends: all of them can be cancelled at once, wait at most a bounded time for a
+//! response, and the session the server assigned is remembered until it is deleted.
 use crate::defaults;
 use futures::{StreamExt, stream::BoxStream};
 use reqwest::{
@@ -21,10 +23,12 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: &str = "mcp-session-id";
 const LAST_EVENT_ID: &str = "last-event-id";
@@ -39,9 +43,145 @@ type Events = BoxStream<'static, Result<Sse, SseError>>;
 
 #[derive(Clone)]
 pub(crate) struct HttpClient {
-    pub(crate) http: reqwest::Client,
+    http: reqwest::Client,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    /// Ends every request in flight, including those rmcp sends during startup.
+    cancel: CancellationToken,
+    /// Bounds the wait for response headers and for a whole non-streaming body.
+    timeout: Duration,
     /// Set when a body or event outgrew its limit, to explain the failure.
-    pub(crate) oversized: Arc<AtomicBool>,
+    oversized: Arc<AtomicBool>,
+    /// What a DELETE of a leftover session needs.
+    uri: Arc<str>,
+    auth_header: Option<String>,
+    headers: HashMap<HeaderName, HeaderValue>,
+    /// The session the server assigned and nobody has deleted yet.
+    session: Mutex<Option<Arc<str>>>,
+}
+
+impl HttpClient {
+    pub(crate) fn new(
+        http: reqwest::Client,
+        timeout: Duration,
+        oversized: Arc<AtomicBool>,
+        uri: Arc<str>,
+        auth_header: Option<String>,
+        headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Self {
+        let shared = Shared {
+            cancel: CancellationToken::new(),
+            timeout,
+            oversized,
+            uri,
+            auth_header,
+            headers,
+            session: Mutex::new(None),
+        };
+        Self {
+            http,
+            shared: Arc::new(shared),
+        }
+    }
+
+    /// Ends every request and stream in flight, then deletes a session that is still
+    /// open, for example after a failed startup that rmcp abandoned.
+    pub(crate) async fn close(&self) {
+        self.shared.cancel.cancel();
+        let Some(session) = self.take_session() else {
+            return;
+        };
+        let request = self.http.delete(self.shared.uri.as_ref());
+        let request = headers(
+            request,
+            Some(session),
+            self.shared.auth_header.clone(),
+            self.shared.headers.clone(),
+        );
+        let _ = tokio::time::timeout(defaults::DELETE_TIMEOUT, request.send()).await;
+    }
+
+    fn take_session(&self) -> Option<Arc<str>> {
+        self.shared.session.lock().expect("session poisoned").take()
+    }
+
+    fn remember(&self, session: &str) {
+        *self.shared.session.lock().expect("session poisoned") = Some(session.into());
+    }
+
+    fn forget(&self, session: &str) {
+        let mut current = self.shared.session.lock().expect("session poisoned");
+        if current.as_deref() == Some(session) {
+            *current = None;
+        }
+    }
+
+    /// Runs `work` unless the client is closed or the request timeout passes.
+    async fn bounded<T>(
+        &self,
+        work: impl Future<Output = Result<T, reqwest::Error>>,
+    ) -> Result<T, Error> {
+        tokio::select! {
+            biased;
+            _ = self.shared.cancel.cancelled() => Err(io_error(std::io::ErrorKind::Interrupted, "request cancelled")),
+            done = tokio::time::timeout(self.shared.timeout, work) => match done {
+                Ok(done) => done.map_err(client_error),
+                Err(_) => Err(io_error(std::io::ErrorKind::TimedOut, "request timed out")),
+            },
+        }
+    }
+
+    /// Reads at most `limit` bytes of the body; the flag is false when there was more.
+    async fn body(&self, mut response: Response, limit: usize) -> Result<(Vec<u8>, bool), Error> {
+        self.bounded(async move {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if body.len() + chunk.len() > limit {
+                    body.extend_from_slice(&chunk[..limit - body.len()]);
+                    return Ok((body, false));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok((body, true))
+        })
+        .await
+    }
+
+    /// Parses the body as SSE until the client closes, failing once a single event
+    /// grows past `limit` bytes.
+    fn events(&self, response: Response, limit: usize) -> Events {
+        let oversized = self.shared.oversized.clone();
+        let mut size = 0usize;
+        let mut line_start = true;
+        let bytes = response
+            .bytes_stream()
+            .take_until(self.shared.cancel.clone().cancelled_owned())
+            .map(move |chunk| {
+                let chunk = chunk.map_err(|error| std::io::Error::other(error.without_url()))?;
+                for &byte in chunk.iter() {
+                    match byte {
+                        // A blank line ends the event.
+                        b'\n' if line_start => size = 0,
+                        b'\n' => line_start = true,
+                        b'\r' => {}
+                        _ => {
+                            line_start = false;
+                            size += 1;
+                            if size > limit {
+                                oversized.store(true, Ordering::SeqCst);
+                                return Err(std::io::Error::other(
+                                    "SSE event exceeds the size limit",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(chunk)
+            });
+        SseStream::from_bytes_stream(bytes).boxed()
+    }
 }
 
 impl StreamableHttpClient for HttpClient {
@@ -82,10 +222,16 @@ impl StreamableHttpClient for HttpClient {
             .post(uri.as_ref())
             .header(ACCEPT, ACCEPTS)
             .json(&message);
-        let response = headers(request, session_id, auth_header, custom_headers)
-            .send()
-            .await
-            .map_err(client_error)?;
+        let request = headers(request, session_id, auth_header, custom_headers);
+        let response = self.bounded(request.send()).await?;
+        let session = response
+            .headers()
+            .get(SESSION_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if let Some(session) = &session {
+            self.remember(session);
+        }
         let status = response.status();
         if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
             return Ok(StreamableHttpPostResponse::Accepted);
@@ -94,14 +240,10 @@ impl StreamableHttpClient for HttpClient {
             return Err(StreamableHttpError::SessionExpired);
         }
         auth_required(&response)?;
-        let session = response
-            .headers()
-            .get(SESSION_ID)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
         let kind = content_type(&response);
         if !status.is_success() {
-            let (body, whole) = read_body(response, defaults::ERROR_BODY_BYTES)
+            let (body, whole) = self
+                .body(response, defaults::ERROR_BODY_BYTES)
                 .await
                 .unwrap_or_default();
             // JSON-RPC errors sent with an HTTP error status still answer the request.
@@ -120,16 +262,14 @@ impl StreamableHttpClient for HttpClient {
         }
         if kind.starts_with(EVENT_STREAM) {
             return Ok(StreamableHttpPostResponse::Sse(
-                events(response, max_sse_event_size, self.oversized.clone()),
+                self.events(response, max_sse_event_size),
                 session,
             ));
         }
         if kind.starts_with(JSON) {
-            let (body, whole) = read_body(response, defaults::MAX_MESSAGE_BYTES)
-                .await
-                .map_err(client_error)?;
+            let (body, whole) = self.body(response, defaults::MAX_MESSAGE_BYTES).await?;
             if !whole {
-                self.oversized.store(true, Ordering::SeqCst);
+                self.shared.oversized.store(true, Ordering::SeqCst);
                 return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                     format!(
                         "response body exceeds {} bytes",
@@ -160,10 +300,15 @@ impl StreamableHttpClient for HttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), Error> {
         let request = self.http.delete(uri.as_ref());
-        let response = headers(request, Some(session_id), auth_header, custom_headers)
-            .send()
-            .await
-            .map_err(client_error)?;
+        let request = headers(
+            request,
+            Some(session_id.clone()),
+            auth_header,
+            custom_headers,
+        );
+        let response = self.bounded(request.send()).await?;
+        // Answered either way; the session needs no second DELETE.
+        self.forget(&session_id);
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
@@ -203,10 +348,8 @@ impl StreamableHttpClient for HttpClient {
         if let Some(id) = last_event_id {
             request = request.header(LAST_EVENT_ID, id);
         }
-        let response = headers(request, session_id, auth_header, custom_headers)
-            .send()
-            .await
-            .map_err(client_error)?;
+        let request = headers(request, session_id, auth_header, custom_headers);
+        let response = self.bounded(request.send()).await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -218,13 +361,17 @@ impl StreamableHttpClient for HttpClient {
                 (!kind.is_empty()).then_some(kind),
             ));
         }
-        Ok(events(response, max_sse_event_size, self.oversized.clone()))
+        Ok(self.events(response, max_sse_event_size))
     }
 }
 
 /// reqwest errors name the request URL; keep what happened without it.
 fn client_error(error: reqwest::Error) -> Error {
     StreamableHttpError::Client(error.without_url())
+}
+
+fn io_error(kind: std::io::ErrorKind, message: &'static str) -> Error {
+    StreamableHttpError::Io(std::io::Error::new(kind, message))
 }
 
 fn headers(
@@ -264,47 +411,4 @@ fn content_type(response: &Response) -> String {
         .get(CONTENT_TYPE)
         .map(|value| String::from_utf8_lossy(value.as_bytes()).to_ascii_lowercase())
         .unwrap_or_default()
-}
-
-/// Reads at most `limit` bytes of the body; the flag is false when there was more.
-async fn read_body(
-    mut response: Response,
-    limit: usize,
-) -> Result<(Vec<u8>, bool), reqwest::Error> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > limit {
-            body.extend_from_slice(&chunk[..limit - body.len()]);
-            return Ok((body, false));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok((body, true))
-}
-
-/// Parses the body as SSE, failing once a single event grows past `limit` bytes.
-fn events(response: Response, limit: usize, oversized: Arc<AtomicBool>) -> Events {
-    let mut size = 0usize;
-    let mut line_start = true;
-    let bytes = response.bytes_stream().map(move |chunk| {
-        let chunk = chunk.map_err(|error| std::io::Error::other(error.without_url()))?;
-        for &byte in chunk.iter() {
-            match byte {
-                // A blank line ends the event.
-                b'\n' if line_start => size = 0,
-                b'\n' => line_start = true,
-                b'\r' => {}
-                _ => {
-                    line_start = false;
-                    size += 1;
-                    if size > limit {
-                        oversized.store(true, Ordering::SeqCst);
-                        return Err(std::io::Error::other("SSE event exceeds the size limit"));
-                    }
-                }
-            }
-        }
-        Ok(chunk)
-    });
-    SseStream::from_bytes_stream(bytes).boxed()
 }

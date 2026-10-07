@@ -183,7 +183,10 @@ pub struct Runtime(Arc<RuntimeInner>);
 #[derive(Default)]
 struct Work {
     closed: bool,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Owned child and leaf tasks with their cancellation tokens. A cell-owned
+    /// child's token need not descend from the node token, so shutdown cancels
+    /// each one directly.
+    tasks: Vec<(tokio::task::JoinHandle<()>, CancellationToken)>,
 }
 #[derive(Default)]
 struct NodeState {
@@ -434,9 +437,14 @@ impl Runtime {
             work.closed = true;
             self.0.ledger.close_admission(cx.id);
             cx.cancel.cancel();
+            // Cancel synchronously, so a task that has not started yet begins cancelled
+            // instead of dispatching work before a bridge or watcher runs.
+            for (_, cancel) in &work.tasks {
+                cancel.cancel();
+            }
             std::mem::take(&mut work.tasks)
         };
-        for task in tasks {
+        for (task, _) in tasks {
             if task.await.is_err() {
                 self.0.panicked.store(true, Ordering::SeqCst);
             }
@@ -1347,17 +1355,27 @@ impl NodeCtx {
         let parent_state = self.state.clone();
         let runtime = self.runtime.clone();
         let parent_cancel = self.cancel.clone();
-        work.tasks.push(tokio::spawn(async move {
+        let child_token = cx.cancel.clone();
+        let task = tokio::spawn(async move {
             // Cell tokens may be supplied by external adapters; also enforce parent cancellation.
             let child_cancel = cx.cancel.clone();
             let bridge = tokio::spawn(async move {
                 tokio::select! { _ = parent_cancel.cancelled() => child_cancel.cancel(), _ = child_cancel.cancelled() => {} }
             });
             let state = cx.state.clone();
-            let result = runtime.run_node(cx, agent_spec, settings, owner_token).await;
+            let result = runtime
+                .run_node(cx, agent_spec, settings, owner_token)
+                .await;
             bridge.abort();
             let _ = bridge.await;
-            let result = result.unwrap_or_else(|_| runtime.outcome(id, Status::Failed, Answer::Text(String::new()), state.turns.load(Ordering::SeqCst)));
+            let result = result.unwrap_or_else(|_| {
+                runtime.outcome(
+                    id,
+                    Status::Failed,
+                    Answer::Text(String::new()),
+                    state.turns.load(Ordering::SeqCst),
+                )
+            });
             tx.send_replace(Some(result.clone()));
             // The handle resolves first, so a parent woken by the notice can read the outcome.
             if notify {
@@ -1365,7 +1383,8 @@ impl NodeCtx {
             } else {
                 parent_state.mailbox.touch();
             }
-        }));
+        });
+        work.tasks.push((task, child_token));
         Ok(handle)
     }
     /// Resolves an address relative to this agent: "parent", a node id such as "3"
@@ -1742,11 +1761,13 @@ impl NodeCtx {
                 cwd: self.cwd.clone(),
                 options: call.options.clone(),
             };
+            let leaf_token = cx.cancel.clone();
             // Own the task independently of the waiting future so settlement always completes.
-            work.tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let result = cx.llm_owned(call, owner).await;
                 let _ = tx.send(result);
-            }));
+            });
+            work.tasks.push((task, leaf_token));
         }
         rx.await
             .map_err(|e| RecursionError::ModelError(e.to_string()))?
@@ -1759,6 +1780,11 @@ impl NodeCtx {
         let cx = self;
         let id = self.id;
         let model = self.model.clone();
+        // The watcher only runs once this task yields. An owner cancelled before the
+        // task started must stop it before any dispatch, so check it here.
+        if owner.is_cancelled() {
+            cx.cancel.cancel();
+        }
         let child = cx.cancel.clone();
         let watcher = tokio::spawn(async move {
             tokio::select! { _ = owner.cancelled() => child.cancel(), _ = child.cancelled() => {} }

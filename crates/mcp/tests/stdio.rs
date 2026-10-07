@@ -686,6 +686,57 @@ async fn the_runtime_calls_mcp_tools_like_any_other_tool() {
 }
 
 #[tokio::test]
+async fn valid_inputs_outside_the_local_schema_subset_reach_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "v": {"type": "null"},
+            "u": {"type": ["string", "integer"]},
+            "x": {"type": "integer"},
+            "c": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        },
+        "patternProperties": {"^p_": {"type": "integer"}},
+        "additionalProperties": false,
+    });
+    let config = McpConfig {
+        servers: BTreeMap::from([(
+            "fake".into(),
+            server_config(
+                &dir.path().join("log.jsonl"),
+                &[
+                    ("KYORA_MCP_TEST_EXTRA_TOOL", "schema"),
+                    ("KYORA_MCP_TEST_EXTRA_SCHEMA", &schema.to_string()),
+                ],
+            ),
+        )]),
+    };
+    let (servers, _) = Servers::start_with_env(&config, dir.path(), &environment()).await;
+    let servers = Arc::new(servers);
+    let input = json!({"v": null, "u": 3, "x": 1.0, "c": null, "p_extra": 2});
+    let (runtime, trace) = scripted(
+        McpToolsets::new(&Toolset::default(), servers.clone()),
+        "mcp__fake__schema",
+        input.clone(),
+    );
+    let mut events = trace.subscribe();
+    runtime.run(spec(dir.path(), None)).await.unwrap();
+    let mut result = None;
+    while let Ok(record) = events.try_recv() {
+        if let TraceEvent::ToolResult {
+            content, is_error, ..
+        } = record.event
+        {
+            result = Some((content, is_error));
+        }
+    }
+    let (content, is_error) = result.unwrap();
+    assert!(!is_error, "{content}");
+    assert_eq!(serde_json::from_str::<Value>(&content).unwrap(), input);
+    servers.shutdown().await;
+}
+
+#[tokio::test]
 async fn runtime_cancellation_reaches_read_only_and_mutating_calls() {
     for tool in ["slow_read", "slow"] {
         let dir = tempfile::tempdir().unwrap();

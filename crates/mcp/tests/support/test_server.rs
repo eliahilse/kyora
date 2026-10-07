@@ -5,7 +5,8 @@
 //! flood, many, bulky), linger, which keeps running after stdin closes, or stall-list,
 //! which stops answering tools/list once the notify tool has run.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
-//! KYORA_MCP_TEST_EXTRA_TOOL adds a tool with that name.
+//! KYORA_MCP_TEST_EXTRA_TOOL adds a tool with that name, which echoes its arguments;
+//! KYORA_MCP_TEST_EXTRA_SCHEMA sets its input schema.
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -114,6 +115,11 @@ fn main() {
             }
             "tools/call" => {
                 let arguments = params["arguments"].clone();
+                let extra = std::env::var("KYORA_MCP_TEST_EXTRA_TOOL").ok();
+                if extra.as_deref() == params["name"].as_str() {
+                    reply(&out, &id, text(&arguments.to_string()));
+                    continue;
+                }
                 match params["name"].as_str().unwrap_or_default() {
                     "echo" => reply(&out, &id, text(arguments["text"].as_str().unwrap_or(""))),
                     "fail" => reply(
@@ -223,7 +229,11 @@ fn tools(mode: &str, added: bool) -> Vec<Value> {
         tools.push(json!({"name": "added", "inputSchema": object}));
     }
     if let Ok(name) = std::env::var("KYORA_MCP_TEST_EXTRA_TOOL") {
-        tools.push(json!({"name": name, "inputSchema": object}));
+        let schema = std::env::var("KYORA_MCP_TEST_EXTRA_SCHEMA")
+            .ok()
+            .and_then(|schema| serde_json::from_str(&schema).ok())
+            .unwrap_or(object);
+        tools.push(json!({"name": name, "inputSchema": schema}));
     }
     tools
 }

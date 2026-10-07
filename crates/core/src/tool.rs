@@ -81,6 +81,12 @@ pub trait Tool: Send + Sync {
     fn large_input(&self) -> bool {
         self.spec().large_input
     }
+    /// Whether the runtime checks inputs against the schema subset before calling.
+    /// Tools whose schemas are enforced elsewhere, such as MCP tools validated by
+    /// their server, return false so valid inputs outside the subset still arrive.
+    fn validate_locally(&self) -> bool {
+        true
+    }
     /// Executes one validated call. Implementations must honor cancellation.
     /// Started mutations must finish or stop safely before returning an outcome.
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput;
@@ -127,12 +133,15 @@ impl Toolset {
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.entries.values().map(|(s, _)| s.clone()).collect()
     }
-    /// Validates tool existence and arguments.
+    /// Validates tool existence and, unless the tool opts out, its arguments.
     pub fn validate(&self, name: &str, input: &Value) -> Result<()> {
-        let (spec, _) = self
+        let (spec, tool) = self
             .entries
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        if !tool.validate_locally() {
+            return Ok(());
+        }
         validate(&spec.input_schema, input)
     }
     /// Looks up a tool after validation.

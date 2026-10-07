@@ -72,6 +72,12 @@ impl Tool for McpTool {
         self.effect
     }
 
+    /// The server validates inputs against its full JSON Schema; the runtime's
+    /// subset would reject valid inputs such as null types or type unions.
+    fn validate_locally(&self) -> bool {
+        false
+    }
+
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
         let deadline = (Instant::now() + self.connection.timeout()).min(cx.node.deadline);
         self.connection

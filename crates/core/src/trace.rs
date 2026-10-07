@@ -1,5 +1,8 @@
 //! Shared persisted and live trace events. Stream events are ephemeral.
-use crate::{AgentOutcome, Limits, NodeId, Status, defaults};
+use crate::{
+    AgentOutcome, Limits, NodeId, Status, defaults,
+    messages::{Delivery, Envelope, MessageId},
+};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use kyora_protocol::{Message, StopReason, StreamEvent, ToolSpec, Usage};
@@ -126,6 +129,30 @@ pub enum TraceEvent {
         content: String,
         /// Execution failed.
         is_error: bool,
+    },
+    /// A message accepted into its recipient's mailbox, recorded before it can be delivered.
+    MessageSent {
+        /// The accepted envelope.
+        #[serde(flatten)]
+        message: Envelope,
+    },
+    /// Messages taken from an agent's mailbox, in delivery order.
+    MessageDelivered {
+        /// Recipient.
+        node: NodeId,
+        /// Delivered message ids.
+        messages: Vec<MessageId>,
+        /// Turn boundary, receive or wait.
+        via: Delivery,
+    },
+    /// A message that never reached its recipient, such as one still queued when the
+    /// recipient ended or a notice for a parent that had already ended.
+    MessageUndelivered {
+        /// The envelope, including its body.
+        #[serde(flatten)]
+        message: Envelope,
+        /// Why it was not delivered.
+        reason: String,
     },
     /// Node shutdown and final accounting.
     NodeEnd {

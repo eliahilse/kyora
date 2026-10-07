@@ -3,6 +3,10 @@ use crate::{
     AgentHandle, ChildSpec, ChildStatus, Effect, Limits, ModelRef, Owner, RecursionError, ToolCx,
     ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
+    messages::{
+        self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Pending, Refusal, Taken,
+        Waited,
+    },
     prompts,
     tool::truncate,
 };
@@ -16,15 +20,19 @@ use kyora_providers::{Accumulator, AttemptCharge, ModelProvider, ProviderError, 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
+    time::Duration,
 };
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::{Semaphore, watch},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 /// A final agent answer, text or a raw JSON value committed by a tool.
@@ -156,6 +164,16 @@ struct RuntimeInner {
     started: AtomicBool,
     panicked: AtomicBool,
     subagent_prompt: Mutex<String>,
+    agents: Mutex<BTreeMap<NodeId, AgentEntry>>,
+    messages: AtomicU64,
+}
+/// Directory entry used to address an agent and to wait for it.
+#[derive(Clone)]
+struct AgentEntry {
+    parent: Option<NodeId>,
+    name: String,
+    state: Arc<NodeState>,
+    outcome: Option<watch::Receiver<Option<AgentOutcome>>>,
 }
 /// Shared runtime for one invocation. `run` may be called exactly once.
 #[derive(Clone)]
@@ -170,6 +188,7 @@ struct NodeState {
     work: Mutex<Work>,
     tools: OnceLock<Vec<String>>,
     turns: AtomicU32,
+    mailbox: Mailbox,
 }
 struct AgentSettings {
     name: String,
@@ -256,6 +275,8 @@ impl Runtime {
             started: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
             subagent_prompt: Mutex::new(prompts::SUBAGENT.into()),
+            agents: Mutex::new(BTreeMap::new()),
+            messages: AtomicU64::new(0),
         })))
     }
     /// Overrides the default child system prompt before the invocation starts.
@@ -313,6 +334,7 @@ impl Runtime {
             cwd: spec.cwd.clone(),
             options: spec.options.clone(),
         };
+        self.register(0, None, "root".into(), cx.state.clone(), None);
         self.emit(TraceEvent::SessionStart {
             session: self.0.config.session.clone(),
             cwd: spec.cwd.clone(),
@@ -362,6 +384,11 @@ impl Runtime {
                 self.0.panicked.store(true, Ordering::SeqCst);
                 Err(anyhow::anyhow!("agent task panicked"))
             });
+        // Refuse new messages before children are cancelled, so their notices and any
+        // late sends fail visibly instead of queueing for an agent that has ended.
+        for message in cx.state.mailbox.close() {
+            self.undelivered(message).await;
+        }
         self.join_descendants(&cx).await;
         watcher.abort();
         let _ = watcher.await;
@@ -485,8 +512,14 @@ impl Runtime {
             .set(specs.iter().map(|tool| tool.name.clone()).collect())
             .expect("toolset frozen once");
         let mut history = Vec::new();
-        self.message(cx.id, &mut history, Message::user_text(spec.task))
-            .await?;
+        // Messages sent before the first request follow the task.
+        self.user_turn(
+            cx,
+            &mut history,
+            vec![ContentBlock::Text { text: spec.task }],
+            true,
+        )
+        .await?;
         let mut turns = 0;
         let mut answer = Answer::Text(String::new());
         let mut previous = None;
@@ -646,15 +679,17 @@ impl Runtime {
             }
             let has_tools = !results.is_empty();
             if has_tools {
-                self.message(
-                    cx.id,
-                    &mut history,
-                    Message {
-                        role: Role::User,
-                        content: results,
-                    },
-                )
-                .await?;
+                // Pending messages follow all tool results, never sit between them, and
+                // are only taken when another request will carry them.
+                let continues = final_answer.is_none()
+                    && !cx.cancel.is_cancelled()
+                    && Instant::now() < cx.deadline
+                    && turns < settings.max_turns
+                    && matches!(
+                        response.stop_reason,
+                        StopReason::ToolUse | StopReason::PauseTurn | StopReason::MaxTokens
+                    );
+                self.user_turn(cx, &mut history, results, continues).await?;
             }
             if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
                 break cx.cancel_status();
@@ -667,12 +702,30 @@ impl Runtime {
                 StopReason::ToolUse | StopReason::PauseTurn => {}
                 StopReason::EndTurn => {
                     answer = Answer::Text(assistant.text());
-                    break Status::Completed;
+                    if turns >= settings.max_turns {
+                        break Status::Completed;
+                    }
+                    // With children still running or messages pending, wait for them
+                    // instead of ending; the next turn starts with whatever arrived.
+                    match self.idle(cx).await {
+                        Some(taken) => self.deliver(cx, &mut history, Vec::new(), taken).await?,
+                        None if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline => {
+                            break cx.cancel_status();
+                        }
+                        None => break Status::Completed,
+                    }
                 }
                 StopReason::MaxTokens => {
                     if !has_tools {
-                        self.message(cx.id, &mut history, Message::user_text("continue"))
-                            .await?;
+                        self.user_turn(
+                            cx,
+                            &mut history,
+                            vec![ContentBlock::Text {
+                                text: "continue".into(),
+                            }],
+                            turns < settings.max_turns,
+                        )
+                        .await?;
                     }
                 }
                 StopReason::ModelContextWindowExceeded => break Status::ContextExhausted,
@@ -681,6 +734,144 @@ impl Runtime {
             }
         };
         Ok(self.outcome(cx.id, status, answer, turns))
+    }
+    /// Records a user message, appending pending messages when `deliver` is set.
+    async fn user_turn(
+        &self,
+        cx: &NodeCtx,
+        history: &mut Vec<Message>,
+        content: Vec<ContentBlock>,
+        deliver: bool,
+    ) -> Result<()> {
+        if deliver {
+            let taken = cx.state.mailbox.take_all();
+            if !taken.is_empty() {
+                return self.deliver(cx, history, content, taken).await;
+            }
+        }
+        self.message(
+            cx.id,
+            history,
+            Message {
+                role: Role::User,
+                content,
+            },
+        )
+        .await
+    }
+    /// Appends taken messages as text blocks after `content` and records the user message.
+    async fn deliver(
+        &self,
+        cx: &NodeCtx,
+        history: &mut Vec<Message>,
+        mut content: Vec<ContentBlock>,
+        taken: Taken<'_>,
+    ) -> Result<()> {
+        self.emit(TraceEvent::MessageDelivered {
+            node: cx.id,
+            messages: taken.ids(),
+            via: Delivery::Turn,
+        })
+        .await?;
+        content.extend(taken.finish().iter().map(|message| ContentBlock::Text {
+            text: self.render(message),
+        }));
+        self.message(
+            cx.id,
+            history,
+            Message {
+                role: Role::User,
+                content,
+            },
+        )
+        .await
+    }
+    /// Waits at the end of a turn until messages arrive or nothing more can arrive.
+    /// Returns None once the mailbox has closed or the node is cancelled.
+    async fn idle<'a>(&self, cx: &'a NodeCtx) -> Option<Taken<'a>> {
+        loop {
+            let mut changed = cx.state.mailbox.subscribe();
+            match cx.state.mailbox.idle() {
+                Idle::Deliver(taken) => return Some(taken),
+                Idle::Done => return None,
+                Idle::Wait => {}
+            }
+            tokio::select! {
+                biased;
+                _ = cx.cancel.cancelled() => return None,
+                _ = tokio::time::sleep_until(cx.deadline) => return None,
+                _ = changed.changed() => {}
+            }
+        }
+    }
+    fn register(
+        &self,
+        id: NodeId,
+        parent: Option<NodeId>,
+        name: String,
+        state: Arc<NodeState>,
+        outcome: Option<watch::Receiver<Option<AgentOutcome>>>,
+    ) {
+        self.agents().insert(
+            id,
+            AgentEntry {
+                parent,
+                name,
+                state,
+                outcome,
+            },
+        );
+    }
+    fn agents(&self) -> std::sync::MutexGuard<'_, BTreeMap<NodeId, AgentEntry>> {
+        self.0
+            .agents
+            .lock()
+            .expect("agent directory mutex poisoned")
+    }
+    fn name(&self, id: NodeId) -> String {
+        self.agents()
+            .get(&id)
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default()
+    }
+    fn render(&self, message: &Envelope) -> String {
+        message.render(&self.name(message.from))
+    }
+    fn next_message(&self) -> MessageId {
+        self.0.messages.fetch_add(1, Ordering::SeqCst)
+    }
+    // A failed trace write also fails node_end and so surfaces there; delivery
+    // bookkeeping does not depend on message records.
+    async fn undelivered(&self, message: Envelope) {
+        let _ = self
+            .emit(TraceEvent::MessageUndelivered {
+                message,
+                reason: "recipient ended".into(),
+            })
+            .await;
+    }
+    /// Posts a node-owned child's terminal notice to its parent's mailbox.
+    async fn notify(&self, parent: NodeId, mailbox: &Mailbox, outcome: &AgentOutcome) {
+        let message = Envelope {
+            id: self.next_message(),
+            from: outcome.node,
+            to: parent,
+            kind: MessageKind::for_status(outcome.status),
+            body: truncate(&outcome.answer.text(), self.0.config.limits.message_chars),
+            sent_at: chrono::Utc::now(),
+            spawn: Some(outcome.node),
+            status: Some(outcome.status),
+        };
+        if !mailbox.is_closed() {
+            let _ = self
+                .emit(TraceEvent::MessageSent {
+                    message: message.clone(),
+                })
+                .await;
+        }
+        if let Err(message) = mailbox.push(message) {
+            self.undelivered(message).await;
+        }
     }
     async fn emit_error(&self, node: NodeId, error: &CallError) -> Result<()> {
         self.emit(TraceEvent::Error {
@@ -1065,6 +1256,21 @@ impl NodeCtx {
             node: Arc::new(cx.clone()),
             outcome,
         };
+        // A node-owned child reports its ending to this agent's mailbox. The result of a
+        // cell-owned child belongs to the cell that owns it, so no notice is posted.
+        let notify = owner_token.is_none();
+        self.runtime.register(
+            id,
+            Some(self.id),
+            settings.name.clone(),
+            cx.state.clone(),
+            Some(handle.outcome.clone()),
+        );
+        if notify {
+            self.state.mailbox.expect(id);
+        }
+        let parent = self.id;
+        let parent_state = self.state.clone();
         let runtime = self.runtime.clone();
         let parent_cancel = self.cancel.clone();
         work.tasks.push(tokio::spawn(async move {
@@ -1078,9 +1284,271 @@ impl NodeCtx {
             bridge.abort();
             let _ = bridge.await;
             let result = result.unwrap_or_else(|_| runtime.outcome(id, Status::Failed, Answer::Text(String::new()), state.turns.load(Ordering::SeqCst)));
-            tx.send_replace(Some(result));
+            tx.send_replace(Some(result.clone()));
+            // The handle resolves first, so a parent woken by the notice can read the outcome.
+            if notify {
+                runtime.notify(parent, &parent_state.mailbox, &result).await;
+            } else {
+                parent_state.mailbox.touch();
+            }
         }));
         Ok(handle)
+    }
+    /// Resolves an address relative to this agent: "parent", a node id such as "3"
+    /// or "#3", or the name of its parent, a child or a sibling. Ids win over names.
+    pub fn resolve(&self, address: &str) -> std::result::Result<NodeId, RecursionError> {
+        let address = address.trim();
+        let agents = self.runtime.agents();
+        let parent = agents.get(&self.id).and_then(|entry| entry.parent);
+        if address == "parent" {
+            return parent.ok_or_else(|| {
+                RecursionError::InvalidRequest("the root agent has no parent".into())
+            });
+        }
+        if let Ok(id) = address.strip_prefix('#').unwrap_or(address).parse() {
+            return Ok(id);
+        }
+        let named = agents
+            .iter()
+            .filter(|(id, entry)| {
+                **id != self.id
+                    && !entry.name.is_empty()
+                    && entry.name == address
+                    && (Some(**id) == parent
+                        || entry.parent == Some(self.id)
+                        || (parent.is_some() && entry.parent == parent))
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        match named[..] {
+            [id] => Ok(id),
+            [] => Err(RecursionError::InvalidRequest(format!(
+                "unknown agent: {address}"
+            ))),
+            _ => Err(RecursionError::InvalidRequest(format!(
+                "ambiguous agent name: {address}; use its id"
+            ))),
+        }
+    }
+    /// Returns the recipient's state and the spawn a message to it belongs to.
+    /// Addressing is limited to this agent's parent, children and siblings.
+    fn kin(
+        &self,
+        to: NodeId,
+    ) -> std::result::Result<(Arc<NodeState>, Option<NodeId>), RecursionError> {
+        let agents = self.runtime.agents();
+        let unknown = || RecursionError::InvalidRequest(format!("unknown agent: {to}"));
+        let me = agents.get(&self.id).ok_or_else(unknown)?;
+        let target = agents.get(&to).ok_or_else(unknown)?;
+        if to == self.id {
+            return Err(RecursionError::InvalidRequest(
+                "cannot send a message to yourself".into(),
+            ));
+        }
+        let spawn = if me.parent == Some(to) {
+            Some(self.id)
+        } else if target.parent == Some(self.id) {
+            Some(to)
+        } else if me.parent.is_some() && me.parent == target.parent {
+            None
+        } else {
+            return Err(RecursionError::InvalidRequest(format!(
+                "agent {to} is not this agent's parent, child or sibling"
+            )));
+        };
+        Ok((target.state.clone(), spawn))
+    }
+    /// Queues a message for the parent, a child or a sibling and returns its id
+    /// without waiting for the recipient. It is delivered at the recipient's next
+    /// turn boundary or by its receive call. A full mailbox refuses it at once.
+    pub async fn send(
+        &self,
+        to: NodeId,
+        body: impl Into<String>,
+    ) -> std::result::Result<MessageId, RecursionError> {
+        let limits = &self.runtime.0.config.limits;
+        let body = body.into();
+        if body.chars().count() > limits.message_chars {
+            return Err(RecursionError::InvalidRequest(format!(
+                "message exceeds {} characters",
+                limits.message_chars
+            )));
+        }
+        self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
+        let (recipient, spawn) = self.kin(to)?;
+        recipient
+            .mailbox
+            .reserve(limits.mailbox_capacity as usize)
+            .map_err(|refusal| match refusal {
+                Refusal::Full => RecursionError::MailboxFull { agent: to },
+                Refusal::Closed => RecursionError::AgentFinished { agent: to },
+            })?;
+        let message = Envelope {
+            id: self.runtime.next_message(),
+            from: self.id,
+            to,
+            kind: MessageKind::Message,
+            body,
+            sent_at: chrono::Utc::now(),
+            spawn,
+            status: None,
+        };
+        let id = message.id;
+        // The send record precedes any delivery record. If this future is dropped
+        // while the record is written, the guard still queues the message.
+        let pending = Pending::new(&recipient.mailbox, message.clone());
+        let _ = self.runtime.emit(TraceEvent::MessageSent { message }).await;
+        match pending.push() {
+            Ok(()) => Ok(id),
+            Err(message) => {
+                self.runtime.undelivered(message).await;
+                Err(RecursionError::AgentFinished { agent: to })
+            }
+        }
+    }
+    /// Takes every pending message. When none is pending, waits up to `yield_after`
+    /// for the first one, and returns an empty list if none arrives in time.
+    pub async fn receive(
+        &self,
+        yield_after: Duration,
+    ) -> std::result::Result<Vec<Envelope>, RecursionError> {
+        let until = Instant::now()
+            .checked_add(yield_after)
+            .map_or(self.deadline, |until| until.min(self.deadline));
+        loop {
+            let mut changed = self.state.mailbox.subscribe();
+            self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
+            let taken = self.state.mailbox.take_all();
+            if !taken.is_empty() {
+                let _ = self
+                    .runtime
+                    .emit(TraceEvent::MessageDelivered {
+                        node: self.id,
+                        messages: taken.ids(),
+                        via: Delivery::Receive,
+                    })
+                    .await;
+                return Ok(taken.finish());
+            }
+            if self.state.mailbox.is_closed() {
+                return Err(RecursionError::Cancelled);
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(RecursionError::Cancelled),
+                _ = tokio::time::sleep_until(until) => return Ok(Vec::new()),
+                _ = changed.changed() => {}
+            }
+        }
+    }
+    /// Waits until the given children have finished; with None, every child whose
+    /// result has not been delivered yet. Returns early, listing the children still
+    /// running, when `timeout` passes. Takes the queued notices of finished children,
+    /// so their results are not delivered again at the next turn.
+    pub async fn wait(
+        &self,
+        agents: Option<&[NodeId]>,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<Waited, RecursionError> {
+        let children = self
+            .runtime
+            .agents()
+            .iter()
+            .filter(|(_, entry)| entry.parent == Some(self.id))
+            .filter_map(|(id, entry)| Some((*id, entry.outcome.clone()?)))
+            .collect::<BTreeMap<_, _>>();
+        let targets = match agents {
+            Some(agents) => agents
+                .iter()
+                .map(|id| {
+                    if children.contains_key(id) {
+                        Ok(*id)
+                    } else {
+                        Err(RecursionError::InvalidRequest(format!(
+                            "agent {id} is not a child of this agent"
+                        )))
+                    }
+                })
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?,
+            None => self
+                .state
+                .mailbox
+                .outstanding()
+                .into_iter()
+                .filter(|id| children.contains_key(id))
+                .collect(),
+        };
+        let until = timeout.map_or(self.deadline, |timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .map_or(self.deadline, |until| until.min(self.deadline))
+        });
+        // Finished means the outcome is published and any notice has been queued.
+        let finished =
+            |id: &NodeId| children[id].borrow().is_some() && !self.state.mailbox.is_awaiting(*id);
+        loop {
+            let mut changed = self.state.mailbox.subscribe();
+            self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
+            if targets.iter().all(finished) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(RecursionError::Cancelled),
+                _ = tokio::time::sleep_until(until) => break,
+                _ = changed.changed() => {}
+            }
+        }
+        let done = targets
+            .iter()
+            .copied()
+            .filter(finished)
+            .collect::<BTreeSet<_>>();
+        let taken = self.state.mailbox.take_notices(&done);
+        if !taken.is_empty() {
+            let _ = self
+                .runtime
+                .emit(TraceEvent::MessageDelivered {
+                    node: self.id,
+                    messages: taken.ids(),
+                    via: Delivery::Wait,
+                })
+                .await;
+        }
+        taken.finish();
+        Ok(Waited {
+            finished: done
+                .iter()
+                .map(|id| {
+                    children[id]
+                        .borrow()
+                        .clone()
+                        .expect("finished child has an outcome")
+                })
+                .collect(),
+            running: targets.difference(&done).copied().collect(),
+        })
+    }
+    /// Number of messages waiting in this agent's mailbox.
+    pub fn pending_messages(&self) -> usize {
+        self.state.mailbox.len()
+    }
+    /// Formats a message the way the runtime shows it to a model.
+    pub fn render(&self, message: &Envelope) -> String {
+        self.runtime.render(message)
+    }
+    /// Formats a finished child's outcome the way its terminal notice is shown.
+    pub fn render_outcome(&self, outcome: &AgentOutcome) -> String {
+        messages::render(
+            MessageKind::for_status(outcome.status),
+            outcome.node,
+            &self.runtime.name(outcome.node),
+            Some(outcome.status),
+            &truncate(
+                &outcome.answer.text(),
+                self.runtime.0.config.limits.message_chars,
+            ),
+        )
     }
     fn cancel_status(&self) -> Status {
         if Instant::now() >= self.deadline {

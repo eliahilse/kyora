@@ -10,8 +10,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub enum Owner {
     /// Cancel when the calling cell ends, or when the parent node ends.
+    /// The caller consumes the result through the handle; no notice is posted.
     Cell(CancellationToken),
     /// Keep running until explicitly cancelled or the parent node ends.
+    /// The child's result, error or cancellation arrives in the parent's mailbox.
     Node,
 }
 /// Optional child settings. Unspecified model and deadline inherit from the parent.
@@ -68,6 +70,18 @@ pub enum RecursionError {
     /// A leaf provider failed or refused the request.
     #[error("model error: {0}")]
     ModelError(String),
+    /// The recipient's mailbox already holds its capacity of undelivered messages.
+    #[error("mailbox of agent {agent} is full")]
+    MailboxFull {
+        /// Recipient.
+        agent: NodeId,
+    },
+    /// The recipient has finished and accepts no further messages.
+    #[error("agent {agent} has finished")]
+    AgentFinished {
+        /// Recipient.
+        agent: NodeId,
+    },
 }
 /// Live counters for a child; status is absent until shutdown completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]

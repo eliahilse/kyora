@@ -31,6 +31,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: &str = "mcp-session-id";
+const PROTOCOL_VERSION: &str = "mcp-protocol-version";
 const LAST_EVENT_ID: &str = "last-event-id";
 const EVENT_STREAM: &str = "text/event-stream";
 const JSON: &str = "application/json";
@@ -62,6 +63,8 @@ struct Shared {
     headers: HashMap<HeaderName, HeaderValue>,
     /// The session the server assigned and nobody has deleted yet.
     session: Mutex<Option<Arc<str>>>,
+    /// The negotiated MCP-Protocol-Version header, which every later request carries.
+    version: Mutex<Option<HeaderValue>>,
 }
 
 impl HttpClient {
@@ -83,6 +86,7 @@ impl HttpClient {
             auth_header,
             headers,
             session: Mutex::new(None),
+            version: Mutex::new(None),
         };
         Self {
             http,
@@ -102,18 +106,38 @@ impl HttpClient {
         let Some(session) = self.take_session() else {
             return;
         };
+        let mut custom = self.shared.headers.clone();
+        if let Some(version) = self
+            .shared
+            .version
+            .lock()
+            .expect("version poisoned")
+            .clone()
+        {
+            custom.insert(HeaderName::from_static(PROTOCOL_VERSION), version);
+        }
         let request = self.http.delete(self.shared.uri.as_ref());
         let request = headers(
             request,
             Some(session),
             self.shared.auth_header.clone(),
-            self.shared.headers.clone(),
+            custom,
         );
         let _ = tokio::time::timeout(defaults::DELETE_TIMEOUT, request.send()).await;
     }
 
     fn take_session(&self) -> Option<Arc<str>> {
         self.shared.session.lock().expect("session poisoned").take()
+    }
+
+    /// Keeps the version rmcp sends once the handshake has negotiated it.
+    fn note_version(&self, custom_headers: &HashMap<HeaderName, HeaderValue>) {
+        let version = custom_headers
+            .iter()
+            .find(|(name, _)| name.as_str() == PROTOCOL_VERSION);
+        if let Some((_, version)) = version {
+            *self.shared.version.lock().expect("version poisoned") = Some(version.clone());
+        }
     }
 
     fn remember(&self, session: &str) {
@@ -211,6 +235,7 @@ impl StreamableHttpClient for HttpClient {
     ) -> Result<StreamableHttpPostResponse, Error> {
         let attached = session_id.is_some();
         let expects_reply = matches!(message, JsonRpcMessage::Request(_));
+        self.note_version(&custom_headers);
         let request = self
             .http
             .post(uri.as_ref())

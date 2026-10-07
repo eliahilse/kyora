@@ -322,6 +322,10 @@ impl Respond for Abandoned {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         match request.method.as_str() {
             "GET" => return ResponseTemplate::new(405),
+            // Strict about the negotiated version, as servers may be after initialize.
+            "DELETE" if header(request, "mcp-protocol-version").is_none() => {
+                return ResponseTemplate::new(400);
+            }
             "DELETE" => return ResponseTemplate::new(200),
             _ => {}
         }
@@ -369,6 +373,7 @@ async fn failed_http_startups_delete_the_session_they_opened() {
             if requests.iter().any(|request| {
                 request.method.as_str() == "DELETE"
                     && header(request, "mcp-session-id") == Some(session)
+                    && header(request, "mcp-protocol-version") == Some("2025-11-25")
             }) {
                 break;
             }

@@ -16,7 +16,7 @@ Every agent node (the root and each child agent) owns one mailbox. Leaf `llm` ca
 
 A mailbox holds at most `Limits::mailbox_capacity` undelivered plain messages (default 64). A send to a full mailbox fails at once with `MailboxFull`: nothing is queued, nothing already queued is dropped, and the sender never blocks. Terminal notices of children are not counted against the bound. Each child produces exactly one, so the agent limits already bound them, and a result is never refused because a chatty sibling filled the mailbox.
 
-Bodies are text and at most `Limits::message_chars` characters (default 20,000). Messages are never cut once accepted: the results of `receive`, `wait` and `cancel_agent` hold whole messages and are exempt from `Limits::tool_output_chars`. The mailbox bounds them instead, at `mailbox_capacity` messages plus one notice per child, each at most `message_chars` and a header. Longer sends are refused. A child's answer in its terminal notice is shortened to the same cap, head and tail kept; the full answer stays in the child's `node_end` record and on its handle.
+Bodies are text and at most `Limits::message_chars` characters (default 20,000). Messages are never cut once accepted: the results of `receive`, `wait` and `cancel_agent` hold whole messages and are exempt from `Limits::tool_output_chars`. The delivery budget below bounds them instead. Longer sends are refused. A child's answer in its terminal notice is shortened to the same cap, head and tail kept; the full answer stays in the child's `node_end` record and on its handle.
 
 ## Envelope
 
@@ -42,6 +42,14 @@ A send returns a message id once the message is queued in the recipient's mailbo
 - undelivered: still queued when the recipient ended, and recorded in the trace.
 
 Nothing is duplicated and nothing disappears silently. Taking messages from the mailbox and handing them over (into the conversation, or as the result of `receive`, `wait` or `cancel_agent`) is one step without a pause, so a caller that stops waiting cannot lose what was taken, and the mailbox never holds more than its capacity. The `message_delivered` record is then written by owned work that the recipient's shutdown joins, in the recipient's delivery order; at a turn boundary it is written before the conversation record that carries the text. Delivery into a conversation is at most once. The mailbox is a single FIFO queue, so messages from one sender arrive in send order, and a child's progress messages always arrive before its own result.
+
+### Delivery budget
+
+Each delivery hands over at most `Limits::delivery_chars` characters of rendered messages (default 60,000), counting each message's header and body. A delivery is one turn boundary, one `receive`, one `wait` or one `cancel_agent`. It takes whole messages in arrival order until the next would exceed the budget, and always at least one, so a single message larger than the budget still goes through whole. It never skips ahead to a smaller message, so the order is kept across deliveries.
+
+What does not fit stays queued in its place, still counts against the mailbox capacity, and goes out at the next delivery. The model is told how many are left: a turn boundary appends `[3 more messages waiting; they follow at your next turn]`, and `receive` ends its result with the same line. An agent with messages still queued does not end at `end_turn`: it takes the next delivery and goes on.
+
+`wait` and `cancel_agent` take only the finished child's messages, its notice last. When the budget cuts in between, the notice stays queued behind the messages that did not fit, and the result says so, for example `agent 3 finished, but 2 of its messages, its result last, did not fit; they follow at your next turn`. For `cancel_agent` this is the one case where the canceller later receives the child's notice as a message.
 
 ### Turn boundaries
 
@@ -95,7 +103,7 @@ Shutdown cancels every child and leaf task it owns directly and synchronously be
 
 `cancel_agent` cancels a descendant of the caller (a child, or a child of a child) and its subtree, and returns once it has stopped, with its outcome. Parents, siblings and the caller itself cannot be cancelled this way. Each node-owned child still produces exactly one terminal notice:
 
-- When the canceller is the child's parent, `cancel_agent` takes that notice itself (recorded as delivered `via: cancel`) and returns the outcome, so the parent gets no separate message.
+- When the canceller is the child's parent, `cancel_agent` takes that notice itself (recorded as delivered `via: cancel`) and returns the outcome, so the parent gets no separate message, unless the child's queued messages exceed the delivery budget (see above).
 - When the canceller is further up, the notice goes to the child's own parent as usual.
 - Cancelling an agent that has already finished changes nothing and reports its outcome; if its notice was still queued, the call takes it.
 
@@ -122,8 +130,8 @@ Sends never block. A wait is only ever on the waiting agent's own children, so w
 |---|---|---|
 | `spawn_agent` | `task`, optional `name`, `tools`, `budget`, `timeout` (seconds), `output` (JSON schema) | Starts a node-owned child and returns `started agent 3 (name)` at once. |
 | `send_message` | `to` (`parent`, an id or a name), `body` | `sent message 7 to agent 3`, or an error such as a full mailbox or a finished agent. |
-| `receive` | optional `yield_after` (seconds, default 0) | The pending messages, rendered as above; waits up to `yield_after` for the first one; `no messages` otherwise. |
-| `wait` | optional `agents` (ids or names), optional `timeout` (seconds) | The results of the named children, or of every child whose result has not been delivered yet, plus the ones still running when the timeout passed. |
+| `receive` | optional `yield_after` (seconds, default 0) | One delivery of pending messages, rendered as above, and how many still wait; waits up to `yield_after` for the first one; `no messages` otherwise. |
+| `wait` | optional `agents` (ids or names), optional `timeout` (seconds) | One delivery of the finished children's messages and results, children whose results did not fit, and the ones still running when the timeout passed. Waits for the named children, or for every child whose result has not been delivered yet. |
 | `cancel_agent` | `to` (an id or a name) | The descendant's outcome once it has stopped, or `agent 3 had already finished` followed by its outcome. |
 | `submit_result` | the output schema | `result submitted`, ending the child, or what to fix. Only for children with an output schema. |
 
@@ -148,7 +156,7 @@ NodeCtx::render_outcome(&self, outcome: &AgentOutcome) -> String
 Envelope::render(&self, sender: &str) -> String
 ```
 
-`ChildSpec::output` sets the output schema. `CancelOutcome` carries the stopped agent's outcome and whether it had already finished. `Waited` holds what the finished children had queued (their unread messages and notices, in arrival order), their outcomes, and the ids of the children still running. `CancelOutcome::messages` holds the same for a cancelled direct child. `wait` takes the queued notices of the finished children, so their results are not delivered again at the next turn; `AgentHandle::result` is a plain observer and takes nothing. Errors: `MailboxFull` and `AgentFinished` for the recipient's state, `InvalidRequest` for unknown, ambiguous or unrelated addresses, messages to oneself and oversized bodies, and `Cancelled` when the calling agent has ended or is cancelled.
+`ChildSpec::output` sets the output schema. `CancelOutcome` carries the stopped agent's outcome and whether it had already finished. `Waited` holds one delivery of what the finished children had queued (their unread messages and notices, in arrival order), their outcomes, `deferred` (children whose messages did not all fit, with how many wait), and the ids of the children still running. `CancelOutcome::messages` and `CancelOutcome::remaining` hold the same for a cancelled direct child. `receive`, `wait` and `cancel_agent` apply the delivery budget for embedders too. `wait` takes the queued notices of the finished children, so their results are not delivered again at the next turn; `AgentHandle::result` is a plain observer and takes nothing. Errors: `MailboxFull` and `AgentFinished` for the recipient's state, `InvalidRequest` for unknown, ambiguous or unrelated addresses, messages to oneself and oversized bodies, and `Cancelled` when the calling agent has ended or is cancelled.
 
 ## Trace events
 

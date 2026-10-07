@@ -30,6 +30,8 @@ pub const PROVIDER_CANCEL_GRACE: Duration = Duration::from_millis(250);
 pub const MAILBOX_CAPACITY: u32 = 64;
 /// Default message body cap in characters.
 pub const MESSAGE_CHARS: usize = 20_000;
+/// Default character budget of one delivery of messages to a model.
+pub const DELIVERY_CHARS: usize = 60_000;
 
 /// Tree and request limits. All counts and durations must be positive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,12 +76,20 @@ pub struct Limits {
     /// its result notice is shortened to this cap.
     #[serde(default = "message_chars")]
     pub message_chars: usize,
+    /// Character budget of one delivery: a turn boundary, a receive or a wait hands
+    /// over whole messages in arrival order until the next would exceed it, always
+    /// at least one. The rest stays queued for the next delivery.
+    #[serde(default = "delivery_chars")]
+    pub delivery_chars: usize,
 }
 fn mailbox_capacity() -> u32 {
     MAILBOX_CAPACITY
 }
 fn message_chars() -> usize {
     MESSAGE_CHARS
+}
+fn delivery_chars() -> usize {
+    DELIVERY_CHARS
 }
 impl Default for Limits {
     /// D10.1 defaults, configurable before constructing a runtime.
@@ -103,6 +113,7 @@ impl Default for Limits {
             tool_output_chars: 20_000,
             mailbox_capacity: MAILBOX_CAPACITY,
             message_chars: MESSAGE_CHARS,
+            delivery_chars: DELIVERY_CHARS,
         }
     }
 }
@@ -123,6 +134,7 @@ impl Limits {
             self.tool_output_chars as u64,
             u64::from(self.mailbox_capacity),
             self.message_chars as u64,
+            self.delivery_chars as u64,
         ]
         .contains(&0)
         {

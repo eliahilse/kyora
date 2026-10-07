@@ -2218,3 +2218,304 @@ async fn cancel_agent_returns_a_childs_progress_before_its_notice() {
     );
     assert!(texts(&cancelled).is_empty());
 }
+
+/// Each of these messages renders to 72 characters.
+fn progress(digit: char) -> String {
+    digit.to_string().repeat(40)
+}
+
+#[tokio::test]
+async fn turn_deliveries_page_by_budget_across_turns() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "worker task", "name": "worker"}),
+                    ),
+                    text("waiting"),
+                    text("still waiting"),
+                    call("cancel_agent", json!({"to": "worker"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "worker task",
+                1,
+                vec![calls(vec![
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('1')}),
+                    ),
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('2')}),
+                    ),
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('3')}),
+                    ),
+                ])],
+            ),
+        ],
+        vec![
+            // All three messages are queued before the parent's first idle delivery.
+            (at("worker task", 0), at("root task", 1)),
+            (at("root task", 1), at("worker task", 1)),
+            (at("worker task", 1), never()),
+        ],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 150,
+            ..Limits::default()
+        },
+        trace,
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 5));
+    let line = |digit| format!("[message from agent 1 (worker)]\n{}", progress(digit));
+    // Two fit the budget; the idle parent does not end while the third waits.
+    assert_eq!(
+        texts(&last(&provider.request("root task", 2))),
+        vec![
+            line('1'),
+            line('2'),
+            "[1 more message waiting; it follows at your next turn]".into(),
+        ]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
+        vec![line('3')]
+    );
+    let live = records(rx);
+    let ids = sent(&live).iter().map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(
+        delivered(&live),
+        vec![
+            (0, ids[..2].to_vec(), Delivery::Turn),
+            (0, vec![ids[2]], Delivery::Turn),
+            (0, vec![ids[3]], Delivery::Cancel),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_message_still_goes_through_and_the_rest_follows() {
+    let big = "b".repeat(500);
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "worker task", "name": "worker"}),
+                    ),
+                    call("receive", json!({"yield_after": 30})),
+                    call("cancel_agent", json!({"to": "worker"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "worker task",
+                1,
+                vec![calls(vec![
+                    ("send_message", json!({"to": "parent", "body": big})),
+                    ("send_message", json!({"to": "parent", "body": "small one"})),
+                    ("send_message", json!({"to": "parent", "body": "small two"})),
+                ])],
+            ),
+        ],
+        vec![
+            (at("worker task", 0), at("root task", 1)),
+            (at("root task", 1), at("worker task", 1)),
+            (at("worker task", 1), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 100,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    // The first message exceeds the budget alone and is still handed over whole;
+    // the rest follows at the same boundary, in order, within its own budget.
+    let boundary = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&boundary),
+        vec![(
+            format!(
+                "[message from agent 1 (worker)]\n{big}\n\n2 more messages waiting; they follow at your next turn"
+            ),
+            false
+        )]
+    );
+    assert_eq!(
+        texts(&boundary),
+        vec![
+            "[message from agent 1 (worker)]\nsmall one",
+            "[message from agent 1 (worker)]\nsmall two",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn wait_defers_a_result_behind_progress_that_does_not_fit() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "chatty task", "name": "chatty"}),
+                    ),
+                    call("wait", json!({})),
+                    text("reading"),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "chatty task",
+                1,
+                vec![
+                    calls(vec![
+                        (
+                            "send_message",
+                            json!({"to": "parent", "body": progress('1')}),
+                        ),
+                        (
+                            "send_message",
+                            json!({"to": "parent", "body": progress('2')}),
+                        ),
+                    ]),
+                    text("final"),
+                ],
+            ),
+        ],
+        vec![
+            (at("chatty task", 0), at("root task", 1)),
+            (at("root task", 1), at("chatty task", 1)),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 100,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 4));
+    let line = |digit| format!("[message from agent 1 (chatty)]\n{}", progress(digit));
+    // The result never overtakes the progress: one message per page, then the result.
+    let first = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&first),
+        vec![(
+            format!(
+                "{}\n\nagent 1 finished, but 2 of its messages, its result last, did not fit; they follow at your next turn",
+                line('1')
+            ),
+            false
+        )]
+    );
+    assert_eq!(
+        texts(&first),
+        vec![
+            line('2'),
+            "[1 more message waiting; it follows at your next turn]".into(),
+        ]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
+        vec!["[result from agent 1 (chatty): completed]\nfinal"]
+    );
+}
+
+#[tokio::test]
+async fn cancel_agent_defers_a_notice_that_does_not_fit() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call("spawn_agent", json!({"task": "slow task", "name": "slow"})),
+                    call("cancel_agent", json!({"to": "slow"})),
+                    text("reading"),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "slow task",
+                1,
+                vec![calls(vec![
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('1')}),
+                    ),
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('2')}),
+                    ),
+                ])],
+            ),
+        ],
+        vec![
+            (at("slow task", 0), at("root task", 1)),
+            (at("root task", 1), at("slow task", 1)),
+            (at("slow task", 1), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 100,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 4));
+    let line = |digit| format!("[message from agent 1 (slow)]\n{}", progress(digit));
+    let first = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&first),
+        vec![(
+            format!(
+                "{}\n\nagent 1 finished, but 2 of its messages, its notice last, did not fit; they follow at your next turn",
+                line('1')
+            ),
+            false
+        )]
+    );
+    assert_eq!(
+        texts(&first),
+        vec![
+            line('2'),
+            "[1 more message waiting; it follows at your next turn]".into(),
+        ]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
+        vec!["[cancelled from agent 1 (slow): cancelled]"]
+    );
+}

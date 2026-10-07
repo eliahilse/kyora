@@ -4,7 +4,9 @@ use crate::{
     RecursionError, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink,
     agent_tools, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
-    messages::{self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Refusal, Waited},
+    messages::{
+        self, Batch, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Refusal, Waited,
+    },
     prompts,
     tool::{self, truncate},
 };
@@ -756,7 +758,7 @@ impl Runtime {
                     // instead of ending; the next turn starts with whatever arrived.
                     // A contract child keeps its mailbox open, since it may go on.
                     match self.idle(cx, !contract).await {
-                        Some(taken) => self.deliver(cx, &mut history, Vec::new(), taken).await?,
+                        Some(batch) => self.deliver(cx, &mut history, Vec::new(), batch).await?,
                         None if cx.stopped() || Instant::now() >= cx.deadline => {
                             break cx.cancel_status();
                         }
@@ -841,9 +843,13 @@ impl Runtime {
         deliver: bool,
     ) -> Result<()> {
         if deliver {
-            let taken = cx.state.mailbox.take_all();
-            if !taken.is_empty() {
-                return self.deliver(cx, history, content, taken).await;
+            let batch = cx.state.mailbox.take(
+                self.0.config.limits.delivery_chars,
+                |_| true,
+                |message| self.size(message),
+            );
+            if !batch.taken.is_empty() {
+                return self.deliver(cx, history, content, batch).await;
             }
         }
         self.message(
@@ -856,17 +862,18 @@ impl Runtime {
         )
         .await
     }
-    /// Appends taken messages as text blocks after `content` and records the user message.
+    /// Appends one delivery as text blocks after `content`, says how many messages
+    /// still wait, and records the user message.
     async fn deliver(
         &self,
         cx: &NodeCtx,
         history: &mut Vec<Message>,
         mut content: Vec<ContentBlock>,
-        taken: Vec<Envelope>,
+        batch: Batch,
     ) -> Result<()> {
         let mut written = {
             let mut work = cx.state.work.lock().expect("node work mutex poisoned");
-            cx.record_delivery(&mut work, &taken, Delivery::Turn)
+            cx.record_delivery(&mut work, &batch.taken, Delivery::Turn)
         };
         // The delivery record precedes the conversation record that carries the text.
         while !*written.borrow_and_update() {
@@ -874,9 +881,14 @@ impl Runtime {
                 break;
             }
         }
-        content.extend(taken.iter().map(|message| ContentBlock::Text {
+        content.extend(batch.taken.iter().map(|message| ContentBlock::Text {
             text: self.render(message),
         }));
+        if batch.queued > 0 {
+            content.push(ContentBlock::Text {
+                text: format!("[{}]", messages::more(batch.queued)),
+            });
+        }
         self.message(
             cx.id,
             history,
@@ -889,11 +901,16 @@ impl Runtime {
     }
     /// Waits at the end of a turn until messages arrive or nothing more can arrive.
     /// Returns None once nothing more can arrive or the node is cancelled.
-    async fn idle(&self, cx: &NodeCtx, close: bool) -> Option<Vec<Envelope>> {
+    async fn idle(&self, cx: &NodeCtx, close: bool) -> Option<Batch> {
         loop {
             let mut changed = cx.state.mailbox.subscribe();
-            match cx.state.mailbox.idle(close) {
-                Idle::Deliver(taken) => return Some(taken),
+            let budget = self.0.config.limits.delivery_chars;
+            match cx
+                .state
+                .mailbox
+                .idle(close, budget, |message| self.size(message))
+            {
+                Idle::Deliver(batch) => return Some(batch),
                 Idle::Done => return None,
                 Idle::Wait => {}
             }
@@ -939,6 +956,10 @@ impl Runtime {
     }
     fn render(&self, message: &Envelope) -> String {
         message.render(&self.name(message.from))
+    }
+    /// Size of a message as delivered, counted against `Limits::delivery_chars`.
+    fn size(&self, message: &Envelope) -> usize {
+        self.render(message).chars().count()
     }
     fn next_message(&self) -> MessageId {
         self.0.messages.fetch_add(1, Ordering::SeqCst)
@@ -1560,8 +1581,9 @@ impl NodeCtx {
         }
         rx.await.unwrap_or(Err(RecursionError::Cancelled))
     }
-    /// Takes every pending message. When none is pending, waits up to `yield_after`
-    /// for the first one, and returns an empty list if none arrives in time.
+    /// Takes one delivery of pending messages: whole messages in arrival order within
+    /// `Limits::delivery_chars`, at least one. When none is pending, waits up to
+    /// `yield_after` for the first one, and returns an empty list if none arrives.
     pub async fn receive(
         &self,
         yield_after: Duration,
@@ -1576,10 +1598,14 @@ impl NodeCtx {
                 self.check_open(&work)?;
                 // Taking and handing over are one step without an await, so a caller
                 // that stops waiting cannot lose messages; owned work records them.
-                let taken = self.state.mailbox.take_all();
-                if !taken.is_empty() {
-                    self.record_delivery(&mut work, &taken, Delivery::Receive);
-                    return Ok(taken);
+                let batch = self.state.mailbox.take(
+                    self.runtime.0.config.limits.delivery_chars,
+                    |_| true,
+                    |message| self.runtime.size(message),
+                );
+                if !batch.taken.is_empty() {
+                    self.record_delivery(&mut work, &batch.taken, Delivery::Receive);
+                    return Ok(batch.taken);
                 }
                 if self.state.mailbox.is_closed() {
                     return Err(RecursionError::Cancelled);
@@ -1665,17 +1691,24 @@ impl NodeCtx {
             .copied()
             .filter(finished)
             .collect::<BTreeSet<_>>();
-        let taken = {
+        let batch = {
             let mut work = self.state.work.lock().expect("node work mutex poisoned");
             self.check_open(&work)?;
-            let taken = self.state.mailbox.take_from(&done);
-            if !taken.is_empty() {
-                self.record_delivery(&mut work, &taken, via);
+            // One delivery of the finished children's messages, in arrival order. A
+            // child's notice is its last message, so it never overtakes the others.
+            let batch = self.state.mailbox.take(
+                self.runtime.0.config.limits.delivery_chars,
+                |message| done.contains(&message.from),
+                |message| self.runtime.size(message),
+            );
+            if !batch.taken.is_empty() {
+                self.record_delivery(&mut work, &batch.taken, via);
             }
-            taken
+            batch
         };
         Ok(Waited {
-            messages: taken,
+            messages: batch.taken,
+            deferred: batch.left,
             finished: done
                 .iter()
                 .map(|id| {
@@ -1728,6 +1761,7 @@ impl NodeCtx {
                 Some(outcome) => Ok(CancelOutcome {
                     outcome,
                     already_finished,
+                    remaining: waited.deferred.get(&agent).copied().unwrap_or_default(),
                     messages: waited.messages,
                 }),
                 // Only the deadline ends an untimed wait early.
@@ -1740,6 +1774,7 @@ impl NodeCtx {
                     outcome,
                     already_finished,
                     messages: Vec::new(),
+                    remaining: 0,
                 });
             }
             tokio::select! {

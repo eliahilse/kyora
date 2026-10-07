@@ -8,7 +8,7 @@ use crate::{AgentOutcome, NodeId, Status};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Mutex, MutexGuard},
 };
 use tokio::sync::watch;
@@ -121,8 +121,77 @@ pub struct Waited {
     pub messages: Vec<Envelope>,
     /// Outcomes of the waited children that finished, in node id order.
     pub finished: Vec<AgentOutcome>,
+    /// Finished children whose messages did not all fit the delivery budget, with
+    /// how many are still queued. Their notice is among them, last, so their order
+    /// is kept; the next delivery hands them over.
+    pub deferred: BTreeMap<NodeId, usize>,
     /// Waited children that were still running.
     pub running: Vec<NodeId>,
+}
+/// One delivery taken from a mailbox.
+pub(crate) struct Batch {
+    /// Envelopes handed over, in arrival order.
+    pub(crate) taken: Vec<Envelope>,
+    /// Selected envelopes that did not fit, by sender.
+    pub(crate) left: BTreeMap<NodeId, usize>,
+    /// Envelopes still queued, from any sender.
+    pub(crate) queued: usize,
+}
+fn take(
+    state: &mut State,
+    budget: usize,
+    pick: impl Fn(&Envelope) -> bool,
+    size: impl Fn(&Envelope) -> usize,
+) -> Batch {
+    let mut taken = Vec::new();
+    let mut left = BTreeMap::new();
+    let mut rest = VecDeque::new();
+    let mut used = 0;
+    let mut full = false;
+    for envelope in state.queue.drain(..) {
+        if pick(&envelope) {
+            if !full {
+                let cost = size(&envelope);
+                if taken.is_empty() || used + cost <= budget {
+                    used += cost;
+                    taken.push(envelope);
+                    continue;
+                }
+                // Later envelopes stay behind this one, even smaller ones.
+                full = true;
+            }
+            *left.entry(envelope.from).or_default() += 1;
+        }
+        rest.push_back(envelope);
+    }
+    state.queue = rest;
+    state.plain -= taken
+        .iter()
+        .filter(|envelope| envelope.kind == MessageKind::Message)
+        .count();
+    Batch {
+        taken,
+        left,
+        queued: state.queue.len(),
+    }
+}
+/// Tells a model how many messages are still waiting after a delivery.
+pub(crate) fn more(count: usize) -> String {
+    if count == 1 {
+        "1 more message waiting; it follows at your next turn".into()
+    } else {
+        format!("{count} more messages waiting; they follow at your next turn")
+    }
+}
+/// Tells a model that a child's messages, ending with `last`, did not all fit.
+pub(crate) fn deferred(agent: NodeId, count: usize, last: &str) -> String {
+    if count == 1 {
+        format!("agent {agent} finished, but its {last} did not fit; it follows at your next turn")
+    } else {
+        format!(
+            "agent {agent} finished, but {count} of its messages, its {last} last, did not fit; they follow at your next turn"
+        )
+    }
 }
 
 /// One agent's queue. Every change bumps a watch counter that wakes waiters.
@@ -148,8 +217,8 @@ pub(crate) enum Refusal {
 }
 /// What an agent with nothing left to do at the end of a turn does next.
 pub(crate) enum Idle {
-    /// Messages arrived and were taken; continue with them.
-    Deliver(Vec<Envelope>),
+    /// Messages arrived and one delivery was taken; continue with it.
+    Deliver(Batch),
     /// Children are still running or a send is in flight.
     Wait,
     /// Nothing can arrive any more. The mailbox is now closed if closing was asked.
@@ -218,38 +287,32 @@ impl Mailbox {
     pub(crate) fn touch(&self) {
         self.wake();
     }
-    /// Takes every queued envelope in arrival order. Taking is final: the caller
-    /// hands them over without an await in between, so nothing taken returns to
-    /// the queue and the capacity bound holds.
-    pub(crate) fn take_all(&self) -> Vec<Envelope> {
-        let mut state = self.lock();
-        state.plain = 0;
-        state.queue.drain(..).collect()
-    }
-    /// Takes everything queued from the given children, in arrival order. For a
-    /// finished child that is its unread messages followed by its terminal notice,
-    /// so the sender's order is kept.
-    pub(crate) fn take_from(&self, children: &BTreeSet<NodeId>) -> Vec<Envelope> {
-        let mut state = self.lock();
-        let (taken, rest): (VecDeque<_>, VecDeque<_>) = state
-            .queue
-            .drain(..)
-            .partition(|envelope| children.contains(&envelope.from));
-        state.queue = rest;
-        state.plain -= taken
-            .iter()
-            .filter(|envelope| envelope.kind == MessageKind::Message)
-            .count();
-        taken.into()
+    /// Takes one delivery: the queued envelopes `pick` selects, whole and in arrival
+    /// order, until the next would push their `size` past `budget`; always at least
+    /// one. Taking is final: the caller hands them over without an await in between,
+    /// so nothing taken returns to the queue and the capacity bound holds. What does
+    /// not fit stays queued, keeps its place and still counts against the capacity.
+    pub(crate) fn take(
+        &self,
+        budget: usize,
+        pick: impl Fn(&Envelope) -> bool,
+        size: impl Fn(&Envelope) -> usize,
+    ) -> Batch {
+        take(&mut self.lock(), budget, pick, size)
     }
     /// Decides atomically between delivering, waiting and closing, so a message
     /// is either delivered or refused to its sender, never accepted and dropped.
     /// Without `close`, `Done` leaves the mailbox open for an agent that goes on.
-    pub(crate) fn idle(&self, close: bool) -> Idle {
+    /// While anything is queued, even after a partial delivery, the agent goes on.
+    pub(crate) fn idle(
+        &self,
+        close: bool,
+        budget: usize,
+        size: impl Fn(&Envelope) -> usize,
+    ) -> Idle {
         let mut state = self.lock();
         if !state.queue.is_empty() {
-            state.plain = 0;
-            return Idle::Deliver(state.queue.drain(..).collect());
+            return Idle::Deliver(take(&mut state, budget, |_| true, size));
         }
         if state.awaiting.is_empty() && state.reserved == 0 {
             state.closed |= close;

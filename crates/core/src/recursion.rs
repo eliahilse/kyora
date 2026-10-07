@@ -95,8 +95,11 @@ pub struct CancelOutcome {
     /// The agent had already finished when it was cancelled.
     pub already_finished: bool,
     /// For a direct child, what it had queued for the caller: its unread messages
-    /// and its terminal notice, in arrival order.
+    /// and its terminal notice, in arrival order, within one delivery budget.
     pub messages: Vec<crate::Envelope>,
+    /// For a direct child, how many of its messages did not fit the delivery budget
+    /// and stay queued; its notice is the last of them. They follow at the next turn.
+    pub remaining: usize,
 }
 /// Live counters for a child; status is absent until shutdown completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]

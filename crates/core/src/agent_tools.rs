@@ -5,7 +5,8 @@
 //! of a toolset factory. The runtime adds `submit_result` itself to a child spawned
 //! with an output schema.
 use crate::{
-    Answer, ChildSpec, Effect, MessageKind, Owner, Tool, ToolCx, ToolOutput, ToolSelection, tool,
+    Answer, ChildSpec, Effect, MessageKind, Owner, Tool, ToolCx, ToolOutput, ToolSelection,
+    messages, tool,
 };
 use async_trait::async_trait;
 use kyora_protocol::ToolSpec;
@@ -158,14 +159,19 @@ impl Tool for Receive {
             Err(error) => return ToolOutput::error(error),
         };
         match cx.node.receive(yield_after).await {
-            Ok(messages) if messages.is_empty() => ToolOutput::text("no messages"),
-            Ok(messages) => ToolOutput::text(
-                messages
+            Ok(taken) if taken.is_empty() => ToolOutput::text("no messages"),
+            Ok(taken) => {
+                let mut parts = taken
                     .iter()
                     .map(|message| cx.node.render(message))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
+                    .collect::<Vec<_>>();
+                // One delivery is bounded; say what is still waiting.
+                let left = cx.node.pending_messages();
+                if left > 0 {
+                    parts.push(messages::more(left));
+                }
+                ToolOutput::text(parts.join("\n\n"))
+            }
             Err(error) => ToolOutput::error(error.to_string()),
         }
     }
@@ -211,7 +217,8 @@ impl Tool for Wait {
             Err(error) => return ToolOutput::error(error.to_string()),
         };
         // Queued messages come first, in arrival order. A finished child whose
-        // notice was delivered earlier is reported from its outcome.
+        // notice was delivered earlier is reported from its outcome; one whose
+        // messages did not all fit is reported as deferred.
         let noticed = waited
             .messages
             .iter()
@@ -226,8 +233,17 @@ impl Tool for Wait {
                 waited
                     .finished
                     .iter()
-                    .filter(|outcome| !noticed.contains(&outcome.node))
+                    .filter(|outcome| {
+                        !noticed.contains(&outcome.node)
+                            && !waited.deferred.contains_key(&outcome.node)
+                    })
                     .map(|outcome| cx.node.render_outcome(outcome)),
+            )
+            .chain(
+                waited
+                    .deferred
+                    .iter()
+                    .map(|(agent, count)| messages::deferred(*agent, *count, "result")),
             )
             .collect::<Vec<_>>();
         if !waited.running.is_empty() {
@@ -275,7 +291,7 @@ impl Tool for CancelAgent {
             Ok(cancelled) => {
                 // The child's unread messages and its notice, in arrival order, or
                 // its outcome when the notice was delivered before.
-                let report = if cancelled.messages.is_empty() {
+                let mut report = if cancelled.messages.is_empty() {
                     cx.node.render_outcome(&cancelled.outcome)
                 } else {
                     cancelled
@@ -285,6 +301,14 @@ impl Tool for CancelAgent {
                         .collect::<Vec<_>>()
                         .join("\n\n")
                 };
+                if cancelled.remaining > 0 {
+                    report.push_str("\n\n");
+                    report.push_str(&messages::deferred(
+                        cancelled.outcome.node,
+                        cancelled.remaining,
+                        "notice",
+                    ));
+                }
                 if cancelled.already_finished {
                     ToolOutput::text(format!(
                         "agent {} had already finished\n{report}",

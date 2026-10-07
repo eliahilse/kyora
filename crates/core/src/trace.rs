@@ -235,6 +235,9 @@ impl TraceSink {
     /// for that event returns, with the acknowledgement's result, once it completes.
     /// Acknowledgements may complete in any order, so storage can confirm records
     /// asynchronously. Records are broadcast to subscribers as they are handed over.
+    /// The first failed acknowledgement is latched: later events fail without being
+    /// stored, and `finish` returns it. An acknowledgement that never completes
+    /// blocks the node that emitted it, and so shutdown.
     pub fn with_store<F, Fut>(mut store: F) -> Self
     where
         F: FnMut(TraceRecord) -> Fut + Send + 'static,
@@ -246,21 +249,42 @@ impl TraceSink {
         let join = tokio::spawn(async move {
             let mut seq = 0;
             let mut acks = tokio::task::JoinSet::new();
+            let failed = Arc::new(std::sync::Mutex::new(None::<String>));
+            let latched = |failed: &std::sync::Mutex<Option<String>>| {
+                failed
+                    .lock()
+                    .expect("trace failure mutex poisoned")
+                    .clone()
+                    .map(|error| anyhow::anyhow!(error))
+            };
             while let Some(command) = rx.recv().await {
                 while acks.try_join_next().is_some() {}
                 match command {
                     WriteCommand::Event(event, ack) => {
+                        // After a failure nothing else is stored, as with a session file.
+                        if let Some(error) = latched(&failed) {
+                            let _ = ack.send(Err(error));
+                            continue;
+                        }
                         let record = TraceRecord::new(*event, Some(seq));
                         seq += 1;
                         let _ = broadcast.send(record.clone());
                         let stored = store(record);
+                        let failed = failed.clone();
                         acks.spawn(async move {
-                            let _ = ack.send(stored.await);
+                            let result = stored.await;
+                            if let Err(error) = &result {
+                                failed
+                                    .lock()
+                                    .expect("trace failure mutex poisoned")
+                                    .get_or_insert_with(|| error.to_string());
+                            }
+                            let _ = ack.send(result);
                         });
                     }
                     WriteCommand::Finish(ack) => {
                         while acks.join_next().await.is_some() {}
-                        let _ = ack.send(Ok(()));
+                        let _ = ack.send(latched(&failed).map_or(Ok(()), Err));
                         break;
                     }
                 }

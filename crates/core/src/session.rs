@@ -57,7 +57,12 @@ impl SessionStore {
                         let _ = ack.send(result);
                     }
                     WriteCommand::Finish(ack) => {
-                        let _ = ack.send(file.flush().map_err(Into::into));
+                        // A record that failed earlier fails the finish as well.
+                        let flushed = match &failed {
+                            Some(error) => Err(anyhow::anyhow!(error.clone())),
+                            None => file.flush().map_err(Into::into),
+                        };
+                        let _ = ack.send(flushed);
                         break;
                     }
                 }

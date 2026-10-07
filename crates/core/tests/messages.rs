@@ -2572,3 +2572,38 @@ async fn a_senders_messages_are_queued_in_send_order() {
         Some(vec!["A".to_string(), "B".to_string()])
     );
 }
+
+#[tokio::test]
+async fn a_failed_message_record_fails_the_run() {
+    // The store refuses delivery records and accepts everything else.
+    let trace = TraceSink::with_store(|record: TraceRecord| {
+        let refused = matches!(record.event, TraceEvent::MessageDelivered { .. });
+        async move {
+            if refused {
+                anyhow::bail!("store unavailable");
+            }
+            Ok(())
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "child task", "name": "worker"}),
+                    ),
+                    text("waiting"),
+                    text("done"),
+                ],
+            ),
+            rule("child task", 1, vec![text("child answer")]),
+        ],
+        vec![(at("child task", 0), at("root task", 1))],
+    );
+    let runtime = setup(provider, idle_tool(), Limits::default(), trace.clone());
+    assert!(runtime.run(spec()).await.is_err());
+    assert!(trace.finish().await.is_err());
+}

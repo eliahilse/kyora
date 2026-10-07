@@ -164,6 +164,20 @@ fn a_second_ctrl_c_during_server_shutdown_kills_the_servers_and_exits() {
         ),
     )
     .unwrap();
+    /// Kills kyora and the lingering server if an assertion fails first.
+    struct Cleanup {
+        kyora: std::process::Child,
+        server: Option<i32>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.server {
+                let _ = nix::sys::signal::killpg(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+            let _ = self.kyora.kill();
+            let _ = self.kyora.wait();
+        }
+    }
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kyora"))
         .args(["run", "task", "--fake-script"])
         .arg(script(&dir))
@@ -173,9 +187,24 @@ fn a_second_ctrl_c_during_server_shutdown_kills_the_servers_and_exits() {
         .env("KYORA_HOME", &home)
         .env_remove("KYORA_FAKE_SCRIPT")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (lines, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = lines.send(line);
+        }
+    });
+    let mut cleanup = Cleanup {
+        kyora: child,
+        server: None,
+    };
     // The marker appears once the run is over and shutdown has closed the server's stdin.
     let deadline = Instant::now() + Duration::from_secs(20);
     let pid = loop {
@@ -188,14 +217,25 @@ fn a_second_ctrl_c_during_server_shutdown_kills_the_servers_and_exits() {
         assert!(Instant::now() < deadline, "server shutdown did not start");
         std::thread::sleep(Duration::from_millis(10));
     };
-    let kyora = Pid::from_raw(child.id() as i32);
+    cleanup.server = Some(pid);
+    let kyora = Pid::from_raw(cleanup.kyora.id() as i32);
     kill(kyora, Signal::SIGINT).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    // Send the second Ctrl-C only once kyora has handled the first.
+    let acknowledged = Instant::now() + Duration::from_secs(5);
+    loop {
+        let wait = acknowledged.saturating_duration_since(Instant::now());
+        let line = received
+            .recv_timeout(wait)
+            .expect("first Ctrl-C not handled");
+        if line.contains("press Ctrl-C again") {
+            break;
+        }
+    }
     kill(kyora, Signal::SIGINT).unwrap();
     // Without the second Ctrl-C, shutdown would wait about 4 s before SIGKILL.
     let interrupted = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = cleanup.kyora.try_wait().unwrap() {
             break status;
         }
         assert!(

@@ -333,6 +333,7 @@ async fn watch_interrupts(stop: CancellationToken) {
             kyora_mcp::kill_servers();
             std::process::exit(130);
         }
+        eprintln!("cancelling; press Ctrl-C again to stop at once");
         last = Some(now);
     }
 }

@@ -18,6 +18,7 @@ use kyora_providers::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    pin::pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -119,6 +120,26 @@ impl Acks {
     }
     fn release(&self) {
         self.open.send_replace(true);
+    }
+}
+/// Asserts that every accepted message got exactly one delivery or undelivered record.
+fn assert_settled(records: &[TraceRecord]) {
+    let mut ends = BTreeMap::<MessageId, usize>::new();
+    for (_, messages, _) in delivered(records) {
+        for id in messages {
+            *ends.entry(id).or_default() += 1;
+        }
+    }
+    for message in undelivered(records) {
+        *ends.entry(message.id).or_default() += 1;
+    }
+    for message in sent(records) {
+        assert_eq!(
+            ends.get(&message.id),
+            Some(&1),
+            "message {} must end exactly once",
+            message.id
+        );
     }
 }
 
@@ -1848,6 +1869,59 @@ async fn only_a_valid_result_finishes_a_contract_child() {
             false
         )]
     );
+}
+
+#[tokio::test]
+async fn dropped_send_is_still_recorded_when_its_recipient_ends() {
+    let (trace, acks) = Acks::new(
+        |event| matches!(event, TraceEvent::MessageSent { message } if message.body == "late"),
+    );
+    let rx = trace.subscribe();
+    let woken = Arc::new(tokio::sync::Notify::new());
+    let (wake, gate) = (woken.clone(), acks.clone());
+    let python = tool(move |_, cx| {
+        let (woken, acks) = (wake.clone(), gate.clone());
+        async move {
+            if cx.node.depth == 0 {
+                cx.node
+                    .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                    .unwrap();
+                tokio::time::timeout(LIMIT, woken.notified()).await.unwrap();
+                let mut result = ToolOutput::text("ok");
+                result.final_answer = Some(Answer::Text("final".into()));
+                return result;
+            }
+            let parent = cx.node.resolve("parent").unwrap();
+            {
+                let mut send = pin!(cx.node.send(parent, "late"));
+                assert!(futures::poll!(send.as_mut()).is_pending());
+                woken.notify_one();
+                // The parent closes its mailbox, then cancels this child.
+                tokio::time::timeout(LIMIT, cx.cancel.cancelled())
+                    .await
+                    .unwrap();
+                acks.release();
+            }
+            ToolOutput::text("dropped")
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule("root task", 0, vec![call("python", json!({}))]),
+            rule("child task", 1, vec![call("python", json!({}))]),
+        ],
+        vec![],
+    );
+    let runtime = setup(provider, python, Limits::default(), trace.clone());
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    trace.finish().await.unwrap();
+    let live = records(rx);
+    assert!(
+        undelivered(&live)
+            .iter()
+            .any(|message| message.body == "late")
+    );
+    assert_settled(&live);
 }
 
 #[tokio::test]

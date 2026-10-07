@@ -5,8 +5,7 @@ use crate::{
     agent_tools, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
     messages::{
-        self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Pending, Refusal, Taken,
-        Waited,
+        self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Refusal, Taken, Waited,
     },
     prompts,
     tool::{self, truncate},
@@ -1512,37 +1511,50 @@ impl NodeCtx {
                 limits.message_chars
             )));
         }
-        self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
-        let (recipient, spawn) = self.kin(to)?;
-        recipient
-            .mailbox
-            .reserve(limits.mailbox_capacity as usize)
-            .map_err(|refusal| match refusal {
-                Refusal::Full => RecursionError::MailboxFull { agent: to },
-                Refusal::Closed => RecursionError::AgentFinished { agent: to },
-            })?;
-        let message = Envelope {
-            id: self.runtime.next_message(),
-            from: self.id,
-            to,
-            kind: MessageKind::Message,
-            body,
-            sent_at: chrono::Utc::now(),
-            spawn,
-            status: None,
-        };
-        let id = message.id;
-        // The send record precedes any delivery record. If this future is dropped
-        // while the record is written, the guard still queues the message.
-        let pending = Pending::new(&recipient.mailbox, message.clone());
-        let _ = self.runtime.emit(TraceEvent::MessageSent { message }).await;
-        match pending.push() {
-            Ok(()) => Ok(id),
-            Err(message) => {
-                self.runtime.undelivered(message).await;
-                Err(RecursionError::AgentFinished { agent: to })
-            }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            self.check_open(&work)?;
+            let (recipient, spawn) = self.kin(to)?;
+            recipient
+                .mailbox
+                .reserve(limits.mailbox_capacity as usize)
+                .map_err(|refusal| match refusal {
+                    Refusal::Full => RecursionError::MailboxFull { agent: to },
+                    Refusal::Closed => RecursionError::AgentFinished { agent: to },
+                })?;
+            let message = Envelope {
+                id: self.runtime.next_message(),
+                from: self.id,
+                to,
+                kind: MessageKind::Message,
+                body,
+                sent_at: chrono::Utc::now(),
+                spawn,
+                status: None,
+            };
+            let runtime = self.runtime.clone();
+            // Recording and queueing run as owned work that this node's shutdown joins,
+            // so a caller that stops waiting cannot leave an accepted send half done.
+            work.tasks.push(tokio::spawn(async move {
+                let id = message.id;
+                // The send record precedes any delivery record.
+                let _ = runtime
+                    .emit(TraceEvent::MessageSent {
+                        message: message.clone(),
+                    })
+                    .await;
+                let result = match recipient.mailbox.push(message) {
+                    Ok(()) => Ok(id),
+                    Err(message) => {
+                        runtime.undelivered(message).await;
+                        Err(RecursionError::AgentFinished { agent: to })
+                    }
+                };
+                let _ = tx.send(result);
+            }));
         }
+        rx.await.unwrap_or(Err(RecursionError::Cancelled))
     }
     /// Takes every pending message. When none is pending, waits up to `yield_after`
     /// for the first one, and returns an empty list if none arrives in time.

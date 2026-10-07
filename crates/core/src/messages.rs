@@ -340,28 +340,3 @@ impl Drop for Taken<'_> {
         }
     }
 }
-/// A reserved plain message on its way into a mailbox. Dropped before `push`, it
-/// is queued anyway, so the reservation is always settled.
-pub(crate) struct Pending<'a> {
-    mailbox: &'a Mailbox,
-    message: Option<Envelope>,
-}
-impl<'a> Pending<'a> {
-    pub(crate) fn new(mailbox: &'a Mailbox, message: Envelope) -> Self {
-        Self {
-            mailbox,
-            message: Some(message),
-        }
-    }
-    pub(crate) fn push(mut self) -> Result<(), Envelope> {
-        let message = self.message.take().expect("message pushed once");
-        self.mailbox.push(message)
-    }
-}
-impl Drop for Pending<'_> {
-    fn drop(&mut self) {
-        if let Some(message) = self.message.take() {
-            let _ = self.mailbox.push(message);
-        }
-    }
-}

@@ -1,7 +1,7 @@
 #![cfg(unix)]
 use kyora_core::{
-    AgentSpec, Effect, Limits, Runtime, RuntimeConfig, Status, Tool, ToolCx, ToolOutput,
-    ToolSelection, Toolset, TraceEvent, TraceSink,
+    AgentSpec, ChildSpec, Effect, Limits, Owner, Runtime, RuntimeConfig, Status, Tool, ToolCx,
+    ToolOutput, ToolSelection, Toolset, TraceEvent, TraceSink,
 };
 use kyora_mcp::{McpConfig, McpToolsets, Server, ServerConfig, Servers};
 use kyora_protocol::{ContentBlock, ModelRequest, ModelResponse, StopReason, ToolSpec, Usage};
@@ -776,6 +776,142 @@ async fn valid_inputs_outside_the_local_schema_subset_reach_the_server() {
     let (content, is_error) = result.unwrap();
     assert!(!is_error, "{content}");
     assert_eq!(serde_json::from_str::<Value>(&content).unwrap(), input);
+    servers.shutdown().await;
+}
+
+/// Spawns one child that asks for an MCP tool and one with the default selection.
+struct Spawner;
+
+#[async_trait::async_trait]
+impl Tool for Spawner {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "spawner".into(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            large_input: false,
+        }
+    }
+    fn effect(&self) -> Effect {
+        Effect::Mutating
+    }
+    async fn call(&self, _input: Value, cx: ToolCx) -> ToolOutput {
+        let with_mcp = ChildSpec {
+            tools: ToolSelection(Some(vec!["mcp__fake__schema".into()])),
+            ..ChildSpec::new("use mcp")
+        };
+        let mut statuses = Vec::new();
+        for child in [with_mcp, ChildSpec::new("default tools")] {
+            match cx.node.spawn_agent(child, Owner::Node) {
+                Ok(handle) => statuses.push(format!("{:?}", handle.result().await.status)),
+                Err(error) => return ToolOutput::error(error.to_string()),
+            }
+        }
+        ToolOutput::text(statuses.join(","))
+    }
+}
+
+#[tokio::test]
+async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    // The child's input uses a null type, which core's schema subset would reject.
+    let schema = json!({"type": "object", "properties": {"v": {"type": "null"}}});
+    let config = McpConfig {
+        servers: BTreeMap::from([(
+            "fake".into(),
+            server_config(
+                &dir.path().join("log.jsonl"),
+                &[
+                    ("KYORA_MCP_TEST_EXTRA_TOOL", "schema"),
+                    ("KYORA_MCP_TEST_EXTRA_SCHEMA", &schema.to_string()),
+                ],
+            ),
+        )]),
+    };
+    let (servers, _) = Servers::start_with_env(&config, dir.path(), &environment()).await;
+    let servers = Arc::new(servers);
+    let base = Toolset::new(vec![Arc::new(Spawner)]).unwrap();
+    let provider = FnProvider::new(|request: &ModelRequest| {
+        let call = |name: &str, input: Value| ContentBlock::ToolUse {
+            id: "call".into(),
+            name: name.into(),
+            input,
+        };
+        let content = match (request.messages.len(), request.messages[0].text().as_str()) {
+            (1, "task") => vec![call("spawner", json!({}))],
+            (1, "use mcp") => vec![call("mcp__fake__schema", json!({"v": null}))],
+            _ => vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        };
+        let stop_reason = if matches!(content[0], ContentBlock::ToolUse { .. }) {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        };
+        Ok(ModelResponse {
+            id: None,
+            model: String::new(),
+            content,
+            stop_reason,
+            usage: Usage::default(),
+            usage_iterations: vec![],
+        })
+    });
+    let trace = TraceSink::ephemeral();
+    let mut events = trace.subscribe();
+    let runtime = Runtime::new(RuntimeConfig {
+        providers: BTreeMap::from([("fake".into(), Arc::new(provider) as Arc<dyn ModelProvider>)]),
+        toolsets: Arc::new(McpToolsets::new(&base, servers.clone())),
+        limits: Limits::default(),
+        retry: RetryPolicy::default(),
+        llm_model: "fake/leaf".parse().unwrap(),
+        trace: trace.clone(),
+        session: "test".into(),
+    })
+    .unwrap();
+    let outcome = runtime.run(spec(dir.path(), None)).await.unwrap();
+    assert_eq!(outcome.status, Status::Completed);
+    let mut offered = BTreeMap::new();
+    let mut results = BTreeMap::new();
+    while let Ok(record) = events.try_recv() {
+        match record.event {
+            TraceEvent::NodeStart { node, tools, .. } => {
+                offered.insert(node, tools.into_iter().map(|t| t.name).collect::<Vec<_>>());
+            }
+            TraceEvent::ToolResult {
+                node,
+                content,
+                is_error,
+                ..
+            } => {
+                results.insert(node, (content, is_error));
+            }
+            _ => {}
+        }
+    }
+    let root = *offered.keys().min().unwrap();
+    assert!(offered[&root].contains(&"mcp__fake__schema".to_owned()));
+    assert_eq!(results[&root], ("Completed,Completed".to_owned(), false));
+    let children: Vec<_> = offered.keys().filter(|node| **node != root).collect();
+    assert_eq!(children.len(), 2);
+    let (with_mcp, default): (Vec<_>, Vec<_>) = children
+        .into_iter()
+        .partition(|node| offered[node] == ["mcp__fake__schema"]);
+    assert_eq!(with_mcp.len(), 1, "{offered:?}");
+    // The default child selection holds no MCP tools.
+    assert!(
+        offered[default[0]]
+            .iter()
+            .all(|name| !name.starts_with("mcp__")),
+        "{offered:?}"
+    );
+    let (content, is_error) = &results[with_mcp[0]];
+    assert!(!is_error, "{content}");
+    assert_eq!(
+        serde_json::from_str::<Value>(content).unwrap(),
+        json!({"v": null})
+    );
     servers.shutdown().await;
 }
 

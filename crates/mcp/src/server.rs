@@ -204,6 +204,21 @@ enum Stopped {
     TimedOut,
 }
 
+/// Ends the HTTP requests of a startup whose future is dropped, for example by a
+/// caller that gives up on it, and tries to delete a session it opened.
+struct StartupGuard(Option<HttpClient>);
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            client.cancel();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move { client.close().await });
+            }
+        }
+    }
+}
+
 /// Explains a closed connection caused by an oversized message.
 fn limit_note(oversized: &AtomicBool) -> String {
     if oversized.load(Ordering::SeqCst) {
@@ -286,6 +301,19 @@ impl Server {
         cwd: &Path,
         env: &[(OsString, OsString)],
     ) -> Result<Arc<Self>> {
+        Self::start_until(name, config, cwd, env, &CancellationToken::new()).await
+    }
+
+    /// Like [`Self::start`], but gives up when `cancel` fires, after the same cleanup
+    /// as any other failure. Dropping the future instead still ends HTTP requests,
+    /// but deleting a session is then only attempted in the background.
+    pub async fn start_until(
+        name: &str,
+        config: &ServerConfig,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        cancel: &CancellationToken,
+    ) -> Result<Arc<Self>> {
         validate_name(name)?;
         config.validate()?;
         let secrets = Secrets::resolve(config, env);
@@ -304,6 +332,7 @@ impl Server {
             )?),
             None => None,
         };
+        let mut guard = StartupGuard(http.as_ref().map(|(client, _)| client.clone()));
         let startup = config.startup_timeout();
         let started = tokio::time::timeout(startup, async {
             let service = if let Some(command) = &config.command {
@@ -354,15 +383,19 @@ impl Server {
                 }
             };
             Ok((service, connection, listing))
-        })
-        .await;
+        });
+        let started = tokio::select! {
+            started = started => match started {
+                Ok(started) => started,
+                Err(_) => Err(anyhow!("startup timed out after {startup:?}")),
+            },
+            _ = cancel.cancelled() => Err(anyhow!("startup cancelled")),
+        };
+        // From here on, cleanup is awaited below rather than left to the guard.
+        guard.0 = None;
         let (service, connection, listing) = match started {
-            Ok(Ok(started)) => started,
-            failed => {
-                let error = match failed {
-                    Ok(Err(error)) => error,
-                    _ => anyhow!("startup timed out after {startup:?}"),
-                };
+            Ok(started) => started,
+            Err(error) => {
                 let stderr = match process {
                     Some(process) => process.kill(&secrets).await,
                     None => String::new(),
@@ -643,8 +676,18 @@ pub struct Servers {
 impl Servers {
     /// Starts every enabled server concurrently with kyora's own environment.
     pub async fn start(config: &McpConfig, cwd: &Path) -> (Self, Vec<anyhow::Error>) {
+        Self::start_until(config, cwd, &CancellationToken::new()).await
+    }
+
+    /// Like [`Self::start`], but servers still starting give up when `cancel` fires,
+    /// after cleaning up. Servers that already started are returned.
+    pub async fn start_until(
+        config: &McpConfig,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> (Self, Vec<anyhow::Error>) {
         let env: Vec<_> = std::env::vars_os().collect();
-        Self::start_with_env(config, cwd, &env).await
+        Self::start_with_env_until(config, cwd, &env, cancel).await
     }
 
     /// Starts every enabled server concurrently. Each failure names its server; the
@@ -654,12 +697,21 @@ impl Servers {
         cwd: &Path,
         env: &[(OsString, OsString)],
     ) -> (Self, Vec<anyhow::Error>) {
+        Self::start_with_env_until(config, cwd, env, &CancellationToken::new()).await
+    }
+
+    async fn start_with_env_until(
+        config: &McpConfig,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        cancel: &CancellationToken,
+    ) -> (Self, Vec<anyhow::Error>) {
         let starts = config
             .servers
             .iter()
             .filter(|(_, server)| server.enabled)
             .map(|(name, server)| async move {
-                Server::start(name, server, cwd, env)
+                Server::start_until(name, server, cwd, env, cancel)
                     .await
                     .with_context(|| format!("mcp server {name}"))
             });

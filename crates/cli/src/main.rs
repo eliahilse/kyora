@@ -272,14 +272,14 @@ async fn execute(mut run: Run) -> u8 {
     let stop = CancellationToken::new();
     let interrupts = tokio::spawn(watch_interrupts(stop.clone()));
     let (servers, failures) = if !mcp.servers.is_empty() {
-        // Ctrl-C drops the unfinished start, which kills every server it spawned.
-        tokio::select! {
-            started = kyora_mcp::Servers::start(&mcp, &cwd) => started,
-            _ = stop.cancelled() => {
-                interrupts.abort();
-                return 130;
-            }
+        // Ctrl-C stops servers still starting, after their cleanup.
+        let started = kyora_mcp::Servers::start_until(&mcp, &cwd, &stop).await;
+        if stop.is_cancelled() {
+            started.0.shutdown().await;
+            interrupts.abort();
+            return 130;
         }
+        started
     } else {
         (kyora_mcp::Servers::default(), Vec::new())
     };

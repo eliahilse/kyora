@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -375,4 +376,115 @@ async fn failed_http_startups_delete_the_session_they_opened() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// A server that opens an SSE response to initialize, assigns a session and never
+/// sends an event, so startup can only be abandoned. It records each request as
+/// "METHOD session".
+async fn hanging_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(answer(stream, log.clone()));
+        }
+    });
+    (url, seen)
+}
+
+async fn answer(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    let mut chunk = [0; 4096];
+    let head = loop {
+        let Ok(read @ 1..) = stream.read(&mut chunk).await else {
+            return;
+        };
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        }
+    };
+    let method = head.split(' ').next().unwrap_or_default().to_uppercase();
+    let session = head
+        .lines()
+        .find_map(|line| line.strip_prefix("mcp-session-id: "))
+        .unwrap_or("-")
+        .to_owned();
+    log.lock().unwrap().push(format!("{method} {session}"));
+    let reply: &[u8] = match method.as_str() {
+        "POST" => b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: hanging\r\ntransfer-encoding: chunked\r\n\r\n",
+        "DELETE" => b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        _ => b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    };
+    let _ = stream.write_all(reply).await;
+    if method == "POST" {
+        // Hold the stream open without ever finishing the response.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    }
+}
+
+async fn deleted(log: &Arc<Mutex<Vec<String>>>) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line == "DELETE hanging")
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+async fn initialize_sent(log: &Arc<Mutex<Vec<String>>>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.starts_with("POST"))
+    {
+        assert!(Instant::now() < deadline, "initialize not sent");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_abandoned_http_startup_deletes_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    // Cancelled through the token, as kyora run does on Ctrl-C.
+    let (url, log) = hanging_server().await;
+    let config = ServerConfig {
+        url: Some(url),
+        ..ServerConfig::default()
+    };
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let watched = log.clone();
+    tokio::spawn(async move {
+        initialize_sent(&watched).await;
+        trigger.cancel();
+    });
+    let started = Server::start_until("remote", &config, dir.path(), &[], &cancel).await;
+    assert!(format!("{:#}", started.err().unwrap()).contains("cancelled"));
+    assert!(deleted(&log).await, "{:?}", log.lock().unwrap());
+
+    // Dropped mid-startup by a caller that gives up on it.
+    let (url, log) = hanging_server().await;
+    let config = ServerConfig {
+        url: Some(url),
+        ..ServerConfig::default()
+    };
+    let path = dir.path().to_owned();
+    let starting =
+        tokio::spawn(async move { Server::start("remote", &config, &path, &[]).await.is_ok() });
+    initialize_sent(&log).await;
+    starting.abort();
+    assert!(deleted(&log).await, "{:?}", log.lock().unwrap());
 }

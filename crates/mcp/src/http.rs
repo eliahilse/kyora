@@ -90,6 +90,11 @@ impl HttpClient {
         }
     }
 
+    /// Ends every request and stream in flight.
+    pub(crate) fn cancel(&self) {
+        self.shared.cancel.cancel();
+    }
+
     /// Ends every request and stream in flight, then deletes a session that is still
     /// open, for example after a failed startup that rmcp abandoned.
     pub(crate) async fn close(&self) {

@@ -233,7 +233,9 @@ async fn execute(mut run: Run) -> u8 {
         let path = defaults::home(None)?.join(config::FILE_NAME);
         let config = config::Config::load(&path)?;
         let resolved = Resolved::new(&mut run, &config, &path)?;
-        Ok::<_, anyhow::Error>((prepare(&run)?, resolved, config, path))
+        let prepared = prepare(&run)?;
+        unknown_tools(&run, &config, &prepared.2)?;
+        Ok::<_, anyhow::Error>((prepared, resolved, config, path))
     })();
     let ((limits, cwd, builtins), resolved, config, path) = match prepared {
         Ok(p) => p,
@@ -337,6 +339,20 @@ async fn watch_interrupts(stop: CancellationToken) {
         }
         last = Some(now);
     }
+}
+/// Rejects `--tools` names that neither a built-in tool nor any enabled MCP server
+/// could provide, before providers or servers are set up. Names an MCP server might
+/// offer are checked once the servers have started.
+fn unknown_tools(run: &Run, config: &config::Config, builtins: &kyora_core::Toolset) -> Result<()> {
+    for name in run.tools.iter().flatten() {
+        let from_server = config.mcp.servers.iter().any(|(server, settings)| {
+            settings.enabled && name.starts_with(&format!("mcp__{server}__"))
+        });
+        if builtins.get(name).is_none() && !from_server {
+            bail!("unknown tool: {name}");
+        }
+    }
+    Ok(())
 }
 /// The node toolset factory and the root's `--tools` selection.
 struct Tools {

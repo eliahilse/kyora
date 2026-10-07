@@ -101,12 +101,12 @@ impl ServerConfig {
                     bail!("bearer_token_env, headers and env_headers apply only to url servers");
                 }
                 if self.env.keys().any(|name| credential(name))
-                    || self.env.values().any(|value| userinfo(value))
+                    || self.env.values().any(|value| url_credentials(value))
                 {
                     bail!("env must not hold credentials; name the variable in env_vars instead");
                 }
-                if self.args.iter().any(|arg| userinfo(arg)) {
-                    bail!("args must not embed credentials in URLs; pass them through env_vars");
+                if self.args.iter().any(|arg| url_credentials(arg)) || flag_credential(&self.args) {
+                    bail!("args must not hold credentials; pass them through env_vars");
                 }
             }
             (None, Some(url)) => {
@@ -128,7 +128,7 @@ impl ServerConfig {
                     bail!("args, env, env_vars and cwd apply only to command servers");
                 }
                 if self.headers.keys().any(|name| credential(name))
-                    || self.headers.values().any(|value| userinfo(value))
+                    || self.headers.values().any(|value| url_credentials(value))
                 {
                     bail!("headers must not hold credentials; use bearer_token_env or env_headers");
                 }
@@ -234,11 +234,47 @@ pub(crate) fn credential(name: &str) -> bool {
 }
 
 /// Whether `value` contains a URL with user information, as in
-/// `postgresql://user:password@host/db`.
-fn userinfo(value: &str) -> bool {
+/// `postgresql://user:password@host/db`, or with a credential-like query parameter,
+/// as in `https://host/?api_key=...`.
+fn url_credentials(value: &str) -> bool {
     value.match_indices("://").any(|(start, scheme)| {
         let rest = &value[start + scheme.len()..];
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let url = rest.split(char::is_whitespace).next().unwrap_or_default();
+        let authority = url.split(['/', '?', '#']).next().unwrap_or_default();
+        let query = url
+            .split_once('?')
+            .map_or("", |(_, query)| query.split('#').next().unwrap_or_default());
         authority.contains('@')
+            || query
+                .split('&')
+                .any(|pair| credential(pair.split('=').next().unwrap_or_default()))
+    })
+}
+
+/// Whether `args` pass a credential-looking flag a literal value, as in
+/// `--api-key VALUE` or `--password=VALUE`. Flags that name where a credential is
+/// kept, such as `--token-file` or `--api-key-env`, are fine.
+fn flag_credential(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        if !arg.starts_with('-') {
+            return false;
+        }
+        let (flag, value) = match arg.trim_start_matches('-').split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (arg.trim_start_matches('-'), None),
+        };
+        let upper = flag.to_ascii_uppercase();
+        let reference = ["FILE", "PATH", "DIR", "ENV", "VAR"]
+            .iter()
+            .any(|suffix| upper.ends_with(suffix));
+        if !credential(flag) || reference {
+            return false;
+        }
+        match value {
+            Some(value) => !value.is_empty(),
+            None => args
+                .get(index + 1)
+                .is_some_and(|next| !next.starts_with('-')),
+        }
     })
 }

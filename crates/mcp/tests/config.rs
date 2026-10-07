@@ -115,6 +115,13 @@ fn credentials_must_come_from_the_environment() {
         ),
         format!("[servers.a]\ncommand = 'x'\nenv = {{ SESSION_ID = '{SECRET}' }}"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--db=postgresql://user:{SECRET}@host/db']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--api-key', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--password={SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['serve', '--token', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--auth', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['-secret', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--url=https://h/mcp?token={SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nenv = {{ UPSTREAM = 'https://h/?api_key={SECRET}' }}"),
     ] {
         let message = error(&text);
         assert!(message.starts_with("mcp server a: "), "{message}");
@@ -132,6 +139,12 @@ fn credentials_must_come_from_the_environment() {
     parse("[servers.a]\nurl = 'https://h/mcp?team=core'")
         .validate()
         .unwrap();
+    // Flags that point at where a credential lives, and flags without values, are fine.
+    parse(
+        "[servers.a]\ncommand = 'x'\nargs = ['--api-key-env', 'GITHUB_TOKEN', '--token-file', '/run/t', '--no-auth', '--port', '8080', '--url=https://h/?team=core']",
+    )
+    .validate()
+    .unwrap();
     assert!(
         error("[servers.a]\nurl = 'https://h/'\nenv_headers = { Mcp-Session-Id = 'X' }")
             .contains("reserved")

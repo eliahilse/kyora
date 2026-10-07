@@ -6,7 +6,8 @@
 //! which stops answering tools/list once the notify tool has run.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
 //! KYORA_MCP_TEST_EXTRA_TOOL adds a tool with that name, which echoes its arguments;
-//! KYORA_MCP_TEST_EXTRA_SCHEMA sets its input schema.
+//! KYORA_MCP_TEST_EXTRA_SCHEMA and KYORA_MCP_TEST_EXTRA_DESCRIPTION set its input schema
+//! and description.
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -233,7 +234,8 @@ fn tools(mode: &str, added: bool) -> Vec<Value> {
             .ok()
             .and_then(|schema| serde_json::from_str(&schema).ok())
             .unwrap_or(object);
-        tools.push(json!({"name": name, "inputSchema": schema}));
+        let description = std::env::var("KYORA_MCP_TEST_EXTRA_DESCRIPTION").unwrap_or_default();
+        tools.push(json!({"name": name, "description": description, "inputSchema": schema}));
     }
     tools
 }

@@ -333,7 +333,14 @@ async fn colliding_names_leave_both_tools_out_with_a_warning() {
 async fn environment_and_working_directory_are_controlled() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
-    let mut config = server_config(&dir.path().join("log.jsonl"), &[("MODE", "fast")]);
+    let mut config = server_config(
+        &dir.path().join("log.jsonl"),
+        &[
+            ("MODE", "fast"),
+            ("KYORA_MCP_TEST_EXTRA_TOOL", "described"),
+            ("KYORA_MCP_TEST_EXTRA_DESCRIPTION", "Uses forwarded."),
+        ],
+    );
     config.env_vars = vec!["KYORA_TEST_FORWARD".into()];
     config.cwd = Some("sub".into());
     let server = start(dir.path(), &config).await;
@@ -354,6 +361,15 @@ async fn environment_and_working_directory_are_controlled() {
     assert_eq!(seen, ["KYORA_TEST_FORWARD", "MODE", "PATH"]);
     // Forwarded values count as credentials and never reach the model.
     assert_eq!(vars["KYORA_TEST_FORWARD"], kyora_mcp::REDACTED);
+    let described = server
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "mcp__fake__described")
+        .unwrap();
+    assert_eq!(
+        described.spec().description,
+        format!("Uses {}.", kyora_mcp::REDACTED)
+    );
     assert_eq!(
         PathBuf::from(report["cwd"].as_str().unwrap())
             .canonicalize()

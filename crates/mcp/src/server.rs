@@ -84,6 +84,10 @@ impl Connection {
         self.timeout
     }
 
+    pub(crate) fn redact(&self, text: &str) -> String {
+        self.secrets.redact(text)
+    }
+
     /// Calls `tool` until it answers, `cancel` fires or `deadline` passes. The last two
     /// send `notifications/cancelled` for the request. Credential values are redacted
     /// from the output, whether it is a result or an error.

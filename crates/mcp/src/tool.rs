@@ -34,6 +34,8 @@ impl McpTool {
             .map(|description| description.into_owned())
             .or(tool.title)
             .unwrap_or_default();
+        // Descriptions reach the model, so they get the same redaction as results.
+        let description = connection.redact(&description);
         Self {
             spec: ToolSpec {
                 name: tool_name(connection.server(), &tool.name),

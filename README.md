@@ -16,4 +16,6 @@ Requires Rust stable (see rust-toolchain.toml); Python 3.9+ for the REPL tests.
 
 Run the TUI demo: `CARGO_BUILD_JOBS=4 cargo run -p kyora-cli -- tui --demo` (see docs/tui.md).
 
+Connect MCP servers through `[mcp.servers.<name>]` in `$KYORA_HOME/config.toml` (see docs/mcp.md).
+
 License: Apache-2.0, see LICENSE.

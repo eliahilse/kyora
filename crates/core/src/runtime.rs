@@ -1445,7 +1445,7 @@ impl NodeCtx {
         let parent = self.id;
         let parent_state = self.state.clone();
         let runtime = self.runtime.clone();
-        work.tasks.push(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let state = cx.state.clone();
             let result = runtime
                 .run_node(cx, agent_spec, settings, owner_token)
@@ -1465,7 +1465,8 @@ impl NodeCtx {
             } else {
                 parent_state.mailbox.touch();
             }
-        }));
+        });
+        self.own(&mut work, task);
         Ok(handle)
     }
     /// Resolves an address relative to this agent: "parent", a node id such as "3"
@@ -1577,7 +1578,7 @@ impl NodeCtx {
             let mut previous = work.sent.replace(queued);
             // Recording and queueing run as owned work that this node's shutdown joins,
             // so a caller that stops waiting cannot leave an accepted send half done.
-            work.tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 if let Some(previous) = &mut previous {
                     while !*previous.borrow_and_update() {
                         if previous.changed().await.is_err() {
@@ -1601,7 +1602,8 @@ impl NodeCtx {
                 };
                 done.send_replace(true);
                 let _ = tx.send(result);
-            }));
+            });
+            self.own(&mut work, task);
         }
         rx.await.unwrap_or(Err(RecursionError::Cancelled))
     }
@@ -1808,6 +1810,21 @@ impl NodeCtx {
             }
         }
     }
+    /// Adds an owned task that this node's shutdown joins. Finished tasks are
+    /// reaped first, so a long-running node holds only the work still in flight;
+    /// a reaped task that panicked still marks the run failed.
+    fn own(&self, work: &mut Work, task: tokio::task::JoinHandle<()>) {
+        work.tasks.retain_mut(|task| {
+            if !task.is_finished() {
+                return true;
+            }
+            if matches!(task.now_or_never(), Some(Err(_))) {
+                self.runtime.0.panicked.store(true, Ordering::SeqCst);
+            }
+            false
+        });
+        work.tasks.push(task);
+    }
     /// Records the delivery of `messages` as owned work that this node's shutdown
     /// joins, after the node's earlier delivery records. The receiver turns true once
     /// the record is written.
@@ -1822,7 +1839,7 @@ impl NodeCtx {
         let runtime = self.runtime.clone();
         let node = self.id;
         let messages = messages.iter().map(|message| message.id).collect();
-        work.tasks.push(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Some(previous) = &mut previous {
                 while !*previous.borrow_and_update() {
                     if previous.changed().await.is_err() {
@@ -1839,7 +1856,8 @@ impl NodeCtx {
                 })
                 .await;
             done.send_replace(true);
-        }));
+        });
+        self.own(work, task);
         written
     }
     /// Number of messages waiting in this agent's mailbox.
@@ -1916,10 +1934,11 @@ impl NodeCtx {
                 owners: Arc::new(self.owners.iter().chain([&owner]).cloned().collect()),
             };
             // Own the task independently of the waiting future so settlement always completes.
-            work.tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let result = cx.llm_owned(call, owner).await;
                 let _ = tx.send(result);
-            }));
+            });
+            self.own(&mut work, task);
         }
         rx.await
             .map_err(|e| RecursionError::ModelError(e.to_string()))?
@@ -2073,5 +2092,108 @@ impl Drop for ReservationGuard<'_> {
             };
             self.ledger.settle(reservation, Charge::Failed(charge));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Tool, Toolset};
+    use async_trait::async_trait;
+    use kyora_protocol::ToolSpec;
+    use kyora_providers::fake::{Matcher, Rule, ScriptedProvider};
+    use serde_json::json;
+
+    /// Sends many messages to its parent, then records how many tasks it still owns.
+    struct Chatty(Arc<AtomicU32>);
+    #[async_trait]
+    impl Tool for Chatty {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "python".into(),
+                input_schema: json!({"type":"object"}),
+                ..ToolSpec::default()
+            }
+        }
+        fn effect(&self) -> Effect {
+            Effect::Mutating
+        }
+        async fn call(&self, _: Value, cx: ToolCx) -> ToolOutput {
+            if cx.node.depth == 0 {
+                let child = cx
+                    .node
+                    .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                    .unwrap();
+                child.result().await;
+                return ToolOutput::text("done");
+            }
+            let parent = cx.node.parent.unwrap();
+            for _ in 0..200 {
+                cx.node.send(parent, "m").await.unwrap();
+            }
+            let held = cx.node.state.work.lock().unwrap().tasks.len();
+            self.0.store(held as u32, Ordering::SeqCst);
+            ToolOutput::text("sent")
+        }
+    }
+    fn turns(task: &str, depth: u32) -> Rule {
+        let step = |content, stop_reason| ModelResponse {
+            content,
+            stop_reason,
+            usage: Usage::default(),
+            id: None,
+            model: String::new(),
+            usage_iterations: vec![],
+        };
+        Rule {
+            matcher: Some(Matcher {
+                first_user_contains: Some(task.into()),
+                depth: Some(depth),
+                ..Matcher::default()
+            }),
+            responses: vec![
+                step(
+                    vec![ContentBlock::ToolUse {
+                        id: "t0".into(),
+                        name: "python".into(),
+                        input: json!({}),
+                    }],
+                    StopReason::ToolUse,
+                ),
+                step(
+                    vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    StopReason::EndTurn,
+                ),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_message_tasks_are_reaped_as_the_node_goes() {
+        let held = Arc::new(AtomicU32::new(u32::MAX));
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::new(vec![
+            turns("root task", 0),
+            turns("child task", 1),
+        ]));
+        let runtime = Runtime::new(RuntimeConfig {
+            providers: BTreeMap::from([("fake".into(), provider)]),
+            toolsets: Arc::new(Toolset::new(vec![Arc::new(Chatty(held.clone()))]).unwrap()),
+            limits: Limits {
+                mailbox_capacity: 1000,
+                ..Limits::default()
+            },
+            retry: RetryPolicy::default(),
+            llm_model: "fake/leaf".parse().unwrap(),
+            trace: TraceSink::ephemeral(),
+            session: "reap".into(),
+        })
+        .unwrap();
+        let mut spec = AgentSpec::new("root task", std::env::current_dir().unwrap());
+        spec.model = "fake/agent".parse().unwrap();
+        assert_eq!(runtime.run(spec).await.unwrap().status, Status::Completed);
+        // 200 sends, each its own task; only the most recent may still be held.
+        assert!(held.load(Ordering::SeqCst) <= 2);
     }
 }

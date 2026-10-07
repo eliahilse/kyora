@@ -35,7 +35,7 @@ deny_tools = ["delete_issue"]
 | `allow_tools`, `deny_tools` | both | Server-side tool names to keep or drop; deny wins. |
 | `enabled` | both | `false` keeps the entry without starting the server. |
 
-Exactly one of `command` and `url` is set. Credentials are never written into the file: `env` keys and `headers` names that look like credentials (containing KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL or AUTH) are rejected; use `env_vars`, `bearer_token_env` or `env_headers`. A stdio server inherits only PATH, HOME, USER, LOGNAME, SHELL, LANG, TERM, TMPDIR, TZ and LC_* from kyora, minus credential-like names, so provider API keys never reach it unless listed in `env_vars`.
+Exactly one of `command` and `url` is set. Credentials are never written into the file: `env` keys and `headers` names that look like credentials or carry them (containing KEY, TOKEN, SECRET, PASSWORD, PASSWD, PASSPHRASE, CREDENTIAL, AUTH, COOKIE, SESSION, BEARER or JWT), URLs with user information in `env`, `headers` or `args`, and `url` query parameters with such names are rejected; use `env_vars`, `bearer_token_env` or `env_headers`. A stdio server inherits only PATH, HOME, USER, LOGNAME, SHELL, LANG, TERM, TMPDIR, TZ and LC_* from kyora, minus credential-like names, so provider API keys never reach it unless listed in `env_vars`.
 
 Server names are 1 to 32 ASCII letters, digits, `-` or `_`, without `__` or a trailing `_`, which keeps every tool name unambiguous. Tool name characters outside `[A-Za-z0-9_-]` become `_`, and names are kept within the 64 characters providers accept; a name that had to change gets eight hex digits of a hash of the original, so distinct server tools stay distinct.
 

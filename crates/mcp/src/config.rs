@@ -100,8 +100,13 @@ impl ServerConfig {
                 {
                     bail!("bearer_token_env, headers and env_headers apply only to url servers");
                 }
-                if self.env.keys().any(|name| credential(name)) {
+                if self.env.keys().any(|name| credential(name))
+                    || self.env.values().any(|value| userinfo(value))
+                {
                     bail!("env must not hold credentials; name the variable in env_vars instead");
+                }
+                if self.args.iter().any(|arg| userinfo(arg)) {
+                    bail!("args must not embed credentials in URLs; pass them through env_vars");
                 }
             }
             (None, Some(url)) => {
@@ -109,7 +114,10 @@ impl ServerConfig {
                 if !matches!(parsed.scheme(), "http" | "https") {
                     bail!("url must use http or https");
                 }
-                if !parsed.username().is_empty() || parsed.password().is_some() {
+                if !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.query_pairs().any(|(name, _)| credential(&name))
+                {
                     bail!("url must not embed credentials; use bearer_token_env or env_headers");
                 }
                 if !self.args.is_empty()
@@ -119,7 +127,9 @@ impl ServerConfig {
                 {
                     bail!("args, env, env_vars and cwd apply only to command servers");
                 }
-                if self.headers.keys().any(|name| credential(name)) {
+                if self.headers.keys().any(|name| credential(name))
+                    || self.headers.values().any(|value| userinfo(value))
+                {
                     bail!("headers must not hold credentials; use bearer_token_env or env_headers");
                 }
                 for name in self.headers.keys().chain(self.env_headers.keys()) {
@@ -201,10 +211,34 @@ fn seconds(value: Option<f64>) -> Option<Duration> {
     value.and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
-/// Names that look like credentials: never inherited by default and never written as literals.
+/// Names that look like credentials or carry them (cookies, sessions): never inherited
+/// by default and never written as literals.
 pub(crate) fn credential(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"]
-        .iter()
-        .any(|needle| upper.contains(needle))
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "AUTH",
+        "COOKIE",
+        "SESSION",
+        "BEARER",
+        "JWT",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
+}
+
+/// Whether `value` contains a URL with user information, as in
+/// `postgresql://user:password@host/db`.
+fn userinfo(value: &str) -> bool {
+    value.match_indices("://").any(|(start, scheme)| {
+        let rest = &value[start + scheme.len()..];
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        authority.contains('@')
+    })
 }

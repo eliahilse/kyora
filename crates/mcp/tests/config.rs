@@ -101,6 +101,20 @@ fn credentials_must_come_from_the_environment() {
         ),
         format!("[servers.a]\nurl = 'https://h/'\nheaders = {{ X-Api-Key = '{SECRET}' }}"),
         format!("[servers.a]\nurl = 'https://user:{SECRET}@h/'"),
+        format!("[servers.a]\nurl = 'https://h/mcp?api_key={SECRET}'"),
+        format!("[servers.a]\nurl = 'https://h/'\nheaders = {{ Cookie = 'session={SECRET}' }}"),
+        format!("[servers.a]\nurl = 'https://h/'\nheaders = {{ Set-Cookie = 'id={SECRET}' }}"),
+        format!(
+            "[servers.a]\nurl = 'https://h/'\nheaders = {{ Proxy-Authorization = 'Basic {SECRET}' }}"
+        ),
+        format!(
+            "[servers.a]\nurl = 'https://h/'\nheaders = {{ X-Upstream = 'https://u:{SECRET}@db/' }}"
+        ),
+        format!(
+            "[servers.a]\ncommand = 'x'\nenv = {{ DATABASE_URL = 'postgresql://user:{SECRET}@host/db' }}"
+        ),
+        format!("[servers.a]\ncommand = 'x'\nenv = {{ SESSION_ID = '{SECRET}' }}"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--db=postgresql://user:{SECRET}@host/db']"),
     ] {
         let message = error(&text);
         assert!(message.starts_with("mcp server a: "), "{message}");
@@ -109,6 +123,15 @@ fn credentials_must_come_from_the_environment() {
     assert!(
         error("[servers.a]\nurl = 'https://h/'\nheaders = { Accept = 'x' }").contains("reserved")
     );
+    // URLs without user information, and an @ outside the authority, are fine.
+    parse(
+        "[servers.a]\ncommand = 'x'\nargs = ['--docs=https://example.com/a@b']\nenv = { HOMEPAGE = 'https://example.com/?q=a@b' }",
+    )
+    .validate()
+    .unwrap();
+    parse("[servers.a]\nurl = 'https://h/mcp?team=core'")
+        .validate()
+        .unwrap();
     assert!(
         error("[servers.a]\nurl = 'https://h/'\nenv_headers = { Mcp-Session-Id = 'X' }")
             .contains("reserved")

@@ -709,6 +709,9 @@ impl Runtime {
             .providers
             .get(&model.provider)
             .ok_or_else(|| anyhow::anyhow!("unknown provider: {}", model.provider))?;
+        if cx.stopped() || Instant::now() >= cx.deadline {
+            return Err(ProviderError::Cancelled.into());
+        }
         let model_info = tokio::select! {
             biased;
             _ = cx.cancel.cancelled() => return Err(ProviderError::Cancelled.into()),
@@ -1154,7 +1157,7 @@ impl NodeCtx {
                 state: Arc::new(NodeState::default()),
                 cwd: self.cwd.clone(),
                 options: call.options.clone(),
-                owners: self.owners.clone(),
+                owners: Arc::new(self.owners.iter().chain([&owner]).cloned().collect()),
             };
             // Own the task independently of the waiting future so settlement always completes.
             work.tasks.push(tokio::spawn(async move {
@@ -1173,11 +1176,6 @@ impl NodeCtx {
         let cx = self;
         let id = self.id;
         let model = self.model.clone();
-        // The watcher only runs once this task yields. An owner cancelled before the
-        // task started must stop it before any dispatch, so check it here.
-        if owner.is_cancelled() {
-            cx.cancel.cancel();
-        }
         let child = cx.cancel.clone();
         let watcher = tokio::spawn(async move {
             tokio::select! { _ = owner.cancelled() => child.cancel(), _ = child.cancelled() => {} }

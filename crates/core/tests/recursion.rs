@@ -8,7 +8,9 @@ use kyora_core::{
     session::SessionStore,
     trace::{TraceEvent, TraceRecord, TraceSink, reconstruct_jsonl, reconstruct_tree},
 };
-use kyora_protocol::{ContentBlock, ModelRequest, ModelResponse, StopReason, ToolSpec, Usage};
+use kyora_protocol::{
+    ContentBlock, ModelInfo, ModelRequest, ModelResponse, StopReason, ToolSpec, Usage,
+};
 use kyora_providers::{
     EventStream, ModelProvider, ProviderError, RetryPolicy,
     fake::{Matcher, Rule, ScriptedProvider},
@@ -1260,5 +1262,80 @@ async fn ancestor_shutdown_stops_a_queued_cell_owned_grandchild() {
         Some(Status::Cancelled)
     );
     assert_order(&live);
+    assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
+}
+
+/// Cancels the captured owner while answering a model-info lookup for the leaf
+/// model, so the cancellation lands after the leaf started and before dispatch.
+struct CancelOnLookup {
+    counting: Arc<Counting>,
+    owner: CancellationToken,
+}
+#[async_trait]
+impl ModelProvider for CancelOnLookup {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn model_info(&self, model: &str) -> Result<ModelInfo, ProviderError> {
+        if model == "leaf" {
+            self.owner.cancel();
+        }
+        Ok(ModelInfo {
+            id: model.into(),
+            ..ModelInfo::default()
+        })
+    }
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        self.counting.stream(request, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn leaf_owner_cancelled_before_dispatch_dispatches_nothing() {
+    let owner = CancellationToken::new();
+    let caller = owner.clone();
+    let spawn = tool(move |_, cx| {
+        let owner = caller.clone();
+        async move {
+            assert!(matches!(
+                cx.node.llm(LlmCall::new("leaf"), &owner).await,
+                Err(RecursionError::Cancelled)
+            ));
+            assert_eq!(cx.node.budget().reserved, 0);
+            finish()
+        }
+    });
+    let counting = counting(vec![
+        root_rule(json!({})),
+        rule("leaf", 0, vec![response(None)]),
+    ]);
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(
+        Arc::new(CancelOnLookup {
+            counting: counting.clone(),
+            owner,
+        }),
+        Arc::new(Toolset::new(vec![spawn]).unwrap()),
+        Limits::default(),
+        trace,
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!(outcome.status, Status::Completed);
+    assert_eq!(*counting.dispatched.lock().unwrap(), vec!["0"]);
+    let live = records(rx);
+    assert!(
+        !live
+            .iter()
+            .any(|record| matches!(record.event, TraceEvent::AttemptStart { node: 1, .. }))
+    );
+    let leaf = &reconstruct_tree(&live).unwrap()[0].children[0];
+    assert_eq!(leaf.status, Some(Status::Cancelled));
+    assert_eq!(leaf.usage_self.total(), 0);
+    assert_eq!(outcome.usage_subtree.total(), outcome.usage_self.total());
     assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
 }

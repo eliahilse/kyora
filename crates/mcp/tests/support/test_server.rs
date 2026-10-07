@@ -5,6 +5,7 @@
 //! flood, many, bulky), linger, which keeps running after stdin closes, or stall-list,
 //! which stops answering tools/list once the notify tool has run.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
+//! KYORA_MCP_TEST_EXTRA_TOOL adds a tool with that name.
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -220,6 +221,9 @@ fn tools(mode: &str, added: bool) -> Vec<Value> {
     ];
     if added {
         tools.push(json!({"name": "added", "inputSchema": object}));
+    }
+    if let Ok(name) = std::env::var("KYORA_MCP_TEST_EXTRA_TOOL") {
+        tools.push(json!({"name": name, "inputSchema": object}));
     }
     tools
 }

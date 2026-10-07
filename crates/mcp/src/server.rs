@@ -26,7 +26,7 @@ use rmcp::{
 };
 use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     ffi::OsString,
     path::Path,
     sync::{
@@ -258,7 +258,7 @@ impl Drop for Pending {
 pub struct Server {
     name: String,
     connection: Arc<Connection>,
-    tools: RwLock<Vec<Arc<dyn Tool>>>,
+    listing: RwLock<Listing>,
     service: Mutex<Option<RunningService<RoleClient, Handler>>>,
     process: Mutex<Option<Process>>,
     http: Option<HttpClient>,
@@ -326,18 +326,21 @@ impl Server {
                 oversized: oversized.clone(),
             });
             // Servers without the tools capability contribute nothing.
-            let tools = if info.capabilities.tools.is_some() {
+            let listing = if info.capabilities.tools.is_some() {
                 // The startup timeout bounds this too; the deadline lets the listing
                 // cancel itself on the server first.
                 let deadline = Instant::now() + startup;
                 list(&connection, config, &CancellationToken::new(), deadline).await?
             } else {
-                Vec::new()
+                Listing {
+                    tools: Vec::new(),
+                    warnings: Vec::new(),
+                }
             };
-            Ok((service, connection, tools))
+            Ok((service, connection, listing))
         })
         .await;
-        let (service, connection, tools) = match started {
+        let (service, connection, listing) = match started {
             Ok(Ok(started)) => started,
             failed => {
                 let error = match failed {
@@ -363,7 +366,7 @@ impl Server {
         let server = Arc::new(Self {
             name: name.to_owned(),
             connection,
-            tools: RwLock::new(tools),
+            listing: RwLock::new(listing),
             service: Mutex::new(Some(service)),
             process: Mutex::new(process),
             http: http.map(|(client, _)| client),
@@ -386,7 +389,21 @@ impl Server {
 
     /// The tools offered now. Nodes freeze the set they receive when they start.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools.read().expect("tool list poisoned").clone()
+        self.listing
+            .read()
+            .expect("tool list poisoned")
+            .tools
+            .clone()
+    }
+
+    /// Problems with the current tool list, such as tools left out because their
+    /// names collide.
+    pub fn warnings(&self) -> Vec<String> {
+        self.listing
+            .read()
+            .expect("tool list poisoned")
+            .warnings
+            .clone()
     }
 
     /// Calls a tool by its server-side name with the configured timeout.
@@ -434,13 +451,50 @@ async fn refresh(
             _ = changed.notified() => {}
         }
         let deadline = Instant::now() + config.startup_timeout();
-        let Ok(tools) = list(&connection, &config, &closed, deadline).await else {
+        let Ok(listing) = list(&connection, &config, &closed, deadline).await else {
             continue;
         };
         let Some(server) = server.upgrade() else {
             return;
         };
-        *server.tools.write().expect("tool list poisoned") = tools;
+        *server.listing.write().expect("tool list poisoned") = listing;
+    }
+}
+
+/// A server's tools, without those whose names collide.
+struct Listing {
+    tools: Vec<Arc<dyn Tool>>,
+    warnings: Vec<String>,
+}
+
+impl Listing {
+    /// Leaves out every tool whose kyora name another tool also maps to, rather than
+    /// letting one silently shadow the other, and says so in a warning.
+    fn new(tools: Vec<McpTool>, connection: &Connection) -> Self {
+        let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for tool in &tools {
+            names
+                .entry(tool.name().to_owned())
+                .or_default()
+                .push(tool.remote_name().to_owned());
+        }
+        let warnings = names
+            .iter()
+            .filter(|(_, remotes)| remotes.len() > 1)
+            .map(|(name, remotes)| {
+                let warning = format!(
+                    "tools {} all map to {name}; none of them is offered",
+                    remotes.join(", ")
+                );
+                connection.secrets.redact(&warning)
+            })
+            .collect();
+        let tools = tools
+            .into_iter()
+            .filter(|tool| names[tool.name()].len() == 1)
+            .map(|tool| Arc::new(tool) as Arc<dyn Tool>)
+            .collect();
+        Self { tools, warnings }
     }
 }
 
@@ -450,7 +504,7 @@ async fn list(
     config: &ServerConfig,
     cancel: &CancellationToken,
     deadline: Instant,
-) -> Result<Vec<Arc<dyn Tool>>> {
+) -> Result<Listing> {
     let mut listed = Vec::new();
     let mut bytes = 0;
     let mut cursor = None;
@@ -484,15 +538,12 @@ async fn list(
         match page.next_cursor {
             Some(next) if !next.is_empty() => cursor = Some(next),
             _ => {
-                let mut names = BTreeSet::new();
-                return Ok(listed
+                let tools = listed
                     .into_iter()
                     .filter(|tool| config.exposes(&tool.name))
                     .map(|tool| McpTool::new(connection.clone(), tool))
-                    // A sanitized name equal to an earlier one keeps the first tool.
-                    .filter(|tool| names.insert(tool.name().to_owned()))
-                    .map(|tool| Arc::new(tool) as Arc<dyn Tool>)
-                    .collect());
+                    .collect();
+                return Ok(Listing::new(tools, connection));
             }
         }
     }

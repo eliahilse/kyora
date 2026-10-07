@@ -277,6 +277,11 @@ async fn execute(mut run: Run) -> u8 {
     for failure in failures {
         eprintln!("warning: {failure:#}; continuing without its tools");
     }
+    for server in servers.servers() {
+        for warning in server.warnings() {
+            eprintln!("warning: mcp server {}: {warning}", server.name());
+        }
+    }
     let servers = Arc::new(servers);
     let toolsets = kyora_mcp::McpToolsets::new(&builtins, servers.clone());
     // `--tools` may name MCP tools, so it is checked once the servers are up.

@@ -304,6 +304,27 @@ async fn allow_and_deny_lists_filter_tools() {
 }
 
 #[tokio::test]
+async fn colliding_names_leave_both_tools_out_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    // A real tool named exactly like the sanitized form of `dotted.name`.
+    let shadow = kyora_mcp::tool_name("fake", "dotted.name");
+    let raw = shadow.trim_start_matches("mcp__fake__").to_owned();
+    let config = server_config(
+        &dir.path().join("log.jsonl"),
+        &[("KYORA_MCP_TEST_EXTRA_TOOL", &raw)],
+    );
+    let server = start(dir.path(), &config).await;
+    let names: Vec<_> = server.tools().iter().map(|tool| tool.spec().name).collect();
+    assert!(!names.contains(&shadow), "{names:?}");
+    assert!(names.contains(&"mcp__fake__echo".to_owned()));
+    let warnings = server.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("dotted.name") && warnings[0].contains(&raw));
+    assert!(warnings[0].contains(&shadow));
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn environment_and_working_directory_are_controlled() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();

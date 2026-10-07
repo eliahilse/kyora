@@ -57,6 +57,8 @@ pub enum Delivery {
     Receive,
     /// Consumed by a wait call that returned the child's outcome.
     Wait,
+    /// Consumed by the cancel call that stopped the child, which returned its outcome.
+    Cancel,
 }
 /// One message between two agents of the same tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,7 +149,7 @@ pub(crate) enum Idle<'a> {
     Deliver(Taken<'a>),
     /// Children are still running or a send is in flight.
     Wait,
-    /// Nothing can arrive any more. The mailbox is now closed.
+    /// Nothing can arrive any more. The mailbox is now closed if closing was asked.
     Done,
 }
 impl Default for Mailbox {
@@ -256,7 +258,8 @@ impl Mailbox {
     }
     /// Decides atomically between delivering, waiting and closing, so a message
     /// is either delivered or refused to its sender, never accepted and dropped.
-    pub(crate) fn idle(&self) -> Idle<'_> {
+    /// Without `close`, `Done` leaves the mailbox open for an agent that goes on.
+    pub(crate) fn idle(&self, close: bool) -> Idle<'_> {
         let mut state = self.lock();
         if !state.queue.is_empty() {
             state.plain = 0;
@@ -267,7 +270,7 @@ impl Mailbox {
             });
         }
         if state.awaiting.is_empty() && state.reserved == 0 {
-            state.closed = true;
+            state.closed |= close;
             return Idle::Done;
         }
         Idle::Wait

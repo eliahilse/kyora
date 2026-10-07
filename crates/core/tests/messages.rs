@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use kyora_core::{
-    AgentSpec, Answer, ChildSpec, Delivery, Effect, Envelope, Limits, MessageId, MessageKind,
-    NodeCtx, NodeId, Owner, RecursionError, Runtime, RuntimeConfig, Status, Tool, ToolCx,
-    ToolOutput, Toolset, agent_tools,
+    AgentOutcome, AgentSpec, Answer, ChildSpec, Delivery, Effect, Envelope, Limits, MessageId,
+    MessageKind, NodeCtx, NodeId, Owner, RecursionError, Runtime, RuntimeConfig, Status, Tool,
+    ToolCx, ToolOutput, Toolset, agent_tools,
     session::SessionStore,
     trace::{TraceEvent, TraceRecord, TraceSink, reconstruct_jsonl, reconstruct_tree},
 };
@@ -80,6 +80,12 @@ impl Gated {
             }
             seen.changed().await.unwrap();
         }
+    }
+    fn requested(&self, task: &str, turns: usize) -> bool {
+        self.seen
+            .borrow()
+            .iter()
+            .any(|request| at(task, turns)(request))
     }
     /// The request a conversation sent after `turns` assistant messages.
     fn request(&self, task: &str, turns: usize) -> ModelRequest {
@@ -299,14 +305,31 @@ fn position(records: &[TraceRecord], find: impl Fn(&TraceEvent) -> bool) -> usiz
 fn node_end(node: NodeId) -> impl Fn(&TraceEvent) -> bool {
     move |event| matches!(event, TraceEvent::NodeEnd { outcome } if outcome.node == node)
 }
-fn status(records: &[TraceRecord], node: NodeId) -> Status {
+fn ended(records: &[TraceRecord], node: NodeId) -> AgentOutcome {
     records
         .iter()
         .find_map(|record| match &record.event {
-            TraceEvent::NodeEnd { outcome } if outcome.node == node => Some(outcome.status),
+            TraceEvent::NodeEnd { outcome } if outcome.node == node => Some(outcome.clone()),
             _ => None,
         })
         .expect("node ended")
+}
+fn status(records: &[TraceRecord], node: NodeId) -> Status {
+    ended(records, node).status
+}
+fn tool_names(records: &[TraceRecord], node: NodeId) -> Vec<String> {
+    records
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::NodeStart {
+                node: id, tools, ..
+            } if *id == node => Some(tools.iter().map(|tool| tool.name.clone()).collect()),
+            _ => None,
+        })
+        .expect("node started")
+}
+fn dates_schema() -> Value {
+    json!({"type":"object","properties":{"dates":{"type":"array","items":{"type":"string"}}},"required":["dates"],"additionalProperties":false})
 }
 
 #[tokio::test]
@@ -1154,4 +1177,422 @@ async fn addressing_is_limited_to_parent_children_and_siblings() {
     );
     let outcome = runtime.run(spec()).await.unwrap();
     assert_eq!(outcome.status, Status::Completed);
+}
+
+#[tokio::test]
+async fn cancel_agent_stops_a_descendant_and_its_subtree() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "worker task", "name": "worker"}),
+                    ),
+                    call("cancel_agent", json!({"to": "2"})),
+                    call("cancel_agent", json!({"to": "worker"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "worker task",
+                1,
+                vec![
+                    calls(vec![
+                        ("spawn_agent", json!({"task": "deep task", "name": "deep"})),
+                        (
+                            "spawn_agent",
+                            json!({"task": "deep task two", "name": "deep2"}),
+                        ),
+                    ]),
+                    text("waiting"),
+                ],
+            ),
+        ],
+        vec![
+            // The root cancels the grandchild once both grandchildren exist, and the
+            // worker once it has heard about that.
+            (at("root task", 1), at("worker task", 1)),
+            (at("root task", 2), at("worker task", 2)),
+            (at("worker task", 2), never()),
+            (at("deep task", 0), never()),
+        ],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(provider.clone(), idle_tool(), Limits::default(), trace);
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 4));
+    // Cancelling a grandchild: the canceller gets the outcome, its parent the notice.
+    let first = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&first),
+        vec![("[cancelled from agent 2 (deep): cancelled]".into(), false)]
+    );
+    assert!(texts(&first).is_empty());
+    assert_eq!(
+        texts(&last(&provider.request("worker task", 2))),
+        vec!["[cancelled from agent 2 (deep): cancelled]"]
+    );
+    // Cancelling a direct child: the outcome comes back and no separate message follows.
+    let second = last(&provider.request("root task", 3));
+    assert_eq!(
+        results(&second),
+        vec![(
+            "[cancelled from agent 1 (worker): cancelled]\nwaiting".into(),
+            false
+        )]
+    );
+    assert!(texts(&second).is_empty());
+    let live = records(rx);
+    for node in [1, 2, 3] {
+        assert_eq!(status(&live, node), Status::Cancelled);
+    }
+    let notices = sent(&live);
+    let id = |from| notices.iter().find(|m| m.from == from).unwrap().id;
+    assert_eq!(
+        delivered(&live),
+        vec![
+            (1, vec![id(2)], Delivery::Turn),
+            (0, vec![id(1)], Delivery::Cancel),
+        ]
+    );
+    // deep2 was cancelled with the worker; its notice found the worker closed.
+    let lost = undelivered(&live);
+    assert_eq!(
+        lost.iter()
+            .map(|m| (m.from, m.to, m.kind))
+            .collect::<Vec<_>>(),
+        vec![(3, 1, MessageKind::Cancelled)]
+    );
+    let worker_end = position(&live, node_end(1));
+    assert!(position(&live, node_end(2)) < worker_end);
+    assert!(position(&live, node_end(3)) < worker_end);
+    assert!(worker_end < position(&live, node_end(0)));
+    assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
+}
+
+#[tokio::test]
+async fn cancel_agent_reports_a_finished_child_and_refuses_non_descendants() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    calls(vec![
+                        (
+                            "spawn_agent",
+                            json!({"task": "child task", "name": "worker"}),
+                        ),
+                        ("spawn_agent", json!({"task": "peer task", "name": "peer"})),
+                    ]),
+                    call("wait", json!({})),
+                    calls(vec![
+                        ("cancel_agent", json!({"to": "worker"})),
+                        ("cancel_agent", json!({"to": "worker"})),
+                    ]),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "child task",
+                1,
+                vec![
+                    calls(vec![
+                        ("cancel_agent", json!({"to": "parent"})),
+                        ("cancel_agent", json!({"to": "#1"})),
+                        ("cancel_agent", json!({"to": "peer"})),
+                    ]),
+                    text("child done"),
+                ],
+            ),
+            rule("peer task", 1, vec![text("peer done")]),
+        ],
+        vec![
+            (at("child task", 0), at("root task", 1)),
+            (at("peer task", 0), at("root task", 1)),
+        ],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(provider.clone(), idle_tool(), Limits::default(), trace);
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 4));
+    assert_eq!(
+        results(&last(&provider.request("child task", 1))),
+        vec![
+            (
+                "invalid request: agent 0 is not a descendant of this agent".into(),
+                true
+            ),
+            (
+                "invalid request: agent 1 is not a descendant of this agent".into(),
+                true
+            ),
+            (
+                "invalid request: agent 2 is not a descendant of this agent".into(),
+                true
+            ),
+        ]
+    );
+    let finished =
+        "agent 1 had already finished\n[result from agent 1 (worker): completed]\nchild done";
+    assert_eq!(
+        results(&last(&provider.request("root task", 3))),
+        vec![(finished.into(), false), (finished.into(), false)]
+    );
+    let live = records(rx);
+    assert_eq!(status(&live, 1), Status::Completed);
+    assert_eq!(status(&live, 2), Status::Completed);
+    // Both results were taken by wait; the cancel calls took nothing.
+    assert!(
+        delivered(&live)
+            .iter()
+            .all(|(node, _, via)| (*node, *via) == (0, Delivery::Wait))
+    );
+}
+
+#[tokio::test]
+async fn submitting_a_result_ends_the_child_and_cancels_its_children() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "extract task", "name": "extract", "output": dates_schema()}),
+                    ),
+                    text("waiting"),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "extract task",
+                1,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "helper task", "name": "helper"}),
+                    ),
+                    call("submit_result", json!({"dates": ["2026-10-07"]})),
+                ],
+            ),
+        ],
+        vec![
+            (at("extract task", 0), at("root task", 1)),
+            // The child submits while its helper is still running.
+            (at("extract task", 1), at("helper task", 0)),
+            (at("helper task", 0), never()),
+        ],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(provider.clone(), idle_tool(), Limits::default(), trace);
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 3));
+    let live = records(rx);
+    assert!(tool_names(&live, 1).contains(&"submit_result".to_string()));
+    assert!(!tool_names(&live, 0).contains(&"submit_result".to_string()));
+    let submit = live
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::NodeStart { node: 1, tools, .. } => tools
+                .iter()
+                .find(|tool| tool.name == "submit_result")
+                .cloned(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(submit.input_schema, dates_schema());
+    // The child ended at once with the structured answer and cancelled its helper.
+    let extract = ended(&live, 1);
+    assert_eq!((extract.status, extract.turns), (Status::Completed, 2));
+    assert!(matches!(&extract.answer, Answer::Value(_)));
+    assert!(!provider.requested("extract task", 2));
+    assert_eq!(status(&live, 2), Status::Cancelled);
+    assert!(position(&live, node_end(2)) < position(&live, node_end(1)));
+    let notice = sent(&live)
+        .into_iter()
+        .find(|m| m.from == 1 && m.kind == MessageKind::Result)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&notice.body).unwrap(),
+        json!({"dates": ["2026-10-07"]})
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 2))),
+        vec!["[result from agent 1 (extract): completed]\n{\"dates\":[\"2026-10-07\"]}"]
+    );
+    assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
+}
+
+#[tokio::test]
+async fn invalid_output_schemas_and_submissions_return_what_to_fix() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    calls(vec![
+                        (
+                            "spawn_agent",
+                            json!({"task": "scalar", "output": {"type": "string"}}),
+                        ),
+                        (
+                            "spawn_agent",
+                            json!({"task": "union", "output": {"type": "object", "properties": {"x": {"type": ["string", "null"]}}}}),
+                        ),
+                        (
+                            "spawn_agent",
+                            json!({"task": "extract task", "name": "extract", "output": dates_schema()}),
+                        ),
+                    ]),
+                    call("wait", json!({})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "extract task",
+                1,
+                vec![
+                    call("submit_result", json!({"dates": "2026-10-07"})),
+                    call(
+                        "submit_result",
+                        json!({"dates": ["2026-10-07"], "note": "x"}),
+                    ),
+                    call("submit_result", json!({"dates": ["2026-10-07"]})),
+                ],
+            ),
+        ],
+        vec![(at("extract task", 0), at("root task", 1))],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(provider.clone(), idle_tool(), Limits::default(), trace);
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 3));
+    assert_eq!(
+        results(&last(&provider.request("root task", 1))),
+        vec![
+            (
+                "invalid request: output must be a JSON schema of type object".into(),
+                true
+            ),
+            (
+                "invalid request: invalid output schema: unsupported schema type: [\"string\",\"null\"]"
+                    .into(),
+                true
+            ),
+            ("started agent 1 (extract)".into(), false),
+        ]
+    );
+    assert_eq!(
+        results(&last(&provider.request("extract task", 1))),
+        vec![(
+            "result does not match the output schema: invalid input type, expected \"array\""
+                .into(),
+            true
+        )]
+    );
+    assert_eq!(
+        results(&last(&provider.request("extract task", 2))),
+        vec![(
+            "result does not match the output schema: unexpected property: note".into(),
+            true
+        )]
+    );
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(
+            "[result from agent 1 (extract): completed]\n{\"dates\":[\"2026-10-07\"]}".into(),
+            false
+        )]
+    );
+    let live = records(rx);
+    // Submissions are checked by the tool, so the model sees the reason.
+    assert!(
+        !live
+            .iter()
+            .any(|record| matches!(record.event, TraceEvent::InvalidToolInput { .. }))
+    );
+    assert_eq!(ended(&live, 1).turns, 3);
+}
+
+#[tokio::test]
+async fn ending_a_turn_without_submitting_is_reminded_once_then_fails() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    calls(vec![
+                        (
+                            "spawn_agent",
+                            json!({"task": "lazy task", "name": "lazy", "output": dates_schema()}),
+                        ),
+                        (
+                            "spawn_agent",
+                            json!({"task": "late task", "name": "late", "output": dates_schema()}),
+                        ),
+                    ]),
+                    call("wait", json!({})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "lazy task",
+                1,
+                vec![text("no dates here"), text("still none")],
+            ),
+            rule(
+                "late task",
+                1,
+                vec![
+                    text("thinking"),
+                    call("submit_result", json!({"dates": []})),
+                ],
+            ),
+        ],
+        vec![
+            (at("lazy task", 0), at("root task", 1)),
+            (at("late task", 0), at("root task", 1)),
+        ],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(provider.clone(), idle_tool(), Limits::default(), trace);
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 3));
+    for task in ["lazy task", "late task"] {
+        assert_eq!(
+            texts(&last(&provider.request(task, 1))),
+            vec![agent_tools::SUBMIT_REMINDER]
+        );
+    }
+    assert!(!provider.requested("lazy task", 2));
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(
+            "[error from agent 1 (lazy): failed]\nended without calling submit_result. Last reply: still none\n\n[result from agent 2 (late): completed]\n{\"dates\":[]}"
+                .into(),
+            false
+        )]
+    );
+    let live = records(rx);
+    assert_eq!(
+        (status(&live, 1), ended(&live, 1).turns),
+        (Status::Failed, 2)
+    );
+    assert_eq!(status(&live, 2), Status::Completed);
+    assert!(live.iter().any(|record| matches!(
+        &record.event,
+        TraceEvent::Error { node: 1, message } if message == "ended without calling submit_result"
+    )));
 }

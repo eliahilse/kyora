@@ -21,4 +21,4 @@ pub use trace::{
     RecursionTree, TraceEvent, TraceRecord, TraceSink, reconstruct_jsonl, reconstruct_tree,
 };
 
-pub use recursion::{AgentHandle, ChildSpec, ChildStatus, Owner, RecursionError};
+pub use recursion::{AgentHandle, CancelOutcome, ChildSpec, ChildStatus, Owner, RecursionError};

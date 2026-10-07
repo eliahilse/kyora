@@ -201,4 +201,5 @@ pub const SUBAGENT_TOOLS: &[&str] = &[
     "send_message",
     "receive",
     "wait",
+    "cancel_agent",
 ];

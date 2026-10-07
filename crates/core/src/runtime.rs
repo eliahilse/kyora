@@ -1,14 +1,15 @@
 //! Shared agent loop and node-scoped entry points for recursive work.
 use crate::{
-    AgentHandle, ChildSpec, ChildStatus, Effect, Limits, ModelRef, Owner, RecursionError, ToolCx,
-    ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink, defaults,
+    AgentHandle, CancelOutcome, ChildSpec, ChildStatus, Effect, Limits, ModelRef, Owner,
+    RecursionError, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink,
+    agent_tools, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
     messages::{
         self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Pending, Refusal, Taken,
         Waited,
     },
     prompts,
-    tool::truncate,
+    tool::{self, truncate},
 };
 use anyhow::{Result, bail};
 use futures::{FutureExt, StreamExt};
@@ -173,6 +174,7 @@ struct AgentEntry {
     parent: Option<NodeId>,
     name: String,
     state: Arc<NodeState>,
+    cancel: CancellationToken,
     outcome: Option<watch::Receiver<Option<AgentOutcome>>>,
 }
 /// Shared runtime for one invocation. `run` may be called exactly once.
@@ -195,6 +197,7 @@ struct AgentSettings {
     origin_cell: Option<u32>,
     init: Option<Arc<Value>>,
     max_turns: u32,
+    output: Option<Value>,
 }
 /// Node-scoped entry point for child agents and leaf completions.
 #[derive(Clone)]
@@ -334,7 +337,14 @@ impl Runtime {
             cwd: spec.cwd.clone(),
             options: spec.options.clone(),
         };
-        self.register(0, None, "root".into(), cx.state.clone(), None);
+        self.register(
+            0,
+            None,
+            "root".into(),
+            cx.state.clone(),
+            cx.cancel.clone(),
+            None,
+        );
         self.emit(TraceEvent::SessionStart {
             session: self.0.config.session.clone(),
             cwd: spec.cwd.clone(),
@@ -351,6 +361,7 @@ impl Runtime {
                     origin_cell: None,
                     init: None,
                     max_turns: self.0.config.limits.max_turns,
+                    output: None,
                 },
                 None,
             )
@@ -484,6 +495,14 @@ impl Runtime {
         .unwrap_or_else(|_| {
             self.0.panicked.store(true, Ordering::SeqCst);
             Err(anyhow::anyhow!("toolset factory panicked"))
+        })
+        .and_then(|tools| match &settings.output {
+            // A child with an output contract finishes through submit_result.
+            Some(schema) => tools.with_own_validation(Arc::new(agent_tools::SubmitResult::new(
+                schema.clone(),
+                self.0.config.limits.message_chars,
+            ))),
+            None => Ok(tools),
         });
         let specs = tools
             .as_ref()
@@ -525,6 +544,8 @@ impl Runtime {
         let mut previous = None;
         let mut output_cap = self.0.config.limits.max_output_tokens;
         let mut invalid_retry = false;
+        let contract = settings.output.is_some();
+        let mut reminded = false;
         let status = loop {
             if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
                 break cx.cancel_status();
@@ -703,16 +724,47 @@ impl Runtime {
                 StopReason::EndTurn => {
                     answer = Answer::Text(assistant.text());
                     if turns >= settings.max_turns {
-                        break Status::Completed;
+                        // A contract child that runs out of turns has not delivered.
+                        break if contract {
+                            Status::MaxTurns
+                        } else {
+                            Status::Completed
+                        };
                     }
                     // With children still running or messages pending, wait for them
                     // instead of ending; the next turn starts with whatever arrived.
-                    match self.idle(cx).await {
+                    // A contract child keeps its mailbox open, since it may go on.
+                    match self.idle(cx, !contract).await {
                         Some(taken) => self.deliver(cx, &mut history, Vec::new(), taken).await?,
                         None if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline => {
                             break cx.cancel_status();
                         }
-                        None => break Status::Completed,
+                        None if !contract => break Status::Completed,
+                        None if !reminded => {
+                            reminded = true;
+                            self.user_turn(
+                                cx,
+                                &mut history,
+                                vec![ContentBlock::Text {
+                                    text: agent_tools::SUBMIT_REMINDER.into(),
+                                }],
+                                true,
+                            )
+                            .await?;
+                        }
+                        None => {
+                            let message = "ended without calling submit_result";
+                            self.emit(TraceEvent::Error {
+                                node: cx.id,
+                                message: message.into(),
+                            })
+                            .await?;
+                            answer = Answer::Text(match assistant.text() {
+                                text if text.is_empty() => format!("{message}."),
+                                text => format!("{message}. Last reply: {text}"),
+                            });
+                            break Status::Failed;
+                        }
                     }
                 }
                 StopReason::MaxTokens => {
@@ -787,11 +839,11 @@ impl Runtime {
         .await
     }
     /// Waits at the end of a turn until messages arrive or nothing more can arrive.
-    /// Returns None once the mailbox has closed or the node is cancelled.
-    async fn idle<'a>(&self, cx: &'a NodeCtx) -> Option<Taken<'a>> {
+    /// Returns None once nothing more can arrive or the node is cancelled.
+    async fn idle<'a>(&self, cx: &'a NodeCtx, close: bool) -> Option<Taken<'a>> {
         loop {
             let mut changed = cx.state.mailbox.subscribe();
-            match cx.state.mailbox.idle() {
+            match cx.state.mailbox.idle(close) {
                 Idle::Deliver(taken) => return Some(taken),
                 Idle::Done => return None,
                 Idle::Wait => {}
@@ -810,6 +862,7 @@ impl Runtime {
         parent: Option<NodeId>,
         name: String,
         state: Arc<NodeState>,
+        cancel: CancellationToken,
         outcome: Option<watch::Receiver<Option<AgentOutcome>>>,
     ) {
         self.agents().insert(
@@ -818,6 +871,7 @@ impl Runtime {
                 parent,
                 name,
                 state,
+                cancel,
                 outcome,
             },
         );
@@ -1187,6 +1241,14 @@ impl NodeCtx {
             .ok_or_else(|| RecursionError::InvalidRequest("toolset not frozen".into()))?;
         let selection = ToolSelection(Some(match spec.tools.0 {
             Some(requested) => {
+                if requested
+                    .iter()
+                    .any(|name| name == agent_tools::SUBMIT_RESULT)
+                {
+                    return Err(RecursionError::InvalidRequest(
+                        "submit_result comes with an output schema".into(),
+                    ));
+                }
                 if let Some(name) = requested.iter().find(|name| !names.contains(name)) {
                     return Err(RecursionError::InvalidRequest(format!(
                         "tool not held by parent: {name}"
@@ -1200,6 +1262,16 @@ impl NodeCtx {
                 .map(|name| (*name).into())
                 .collect(),
         }));
+        if let Some(output) = &spec.output {
+            if output["type"] != "object" {
+                return Err(RecursionError::InvalidRequest(
+                    "output must be a JSON schema of type object".into(),
+                ));
+            }
+            tool::check_schema(output).map_err(|error| {
+                RecursionError::InvalidRequest(format!("invalid output schema: {error}"))
+            })?;
+        }
         let owner_token = match owner {
             Owner::Node => None,
             Owner::Cell(token) => {
@@ -1249,6 +1321,7 @@ impl NodeCtx {
             max_turns: spec
                 .max_turns
                 .unwrap_or(self.runtime.0.config.limits.subagent_max_turns),
+            output: spec.output,
         };
         let (tx, outcome) = tokio::sync::watch::channel(None);
         let handle = AgentHandle {
@@ -1264,6 +1337,7 @@ impl NodeCtx {
             Some(self.id),
             settings.name.clone(),
             cx.state.clone(),
+            cx.cancel.clone(),
             Some(handle.outcome.clone()),
         );
         if notify {
@@ -1450,6 +1524,14 @@ impl NodeCtx {
         agents: Option<&[NodeId]>,
         timeout: Option<Duration>,
     ) -> std::result::Result<Waited, RecursionError> {
+        self.wait_via(agents, timeout, Delivery::Wait).await
+    }
+    async fn wait_via(
+        &self,
+        agents: Option<&[NodeId]>,
+        timeout: Option<Duration>,
+        via: Delivery,
+    ) -> std::result::Result<Waited, RecursionError> {
         let children = self
             .runtime
             .agents()
@@ -1511,7 +1593,7 @@ impl NodeCtx {
                 .emit(TraceEvent::MessageDelivered {
                     node: self.id,
                     messages: taken.ids(),
-                    via: Delivery::Wait,
+                    via,
                 })
                 .await;
         }
@@ -1528,6 +1610,65 @@ impl NodeCtx {
                 .collect(),
             running: targets.difference(&done).copied().collect(),
         })
+    }
+    /// Cancels a descendant of this agent together with its subtree, through the
+    /// ordered shutdown, and returns once it has stopped. For a direct child the
+    /// terminal notice is taken here, so the canceller gets no separate message;
+    /// a deeper descendant's notice still reaches its own parent. Cancelling an
+    /// agent that already finished only reports its outcome.
+    pub async fn cancel_agent(
+        &self,
+        agent: NodeId,
+    ) -> std::result::Result<CancelOutcome, RecursionError> {
+        self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
+        let (cancel, mut outcome, parent) = {
+            let agents = self.runtime.agents();
+            let target = agents
+                .get(&agent)
+                .ok_or_else(|| RecursionError::InvalidRequest(format!("unknown agent: {agent}")))?;
+            let mut ancestor = target.parent;
+            while ancestor.is_some_and(|id| id != self.id) {
+                ancestor = ancestor.and_then(|id| agents.get(&id)?.parent);
+            }
+            match (ancestor, &target.outcome) {
+                (Some(_), Some(outcome)) if agent != self.id => {
+                    (target.cancel.clone(), outcome.clone(), target.parent)
+                }
+                _ => {
+                    return Err(RecursionError::InvalidRequest(format!(
+                        "agent {agent} is not a descendant of this agent"
+                    )));
+                }
+            }
+        };
+        let already_finished = outcome.borrow().is_some();
+        cancel.cancel();
+        if parent == Some(self.id) {
+            let waited = self
+                .wait_via(Some(&[agent]), None, Delivery::Cancel)
+                .await?;
+            return match waited.finished.into_iter().next() {
+                Some(outcome) => Ok(CancelOutcome {
+                    outcome,
+                    already_finished,
+                }),
+                // Only the deadline ends an untimed wait early.
+                None => Err(RecursionError::Cancelled),
+            };
+        }
+        loop {
+            if let Some(outcome) = outcome.borrow_and_update().clone() {
+                return Ok(CancelOutcome {
+                    outcome,
+                    already_finished,
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(RecursionError::Cancelled),
+                _ = outcome.changed() => {}
+            }
+        }
     }
     /// Number of messages waiting in this agent's mailbox.
     pub fn pending_messages(&self) -> usize {

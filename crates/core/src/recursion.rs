@@ -39,6 +39,9 @@ pub struct ChildSpec {
     pub preamble: Option<String>,
     /// Originating cell, recorded in the trace.
     pub origin_cell: Option<u32>,
+    /// JSON schema (type object) for a structured result. The child gets a
+    /// `submit_result` tool with this input schema; a valid submission ends it.
+    pub output: Option<serde_json::Value>,
 }
 impl ChildSpec {
     /// Creates a task using inherited settings and the default child tool rule.
@@ -82,6 +85,15 @@ pub enum RecursionError {
         /// Recipient.
         agent: NodeId,
     },
+}
+/// How an agent stopped after `NodeCtx::cancel_agent`.
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    /// Final outcome. An agent that finished before the cancellation reached it
+    /// keeps its own status.
+    pub outcome: AgentOutcome,
+    /// The agent had already finished when it was cancelled.
+    pub already_finished: bool,
 }
 /// Live counters for a child; status is absent until shutdown completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]

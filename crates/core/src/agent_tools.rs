@@ -1,23 +1,37 @@
 //! Model-facing tools for sub-agents and messages within one agent tree.
 //!
-//! Thin adapters over `NodeCtx::spawn_agent`, `send`, `receive` and `wait`. They
-//! hold no state of their own, so one set can serve every node of a toolset factory.
-use crate::{ChildSpec, Effect, Owner, Tool, ToolCx, ToolOutput, ToolSelection};
+//! Thin adapters over `NodeCtx::spawn_agent`, `send`, `receive`, `wait` and
+//! `cancel_agent`. They hold no state of their own, so one set can serve every node
+//! of a toolset factory. The runtime adds `submit_result` itself to a child spawned
+//! with an output schema.
+use crate::{Answer, ChildSpec, Effect, Owner, Tool, ToolCx, ToolOutput, ToolSelection, tool};
 use async_trait::async_trait;
 use kyora_protocol::ToolSpec;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
 /// Names of the agent tools, in the order `tools` returns them.
-pub const NAMES: &[&str] = &["spawn_agent", "send_message", "receive", "wait"];
+pub const NAMES: &[&str] = &[
+    "spawn_agent",
+    "send_message",
+    "receive",
+    "wait",
+    "cancel_agent",
+];
+/// Name of the tool a child with an output schema finishes with.
+pub const SUBMIT_RESULT: &str = "submit_result";
+/// User text appended once when a child with an output schema ends its turn
+/// without submitting a result.
+pub const SUBMIT_REMINDER: &str = "You have not submitted a result. Call submit_result with a result that matches its input schema; ending your turn again without it fails the task.";
 
-/// Returns the four agent tools.
+/// Returns the five agent tools.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(SpawnAgent),
         Arc::new(SendMessage),
         Arc::new(Receive),
         Arc::new(Wait),
+        Arc::new(CancelAgent),
     ]
 }
 fn spec(name: &str, description: &str, properties: Value, required: Value) -> ToolSpec {
@@ -48,7 +62,7 @@ impl Tool for SpawnAgent {
         spec(
             "spawn_agent",
             "Start a sub-agent on a task and return its id at once. It runs in the background while you keep working; its result arrives later as a message at the start of one of your turns. If you end your turn while sub-agents are running, you wait for their results.",
-            json!({"task":{"type":"string","description":"Complete instructions. The sub-agent sees nothing else of your conversation."},"name":{"type":"string","description":"Short name to address it by."},"tools":{"type":"array","items":{"type":"string"},"description":"Tools to give it, a subset of yours. Omit for the default set."},"budget":{"type":"integer","description":"Token budget for it and its own sub-agents."},"timeout":{"type":"number","description":"Seconds before it is stopped."}}),
+            json!({"task":{"type":"string","description":"Complete instructions. The sub-agent sees nothing else of your conversation."},"name":{"type":"string","description":"Short name to address it by."},"tools":{"type":"array","items":{"type":"string"},"description":"Tools to give it, a subset of yours. Omit for the default set."},"budget":{"type":"integer","description":"Token budget for it and its own sub-agents."},"timeout":{"type":"number","description":"Seconds before it is stopped."},"output":{"type":"object","description":"JSON schema of type object for a structured result. The sub-agent must finish by submitting a matching object, which arrives as its result. Omit for an open-ended task."}}),
             json!(["task"]),
         )
     }
@@ -76,6 +90,7 @@ impl Tool for SpawnAgent {
             Ok(timeout) => child.timeout = timeout,
             Err(error) => return ToolOutput::error(error),
         }
+        child.output = input.get("output").cloned();
         let name = child.name.clone().unwrap_or_default();
         match cx.node.spawn_agent(child, Owner::Node) {
             Ok(handle) if name.is_empty() => {
@@ -206,5 +221,81 @@ impl Tool for Wait {
             return ToolOutput::text("no sub-agents to wait for");
         }
         ToolOutput::text(parts.join("\n\n"))
+    }
+}
+
+/// Cancels a descendant and its subtree, then reports how it ended.
+pub struct CancelAgent;
+#[async_trait]
+impl Tool for CancelAgent {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "cancel_agent",
+            "Cancel one of your sub-agents, or one of theirs, together with everything it started. Returns once it has stopped, with how it ended; you get no separate message about it. For an agent that already finished, this only reports its result.",
+            json!({"to":{"type":"string","description":"Id or name of the sub-agent."}}),
+            json!(["to"]),
+        )
+    }
+    fn effect(&self) -> Effect {
+        Effect::Mutating
+    }
+    async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
+        let cancelled = match cx.node.resolve(input["to"].as_str().unwrap_or_default()) {
+            Ok(agent) => cx.node.cancel_agent(agent).await,
+            Err(error) => Err(error),
+        };
+        match cancelled {
+            Ok(cancelled) if cancelled.already_finished => ToolOutput::text(format!(
+                "agent {} had already finished\n{}",
+                cancelled.outcome.node,
+                cx.node.render_outcome(&cancelled.outcome)
+            )),
+            Ok(cancelled) => ToolOutput::text(cx.node.render_outcome(&cancelled.outcome)),
+            Err(error) => ToolOutput::error(error.to_string()),
+        }
+    }
+}
+
+/// Commits a structured result that matches the child's output schema.
+pub(crate) struct SubmitResult {
+    schema: Value,
+    max_chars: usize,
+}
+impl SubmitResult {
+    pub(crate) fn new(schema: Value, max_chars: usize) -> Self {
+        Self { schema, max_chars }
+    }
+}
+#[async_trait]
+impl Tool for SubmitResult {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: SUBMIT_RESULT.into(),
+            description: "Submit your result. The input must match this schema. A valid submission ends your work at once and sends the result to your parent; an invalid one returns what to fix.".into(),
+            input_schema: self.schema.clone(),
+            large_input: false,
+        }
+    }
+    fn effect(&self) -> Effect {
+        Effect::Mutating
+    }
+    async fn call(&self, input: Value, _: ToolCx) -> ToolOutput {
+        if let Err(error) = tool::validate(&self.schema, &input) {
+            return ToolOutput::error(format!("result does not match the output schema: {error}"));
+        }
+        let raw = match serde_json::value::to_raw_value(&input) {
+            Ok(raw) => raw,
+            Err(error) => return ToolOutput::error(error.to_string()),
+        };
+        // The JSON reaches the parent whole, so it must fit one message body.
+        if raw.get().chars().count() > self.max_chars {
+            return ToolOutput::error(format!(
+                "result exceeds {} characters; submit a shorter one",
+                self.max_chars
+            ));
+        }
+        let mut output = ToolOutput::text("result submitted");
+        output.final_answer = Some(Answer::Value(raw));
+        output
     }
 }

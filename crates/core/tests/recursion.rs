@@ -1089,3 +1089,73 @@ async fn descendant_charges_close_only_the_bounded_subtree() {
     assert!(!runtime.ledger().snapshot(0).closed);
     assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
 }
+
+/// Scripted responses, recording the node id of every dispatched request.
+struct Counting {
+    scripted: ScriptedProvider,
+    dispatched: Mutex<Vec<String>>,
+}
+#[async_trait]
+impl ModelProvider for Counting {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        self.dispatched
+            .lock()
+            .unwrap()
+            .push(request.metadata.node_id.clone().unwrap_or_default());
+        self.scripted.stream(request, cancel).await
+    }
+}
+fn counting(rules: Vec<Rule>) -> Arc<Counting> {
+    Arc::new(Counting {
+        scripted: ScriptedProvider::new(rules),
+        dispatched: Mutex::new(vec![]),
+    })
+}
+
+#[tokio::test]
+async fn independent_cell_child_dispatches_nothing_after_its_parent_ends() {
+    // The parent ends without yielding, so the child's task has not started and
+    // nothing has propagated the parent's cancellation to its independent token.
+    let spawn = tool(|_, cx| async move {
+        cx.node
+            .spawn_agent(
+                ChildSpec::new("cell child"),
+                Owner::Cell(CancellationToken::new()),
+            )
+            .unwrap();
+        finish()
+    });
+    let provider = counting(vec![
+        root_rule(json!({})),
+        rule("cell child", 1, vec![response(None)]),
+    ]);
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(
+        provider.clone(),
+        Arc::new(Toolset::new(vec![spawn]).unwrap()),
+        Limits::default(),
+        trace,
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(*provider.dispatched.lock().unwrap(), vec!["0"]);
+    let live = records(rx);
+    assert!(
+        !live
+            .iter()
+            .any(|record| matches!(record.event, TraceEvent::AttemptStart { node: 1, .. }))
+    );
+    assert_eq!(
+        reconstruct_tree(&live).unwrap()[0].children[0].status,
+        Some(Status::Cancelled)
+    );
+    assert_order(&live);
+    assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
+}

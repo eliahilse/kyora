@@ -568,7 +568,9 @@ async fn list(
             Err(Stopped::Cancelled) => bail!("tools/list cancelled"),
             Err(Stopped::TimedOut) => bail!("tools/list timed out"),
         };
-        // Each page is bounded by the message limit; the listing as a whole by these.
+        // Each page is bounded by the message limit. The totals are checked after every
+        // page and before the next is requested, so a listing holds at most these
+        // limits plus one page.
         bytes += page
             .tools
             .iter()

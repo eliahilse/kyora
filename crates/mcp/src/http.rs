@@ -153,30 +153,15 @@ impl HttpClient {
     /// grows past `limit` bytes.
     fn events(&self, response: Response, limit: usize) -> Events {
         let oversized = self.shared.oversized.clone();
-        let mut size = 0usize;
-        let mut line_start = true;
+        let mut size = EventSize::new(limit);
         let bytes = response
             .bytes_stream()
             .take_until(self.shared.cancel.clone().cancelled_owned())
             .map(move |chunk| {
                 let chunk = chunk.map_err(|error| std::io::Error::other(error.without_url()))?;
-                for &byte in chunk.iter() {
-                    match byte {
-                        // A blank line ends the event.
-                        b'\n' if line_start => size = 0,
-                        b'\n' => line_start = true,
-                        b'\r' => {}
-                        _ => {
-                            line_start = false;
-                            size += 1;
-                            if size > limit {
-                                oversized.store(true, Ordering::SeqCst);
-                                return Err(std::io::Error::other(
-                                    "SSE event exceeds the size limit",
-                                ));
-                            }
-                        }
-                    }
+                if !size.feed(&chunk) {
+                    oversized.store(true, Ordering::SeqCst);
+                    return Err(std::io::Error::other("SSE event exceeds the size limit"));
                 }
                 Ok(chunk)
             });
@@ -365,6 +350,52 @@ impl StreamableHttpClient for HttpClient {
     }
 }
 
+/// The size of the SSE event being received. As in the SSE parser, a line ends at CR,
+/// LF or CRLF, and a blank line ends the event.
+struct EventSize {
+    limit: usize,
+    size: usize,
+    line: usize,
+    after_cr: bool,
+}
+
+impl EventSize {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            size: 0,
+            line: 0,
+            after_cr: false,
+        }
+    }
+
+    /// False once the current event exceeds the limit.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &byte in bytes {
+            match byte {
+                // The LF of a CRLF, possibly split across chunks.
+                b'\n' if self.after_cr => self.after_cr = false,
+                b'\r' | b'\n' => {
+                    self.after_cr = byte == b'\r';
+                    if self.line == 0 {
+                        self.size = 0;
+                    }
+                    self.line = 0;
+                }
+                _ => {
+                    self.after_cr = false;
+                    self.line += 1;
+                    self.size += 1;
+                    if self.size > self.limit {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 /// reqwest errors name the request URL; keep what happened without it.
 fn client_error(error: reqwest::Error) -> Error {
     StreamableHttpError::Client(error.without_url())
@@ -411,4 +442,40 @@ fn content_type(response: &Response) -> String {
         .get(CONTENT_TYPE)
         .map(|value| String::from_utf8_lossy(value.as_bytes()).to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventSize;
+
+    #[test]
+    fn every_line_ending_separates_events() {
+        for ending in ["\n", "\r", "\r\n"] {
+            let event = format!("event: message{ending}data: 0123456789{ending}{ending}");
+            let mut size = EventSize::new(32);
+            for _ in 0..100 {
+                assert!(size.feed(event.as_bytes()), "{ending:?}");
+            }
+            let long = format!("data: 0123456789{ending}").repeat(3);
+            assert!(!EventSize::new(32).feed(long.as_bytes()), "{ending:?}");
+        }
+    }
+
+    #[test]
+    fn a_crlf_split_across_chunks_is_one_line_ending() {
+        let mut size = EventSize::new(20);
+        for chunk in [
+            "data: 0123456789\r",
+            "\n",
+            "\r",
+            "\n",
+            "data: 0123456789\r\n\r\n",
+        ] {
+            assert!(size.feed(chunk.as_bytes()));
+        }
+        // A lone CR then LF is still one line end, so this is one 22 byte event.
+        let mut size = EventSize::new(20);
+        assert!(size.feed(b"data: 0123456789\r"));
+        assert!(!size.feed(b"\ndata: 0"));
+    }
 }

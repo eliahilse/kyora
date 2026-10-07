@@ -147,9 +147,9 @@ pub(crate) enum Refusal {
     Closed,
 }
 /// What an agent with nothing left to do at the end of a turn does next.
-pub(crate) enum Idle<'a> {
-    /// Messages arrived; continue with them.
-    Deliver(Taken<'a>),
+pub(crate) enum Idle {
+    /// Messages arrived and were taken; continue with them.
+    Deliver(Vec<Envelope>),
     /// Children are still running or a send is in flight.
     Wait,
     /// Nothing can arrive any more. The mailbox is now closed if closing was asked.
@@ -218,65 +218,38 @@ impl Mailbox {
     pub(crate) fn touch(&self) {
         self.wake();
     }
-    /// Takes every queued envelope in arrival order.
-    pub(crate) fn take_all(&self) -> Taken<'_> {
-        let envelopes = {
-            let mut state = self.lock();
-            state.plain = 0;
-            state.queue.drain(..).collect()
-        };
-        Taken {
-            mailbox: self,
-            envelopes,
-        }
+    /// Takes every queued envelope in arrival order. Taking is final: the caller
+    /// hands them over without an await in between, so nothing taken returns to
+    /// the queue and the capacity bound holds.
+    pub(crate) fn take_all(&self) -> Vec<Envelope> {
+        let mut state = self.lock();
+        state.plain = 0;
+        state.queue.drain(..).collect()
     }
     /// Takes everything queued from the given children, in arrival order. For a
     /// finished child that is its unread messages followed by its terminal notice,
     /// so the sender's order is kept.
-    pub(crate) fn take_from(&self, children: &BTreeSet<NodeId>) -> Taken<'_> {
-        let envelopes = {
-            let mut state = self.lock();
-            let (taken, rest): (VecDeque<_>, VecDeque<_>) = state
-                .queue
-                .drain(..)
-                .partition(|envelope| children.contains(&envelope.from));
-            state.queue = rest;
-            state.plain -= taken
-                .iter()
-                .filter(|envelope| envelope.kind == MessageKind::Message)
-                .count();
-            taken.into()
-        };
-        Taken {
-            mailbox: self,
-            envelopes,
-        }
-    }
-    fn requeue(&self, envelopes: Vec<Envelope>) {
-        {
-            let mut state = self.lock();
-            if state.closed {
-                return;
-            }
-            for envelope in envelopes.into_iter().rev() {
-                state.plain += usize::from(envelope.kind == MessageKind::Message);
-                state.queue.push_front(envelope);
-            }
-        }
-        self.wake();
+    pub(crate) fn take_from(&self, children: &BTreeSet<NodeId>) -> Vec<Envelope> {
+        let mut state = self.lock();
+        let (taken, rest): (VecDeque<_>, VecDeque<_>) = state
+            .queue
+            .drain(..)
+            .partition(|envelope| children.contains(&envelope.from));
+        state.queue = rest;
+        state.plain -= taken
+            .iter()
+            .filter(|envelope| envelope.kind == MessageKind::Message)
+            .count();
+        taken.into()
     }
     /// Decides atomically between delivering, waiting and closing, so a message
     /// is either delivered or refused to its sender, never accepted and dropped.
     /// Without `close`, `Done` leaves the mailbox open for an agent that goes on.
-    pub(crate) fn idle(&self, close: bool) -> Idle<'_> {
+    pub(crate) fn idle(&self, close: bool) -> Idle {
         let mut state = self.lock();
         if !state.queue.is_empty() {
             state.plain = 0;
-            let envelopes = state.queue.drain(..).collect();
-            return Idle::Deliver(Taken {
-                mailbox: self,
-                envelopes,
-            });
+            return Idle::Deliver(state.queue.drain(..).collect());
         }
         if state.awaiting.is_empty() && state.reserved == 0 {
             state.closed |= close;
@@ -314,29 +287,5 @@ impl Mailbox {
             .map(|envelope| envelope.from)
             .chain(state.awaiting.iter().copied())
             .collect()
-    }
-}
-/// Envelopes taken from a mailbox. Dropped before `finish`, they return to the
-/// front of the queue, so a cancelled delivery loses nothing.
-pub(crate) struct Taken<'a> {
-    mailbox: &'a Mailbox,
-    envelopes: Vec<Envelope>,
-}
-impl Taken<'_> {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.envelopes.is_empty()
-    }
-    pub(crate) fn ids(&self) -> Vec<MessageId> {
-        self.envelopes.iter().map(|envelope| envelope.id).collect()
-    }
-    pub(crate) fn finish(mut self) -> Vec<Envelope> {
-        std::mem::take(&mut self.envelopes)
-    }
-}
-impl Drop for Taken<'_> {
-    fn drop(&mut self) {
-        if !self.envelopes.is_empty() {
-            self.mailbox.requeue(std::mem::take(&mut self.envelopes));
-        }
     }
 }

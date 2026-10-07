@@ -41,7 +41,7 @@ A send returns a message id once the message is queued in the recipient's mailbo
 - delivered: appended to the recipient's conversation at a turn boundary, returned by `receive`, or taken by `wait` or `cancel_agent`, which return a finished child's unread messages together with its notice, so the child's order is kept;
 - undelivered: still queued when the recipient ended, and recorded in the trace.
 
-Nothing is duplicated and nothing disappears silently. Delivery into a conversation is at most once. The mailbox is a single FIFO queue, so messages from one sender arrive in send order, and a child's progress messages always arrive before its own result.
+Nothing is duplicated and nothing disappears silently. Taking messages from the mailbox and handing them over (into the conversation, or as the result of `receive`, `wait` or `cancel_agent`) is one step without a pause, so a caller that stops waiting cannot lose what was taken, and the mailbox never holds more than its capacity. The `message_delivered` record is then written by owned work that the recipient's shutdown joins, in the recipient's delivery order; at a turn boundary it is written before the conversation record that carries the text. Delivery into a conversation is at most once. The mailbox is a single FIFO queue, so messages from one sender arrive in send order, and a child's progress messages always arrive before its own result.
 
 ### Turn boundaries
 

@@ -4,9 +4,7 @@ use crate::{
     RecursionError, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink,
     agent_tools, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
-    messages::{
-        self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Refusal, Taken, Waited,
-    },
+    messages::{self, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Refusal, Waited},
     prompts,
     tool::{self, truncate},
 };
@@ -183,6 +181,8 @@ pub struct Runtime(Arc<RuntimeInner>);
 struct Work {
     closed: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Turns true once this node's latest delivery record is written.
+    recorded: Option<watch::Receiver<bool>>,
 }
 #[derive(Default)]
 struct NodeState {
@@ -862,15 +862,19 @@ impl Runtime {
         cx: &NodeCtx,
         history: &mut Vec<Message>,
         mut content: Vec<ContentBlock>,
-        taken: Taken<'_>,
+        taken: Vec<Envelope>,
     ) -> Result<()> {
-        self.emit(TraceEvent::MessageDelivered {
-            node: cx.id,
-            messages: taken.ids(),
-            via: Delivery::Turn,
-        })
-        .await?;
-        content.extend(taken.finish().iter().map(|message| ContentBlock::Text {
+        let mut written = {
+            let mut work = cx.state.work.lock().expect("node work mutex poisoned");
+            cx.record_delivery(&mut work, &taken, Delivery::Turn)
+        };
+        // The delivery record precedes the conversation record that carries the text.
+        while !*written.borrow_and_update() {
+            if written.changed().await.is_err() {
+                break;
+            }
+        }
+        content.extend(taken.iter().map(|message| ContentBlock::Text {
             text: self.render(message),
         }));
         self.message(
@@ -885,7 +889,7 @@ impl Runtime {
     }
     /// Waits at the end of a turn until messages arrive or nothing more can arrive.
     /// Returns None once nothing more can arrive or the node is cancelled.
-    async fn idle<'a>(&self, cx: &'a NodeCtx, close: bool) -> Option<Taken<'a>> {
+    async fn idle(&self, cx: &NodeCtx, close: bool) -> Option<Vec<Envelope>> {
         loop {
             let mut changed = cx.state.mailbox.subscribe();
             match cx.state.mailbox.idle(close) {
@@ -1567,21 +1571,19 @@ impl NodeCtx {
             .map_or(self.deadline, |until| until.min(self.deadline));
         loop {
             let mut changed = self.state.mailbox.subscribe();
-            self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
-            let taken = self.state.mailbox.take_all();
-            if !taken.is_empty() {
-                let _ = self
-                    .runtime
-                    .emit(TraceEvent::MessageDelivered {
-                        node: self.id,
-                        messages: taken.ids(),
-                        via: Delivery::Receive,
-                    })
-                    .await;
-                return Ok(taken.finish());
-            }
-            if self.state.mailbox.is_closed() {
-                return Err(RecursionError::Cancelled);
+            {
+                let mut work = self.state.work.lock().expect("node work mutex poisoned");
+                self.check_open(&work)?;
+                // Taking and handing over are one step without an await, so a caller
+                // that stops waiting cannot lose messages; owned work records them.
+                let taken = self.state.mailbox.take_all();
+                if !taken.is_empty() {
+                    self.record_delivery(&mut work, &taken, Delivery::Receive);
+                    return Ok(taken);
+                }
+                if self.state.mailbox.is_closed() {
+                    return Err(RecursionError::Cancelled);
+                }
             }
             tokio::select! {
                 biased;
@@ -1663,19 +1665,17 @@ impl NodeCtx {
             .copied()
             .filter(finished)
             .collect::<BTreeSet<_>>();
-        let taken = self.state.mailbox.take_from(&done);
-        if !taken.is_empty() {
-            let _ = self
-                .runtime
-                .emit(TraceEvent::MessageDelivered {
-                    node: self.id,
-                    messages: taken.ids(),
-                    via,
-                })
-                .await;
-        }
+        let taken = {
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            self.check_open(&work)?;
+            let taken = self.state.mailbox.take_from(&done);
+            if !taken.is_empty() {
+                self.record_delivery(&mut work, &taken, via);
+            }
+            taken
+        };
         Ok(Waited {
-            messages: taken.finish(),
+            messages: taken,
             finished: done
                 .iter()
                 .map(|id| {
@@ -1748,6 +1748,40 @@ impl NodeCtx {
                 _ = outcome.changed() => {}
             }
         }
+    }
+    /// Records the delivery of `messages` as owned work that this node's shutdown
+    /// joins, after the node's earlier delivery records. The receiver turns true once
+    /// the record is written.
+    fn record_delivery(
+        &self,
+        work: &mut Work,
+        messages: &[Envelope],
+        via: Delivery,
+    ) -> watch::Receiver<bool> {
+        let (done, written) = watch::channel(false);
+        let mut previous = work.recorded.replace(written.clone());
+        let runtime = self.runtime.clone();
+        let node = self.id;
+        let messages = messages.iter().map(|message| message.id).collect();
+        work.tasks.push(tokio::spawn(async move {
+            if let Some(previous) = &mut previous {
+                while !*previous.borrow_and_update() {
+                    if previous.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // A failed trace write also fails node_end and so surfaces there.
+            let _ = runtime
+                .emit(TraceEvent::MessageDelivered {
+                    node,
+                    messages,
+                    via,
+                })
+                .await;
+            done.send_replace(true);
+        }));
+        written
     }
     /// Number of messages waiting in this agent's mailbox.
     pub fn pending_messages(&self) -> usize {

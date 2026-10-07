@@ -20,6 +20,7 @@ use std::{
     collections::BTreeMap,
     pin::pin,
     sync::{Arc, Mutex},
+    task::Poll,
     time::Duration,
 };
 use tokio::sync::watch;
@@ -1922,6 +1923,149 @@ async fn dropped_send_is_still_recorded_when_its_recipient_ends() {
             .any(|message| message.body == "late")
     );
     assert_settled(&live);
+}
+
+#[tokio::test]
+async fn receive_hands_over_messages_without_waiting_for_their_record() {
+    let (trace, acks) = Acks::new(|event| {
+        matches!(
+            event,
+            TraceEvent::MessageDelivered {
+                via: Delivery::Receive,
+                ..
+            }
+        )
+    });
+    let rx = trace.subscribe();
+    let returned = Arc::new(Mutex::new(None));
+    let (seen, gate) = (returned.clone(), acks.clone());
+    let python = tool(move |_, cx| {
+        let (seen, acks) = (seen.clone(), gate.clone());
+        async move {
+            if cx.node.depth == 1 {
+                let parent = cx.node.resolve("parent").unwrap();
+                cx.node.send(parent, "first").await.unwrap();
+                return ToolOutput::text("sent");
+            }
+            cx.node
+                .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                .unwrap();
+            eventually(&cx, "the message", || cx.node.pending_messages() == 1).await;
+            // A caller that gives up on a receive must not lose what it took.
+            let got = {
+                let mut receive = pin!(cx.node.receive(Duration::ZERO));
+                match futures::poll!(receive.as_mut()) {
+                    Poll::Ready(result) => result.unwrap().len(),
+                    Poll::Pending => 0,
+                }
+            };
+            *seen.lock().unwrap() = Some(got);
+            acks.release();
+            let mut result = ToolOutput::text("ok");
+            result.final_answer = Some(Answer::Text("final".into()));
+            result
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule("root task", 0, vec![call("python", json!({}))]),
+            rule("child task", 1, vec![call("python", json!({}))]),
+        ],
+        vec![(at("child task", 1), never())],
+    );
+    let runtime = setup(provider, python, Limits::default(), trace.clone());
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    trace.finish().await.unwrap();
+    assert_eq!(*returned.lock().unwrap(), Some(1));
+    assert_settled(&records(rx));
+}
+
+#[tokio::test]
+async fn a_held_receive_cannot_overfill_the_mailbox() {
+    let (trace, acks) = Acks::new(|event| {
+        matches!(
+            event,
+            TraceEvent::MessageDelivered {
+                via: Delivery::Receive,
+                ..
+            }
+        )
+    });
+    let (to_child, to_root) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let observed = Arc::new(Mutex::new(None));
+    let (child_bell, root_bell, seen, gate) = (
+        to_child.clone(),
+        to_root.clone(),
+        observed.clone(),
+        acks.clone(),
+    );
+    let python = tool(move |_, cx| {
+        let (to_child, to_root, seen, acks) = (
+            child_bell.clone(),
+            root_bell.clone(),
+            seen.clone(),
+            gate.clone(),
+        );
+        async move {
+            if cx.node.depth == 1 {
+                let parent = cx.node.resolve("parent").unwrap();
+                cx.node.send(parent, "A").await.unwrap();
+                tokio::time::timeout(LIMIT, to_child.notified())
+                    .await
+                    .unwrap();
+                cx.node.send(parent, "B").await.unwrap();
+                assert!(matches!(
+                    cx.node.send(parent, "C").await,
+                    Err(RecursionError::MailboxFull { agent: 0 })
+                ));
+                to_root.notify_one();
+                return ToolOutput::text("sent");
+            }
+            cx.node
+                .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                .unwrap();
+            eventually(&cx, "A", || cx.node.pending_messages() == 1).await;
+            let got = {
+                let mut receive = pin!(cx.node.receive(Duration::ZERO));
+                let got = match futures::poll!(receive.as_mut()) {
+                    Poll::Ready(result) => result.unwrap().len(),
+                    Poll::Pending => 0,
+                };
+                to_child.notify_one();
+                tokio::time::timeout(LIMIT, to_root.notified())
+                    .await
+                    .unwrap();
+                got
+            };
+            *seen.lock().unwrap() = Some((got, cx.node.pending_messages()));
+            acks.release();
+            let mut result = ToolOutput::text("ok");
+            result.final_answer = Some(Answer::Text("final".into()));
+            result
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule("root task", 0, vec![call("python", json!({}))]),
+            rule("child task", 1, vec![call("python", json!({}))]),
+        ],
+        vec![(at("child task", 1), never())],
+    );
+    let runtime = setup(
+        provider,
+        python,
+        Limits {
+            mailbox_capacity: 1,
+            ..Limits::default()
+        },
+        trace,
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    // A was handed over, B took its place, and the mailbox never held two.
+    assert_eq!(*observed.lock().unwrap(), Some((1, 1)));
 }
 
 #[tokio::test]

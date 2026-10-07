@@ -163,10 +163,7 @@ pub struct Runtime(Arc<RuntimeInner>);
 #[derive(Default)]
 struct Work {
     closed: bool,
-    /// Owned child and leaf tasks with their cancellation tokens. A cell-owned
-    /// child's token need not descend from the node token, so shutdown cancels
-    /// each one directly.
-    tasks: Vec<(tokio::task::JoinHandle<()>, CancellationToken)>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 #[derive(Default)]
 struct NodeState {
@@ -199,6 +196,10 @@ pub struct NodeCtx {
     state: Arc<NodeState>,
     cwd: PathBuf,
     options: RequestOptions,
+    /// External owners on the path from the root: cell tokens of cell-owned agents
+    /// and the caller token of a leaf. The node token always descends from the
+    /// parent's, so node cancellation reaches the whole subtree synchronously.
+    owners: Arc<Vec<CancellationToken>>,
 }
 /// One leaf completion without tools.
 #[derive(Debug, Clone)]
@@ -315,6 +316,7 @@ impl Runtime {
             state: Arc::new(NodeState::default()),
             cwd: spec.cwd.clone(),
             options: spec.options.clone(),
+            owners: Arc::new(Vec::new()),
         };
         self.emit(TraceEvent::SessionStart {
             session: self.0.config.session.clone(),
@@ -398,15 +400,12 @@ impl Runtime {
             let mut work = cx.state.work.lock().expect("node work mutex poisoned");
             work.closed = true;
             self.0.ledger.close_admission(cx.id);
+            // Every child and leaf token descends from the node token, so this stops
+            // the whole subtree at once, including tasks that have not started yet.
             cx.cancel.cancel();
-            // Cancel synchronously, so a task that has not started yet begins cancelled
-            // instead of dispatching work before a bridge or watcher runs.
-            for (_, cancel) in &work.tasks {
-                cancel.cancel();
-            }
             std::mem::take(&mut work.tasks)
         };
-        for (task, _) in tasks {
+        for task in tasks {
             if task.await.is_err() {
                 self.0.panicked.store(true, Ordering::SeqCst);
             }
@@ -501,7 +500,7 @@ impl Runtime {
         let mut output_cap = self.0.config.limits.max_output_tokens;
         let mut invalid_retry = false;
         let status = loop {
-            if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+            if cx.stopped() || Instant::now() >= cx.deadline {
                 break cx.cancel_status();
             }
             if turns >= settings.max_turns {
@@ -603,7 +602,7 @@ impl Runtime {
                     ))
                 } else if final_answer.is_some() {
                     ToolOutput::error("skipped: final answer already committed")
-                } else if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                } else if cx.stopped() || Instant::now() >= cx.deadline {
                     ToolOutput::error("cancelled")
                 } else if let Err(error) = tools.validate(name, input) {
                     ToolOutput::error(error.to_string())
@@ -664,7 +663,7 @@ impl Runtime {
                 )
                 .await?;
             }
-            if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+            if cx.stopped() || Instant::now() >= cx.deadline {
                 break cx.cancel_status();
             }
             if let Some(value) = final_answer {
@@ -731,7 +730,7 @@ impl Runtime {
                 _ = tokio::time::sleep_until(cx.deadline) => return Err(ProviderError::Cancelled.into()),
                 permit = self.0.slots.acquire() => permit.map_err(|e| anyhow::anyhow!(e))?,
             };
-            if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+            if cx.stopped() || Instant::now() >= cx.deadline {
                 return Err(ProviderError::Cancelled.into());
             }
             let reservation = self
@@ -759,7 +758,7 @@ impl Runtime {
             let start = Instant::now();
             let mut partial = false;
             let dispatched = AssertUnwindSafe(async {
-                if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                if cx.stopped() || Instant::now() >= cx.deadline {
                     Err(ProviderError::NotSent("cancelled before dispatch".into()))
                 } else {
                     reservation.dispatched = true;
@@ -788,13 +787,13 @@ impl Runtime {
                             attempt_cancel.cancel();
                             let result = tokio::time::timeout(defaults::PROVIDER_CANCEL_GRACE, &mut future)
                                 .await
-                                .unwrap_or(Err(if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                                .unwrap_or(Err(if cx.stopped() || Instant::now() >= cx.deadline {
                                     ProviderError::Cancelled
                                 } else {
                                     ProviderError::IdleTimeout
                                 }));
                             if matches!(result, Err(ProviderError::Cancelled))
-                                && !cx.cancel.is_cancelled() && Instant::now() < cx.deadline
+                                && !cx.stopped() && Instant::now() < cx.deadline
                             {
                                 Err(ProviderError::IdleTimeout)
                             } else {
@@ -839,7 +838,7 @@ impl Runtime {
             match result {
                 Ok(response) => return Ok(response),
                 Err(error) => {
-                    if cx.cancel.is_cancelled() || Instant::now() >= cx.deadline {
+                    if cx.stopped() || Instant::now() >= cx.deadline {
                         return Err(ProviderError::Cancelled.into());
                     }
                     failures += 1;
@@ -944,8 +943,17 @@ impl Runtime {
     }
 }
 impl NodeCtx {
+    /// Whether this node must stop. External owners are checked directly, because
+    /// the watchers that forward their cancellation to the node token may not have
+    /// run yet; a cancelled owner cancels the node token here.
+    fn stopped(&self) -> bool {
+        if !self.cancel.is_cancelled() && self.owners.iter().any(CancellationToken::is_cancelled) {
+            self.cancel.cancel();
+        }
+        self.cancel.is_cancelled()
+    }
     fn check_open(&self, work: &Work) -> std::result::Result<(), RecursionError> {
-        if work.closed || self.cancel.is_cancelled() || Instant::now() >= self.deadline {
+        if work.closed || self.stopped() || Instant::now() >= self.deadline {
             return Err(RecursionError::Cancelled);
         }
         Ok(())
@@ -1026,7 +1034,11 @@ impl NodeCtx {
                 Some(token)
             }
         };
-        let cancel = owner_token.as_ref().unwrap_or(&self.cancel).child_token();
+        // The child token descends from this node's token even when a cell owns the
+        // child; the cell token is an additional owner, checked directly.
+        let cancel = self.cancel.child_token();
+        let mut owners = self.owners.to_vec();
+        owners.extend(owner_token.clone());
         let id = self.runtime.0.ledger.admit(self.id, true, spec.budget)?;
         let cx = NodeCtx {
             id,
@@ -1039,6 +1051,7 @@ impl NodeCtx {
             state: Arc::new(NodeState::default()),
             cwd: self.cwd.clone(),
             options: self.options.clone(),
+            owners: Arc::new(owners),
         };
         let task = match spec.preamble {
             Some(preamble) => format!("{}\n\n{preamble}", spec.task),
@@ -1074,20 +1087,11 @@ impl NodeCtx {
             outcome,
         };
         let runtime = self.runtime.clone();
-        let parent_cancel = self.cancel.clone();
-        let child_token = cx.cancel.clone();
-        let task = tokio::spawn(async move {
-            // Cell tokens may be supplied by external adapters; also enforce parent cancellation.
-            let child_cancel = cx.cancel.clone();
-            let bridge = tokio::spawn(async move {
-                tokio::select! { _ = parent_cancel.cancelled() => child_cancel.cancel(), _ = child_cancel.cancelled() => {} }
-            });
+        work.tasks.push(tokio::spawn(async move {
             let state = cx.state.clone();
             let result = runtime
                 .run_node(cx, agent_spec, settings, owner_token)
                 .await;
-            bridge.abort();
-            let _ = bridge.await;
             let result = result.unwrap_or_else(|_| {
                 runtime.outcome(
                     id,
@@ -1097,8 +1101,7 @@ impl NodeCtx {
                 )
             });
             tx.send_replace(Some(result));
-        });
-        work.tasks.push((task, child_token));
+        }));
         Ok(handle)
     }
     fn cancel_status(&self) -> Status {
@@ -1151,14 +1154,13 @@ impl NodeCtx {
                 state: Arc::new(NodeState::default()),
                 cwd: self.cwd.clone(),
                 options: call.options.clone(),
+                owners: self.owners.clone(),
             };
-            let leaf_token = cx.cancel.clone();
             // Own the task independently of the waiting future so settlement always completes.
-            let task = tokio::spawn(async move {
+            work.tasks.push(tokio::spawn(async move {
                 let result = cx.llm_owned(call, owner).await;
                 let _ = tx.send(result);
-            });
-            work.tasks.push((task, leaf_token));
+            }));
         }
         rx.await
             .map_err(|e| RecursionError::ModelError(e.to_string()))?

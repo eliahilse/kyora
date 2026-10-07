@@ -1203,3 +1203,62 @@ async fn leaf_owner_cancelled_before_its_task_starts_dispatches_nothing() {
     assert_eq!(outcome.usage_subtree.total(), outcome.usage_self.total());
     assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
 }
+
+#[tokio::test]
+async fn ancestor_shutdown_stops_a_queued_cell_owned_grandchild() {
+    // The child queues a grandchild with an independent cell token while it is
+    // inside a started mutating tool. The parent is woken first, finishes and
+    // cancels the child; the grandchild's task only starts afterwards.
+    let woken = Arc::new(tokio::sync::Notify::new());
+    let wake = woken.clone();
+    let spawn = tool(move |_, cx| {
+        let woken = wake.clone();
+        async move {
+            if cx.node.depth == 0 {
+                cx.node
+                    .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                    .unwrap();
+                woken.notified().await;
+                return finish();
+            }
+            woken.notify_one();
+            cx.node
+                .spawn_agent(
+                    ChildSpec::new("grandchild"),
+                    Owner::Cell(CancellationToken::new()),
+                )
+                .unwrap();
+            cx.cancel.cancelled().await;
+            ToolOutput::text("cancelled")
+        }
+    });
+    let provider = counting(vec![
+        root_rule(json!({})),
+        rule("child task", 1, vec![response(Some(json!({})))]),
+        rule("grandchild", 2, vec![response(None)]),
+    ]);
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(
+        provider.clone(),
+        Arc::new(Toolset::new(vec![spawn]).unwrap()),
+        Limits::default(),
+        trace,
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(*provider.dispatched.lock().unwrap(), vec!["0", "1"]);
+    let live = records(rx);
+    assert!(
+        !live
+            .iter()
+            .any(|record| matches!(record.event, TraceEvent::AttemptStart { node: 2, .. }))
+    );
+    let tree = reconstruct_tree(&live).unwrap();
+    assert_eq!(tree[0].children[0].status, Some(Status::Cancelled));
+    assert_eq!(
+        tree[0].children[0].children[0].status,
+        Some(Status::Cancelled)
+    );
+    assert_order(&live);
+    assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
+}

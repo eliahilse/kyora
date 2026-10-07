@@ -1,5 +1,8 @@
 //! Atomic admission and accounting for the node scope tree.
-use crate::defaults::{Limits, MIN_OUTPUT_TOKENS};
+use crate::{
+    RecursionError,
+    defaults::{Limits, MIN_OUTPUT_TOKENS},
+};
 use anyhow::{Result, bail};
 use kyora_protocol::{ModelRequest, Usage};
 use kyora_providers::AttemptCharge;
@@ -36,6 +39,7 @@ struct Scope {
     depth: u32,
     agent: bool,
     alive: bool,
+    admission_closed: bool,
     budget: BudgetSnapshot,
     usage: Usage,
     own: Usage,
@@ -87,6 +91,7 @@ impl Ledger {
             depth: 0,
             agent: true,
             alive: true,
+            admission_closed: false,
             budget: BudgetSnapshot {
                 limit: limits.budget_tokens,
                 ..BudgetSnapshot::default()
@@ -107,42 +112,57 @@ impl Ledger {
         })
     }
     /// Atomically admits a child. Leaf LLM nodes do not consume agent depth or slots.
-    pub fn admit(&self, parent: NodeId, agent: bool, limit: Option<u64>) -> Result<NodeId> {
+    pub fn admit(
+        &self,
+        parent: NodeId,
+        agent: bool,
+        limit: Option<u64>,
+    ) -> std::result::Result<NodeId, RecursionError> {
         let mut s = self.state.lock().expect("ledger mutex poisoned");
         let p = s
             .scopes
             .get(parent as usize)
-            .ok_or_else(|| anyhow::anyhow!("unknown parent"))?;
-        if !p.alive {
-            bail!("parent is shut down");
+            .ok_or_else(|| RecursionError::InvalidRequest("unknown parent".into()))?;
+        if !p.alive || p.admission_closed {
+            return Err(RecursionError::Cancelled);
         }
         let depth = p.depth + u32::from(agent);
-        if agent
-            && (depth > self.limits.max_depth
-                || s.total >= self.limits.max_agents_total
-                || s.live >= self.limits.max_agents_live)
-        {
-            bail!("agent admission limit exceeded");
-        }
-        if !agent && s.llm >= self.limits.max_llm_calls {
-            bail!("llm call limit exceeded");
+        for (exceeded, limit) in [
+            (agent && depth > self.limits.max_depth, "depth"),
+            (
+                agent && s.live >= self.limits.max_agents_live,
+                "agents_live",
+            ),
+            (
+                agent && s.total >= self.limits.max_agents_total,
+                "agents_total",
+            ),
+            (!agent && s.llm >= self.limits.max_llm_calls, "llm_calls"),
+        ] {
+            if exceeded {
+                return Err(RecursionError::LimitExceeded { limit });
+            }
         }
         if limit == Some(0) {
-            bail!("budget must be positive");
+            return Err(RecursionError::InvalidRequest(
+                "budget must be positive".into(),
+            ));
         }
         let path = path(&s, parent);
         if path.iter().any(|id| s.scopes[*id].budget.remaining() == 0) {
-            bail!("budget exhausted");
+            return Err(RecursionError::BudgetExceeded);
         }
         let budget = limit
             .unwrap_or(self.limits.budget_tokens)
             .min(p.budget.limit);
-        let id = u32::try_from(s.scopes.len())?;
+        let id = u32::try_from(s.scopes.len())
+            .map_err(|_| RecursionError::InvalidRequest("node identifiers exhausted".into()))?;
         s.scopes.push(Scope {
             parent: Some(parent),
             depth,
             agent,
             alive: true,
+            admission_closed: false,
             budget: BudgetSnapshot {
                 limit: budget,
                 ..BudgetSnapshot::default()
@@ -169,7 +189,11 @@ impl Ledger {
             bail!("max_tokens must be positive");
         }
         let mut s = self.state.lock().expect("ledger mutex poisoned");
-        if !s.scopes.get(node as usize).is_some_and(|n| n.alive) {
+        if !s
+            .scopes
+            .get(node as usize)
+            .is_some_and(|n| n.alive && !n.admission_closed)
+        {
             bail!("node is shut down");
         }
         let path = path(&s, node);
@@ -228,6 +252,11 @@ impl Ledger {
             charged,
             excess: charged.saturating_sub(tokens),
         }
+    }
+    /// Closes admission without releasing the live slot or discarding reservations.
+    pub fn close_admission(&self, node: NodeId) {
+        self.state.lock().expect("ledger mutex poisoned").scopes[node as usize].admission_closed =
+            true;
     }
     /// Releases a live-agent slot only at node shutdown. Idempotent.
     pub fn shutdown(&self, node: NodeId) {

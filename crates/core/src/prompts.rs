@@ -10,3 +10,7 @@ pub fn root(tools: &[kyora_protocol::ToolSpec]) -> String {
             .join(", ")
     )
 }
+
+/// Default frozen child prompt, shared byte-for-byte by siblings.
+/// Override with Runtime::set_subagent_prompt before starting the root.
+pub const SUBAGENT: &str = "You are a sub-agent working on the supplied task in the current working directory. Use the available tool schemas to supply arguments. Return the final answer as text.";

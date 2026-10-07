@@ -577,6 +577,8 @@ impl Runtime {
                 },
             };
             let sent = req.messages.len();
+            // Messages delivered from here on travel with the next request.
+            cx.state.mailbox.new_turn();
             let (mut response, mut invalid) =
                 match self.attempts(cx, &spec.model, req, previous).await {
                     Ok(r) => r,
@@ -860,7 +862,7 @@ impl Runtime {
                 |_| true,
                 |message| self.size(message),
             );
-            if !batch.taken.is_empty() {
+            if !batch.taken.is_empty() || batch.queued > 0 {
                 return self.deliver(cx, history, content, batch).await;
             }
         }
@@ -883,14 +885,17 @@ impl Runtime {
         mut content: Vec<ContentBlock>,
         batch: Batch,
     ) -> Result<()> {
-        let mut written = {
-            let mut work = cx.state.work.lock().expect("node work mutex poisoned");
-            cx.record_delivery(&mut work, &batch.taken, Delivery::Turn)
-        };
-        // The delivery record precedes the conversation record that carries the text.
-        while !*written.borrow_and_update() {
-            if written.changed().await.is_err() {
-                break;
+        // Nothing may fit when this turn's budget is spent; then only the count goes.
+        if !batch.taken.is_empty() {
+            let mut written = {
+                let mut work = cx.state.work.lock().expect("node work mutex poisoned");
+                cx.record_delivery(&mut work, &batch.taken, Delivery::Turn)
+            };
+            // The delivery record precedes the conversation record that carries the text.
+            while !*written.borrow_and_update() {
+                if written.changed().await.is_err() {
+                    break;
+                }
             }
         }
         content.extend(batch.taken.iter().map(|message| ContentBlock::Text {
@@ -1608,8 +1613,10 @@ impl NodeCtx {
         rx.await.unwrap_or(Err(RecursionError::Cancelled))
     }
     /// Takes one delivery of pending messages: whole messages in arrival order within
-    /// `Limits::delivery_chars`, at least one. When none is pending, waits up to
-    /// `yield_after` for the first one, and returns an empty list if none arrives.
+    /// what is left of this turn's `Limits::delivery_chars`, at least one if nothing
+    /// was delivered this turn. When none is pending, waits up to `yield_after` for
+    /// the first one. Returns an empty list if none arrives, or at once when messages
+    /// wait but this turn's budget is spent.
     pub async fn receive(
         &self,
         yield_after: Duration,
@@ -1632,6 +1639,10 @@ impl NodeCtx {
                 if !batch.taken.is_empty() {
                     self.record_delivery(&mut work, &batch.taken, Delivery::Receive);
                     return Ok(batch.taken);
+                }
+                // Messages are waiting, but this turn's budget is spent.
+                if batch.queued > 0 {
+                    return Ok(Vec::new());
                 }
                 if self.state.mailbox.is_closed() {
                     return Err(RecursionError::Cancelled);

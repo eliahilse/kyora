@@ -76,9 +76,10 @@ pub struct Limits {
     /// its result notice is shortened to this cap.
     #[serde(default = "message_chars")]
     pub message_chars: usize,
-    /// Character budget of one delivery: a turn boundary, a receive or a wait hands
-    /// over whole messages in arrival order until the next would exceed it, always
-    /// at least one. The rest stays queued for the next delivery.
+    /// Character budget for the messages one model request carries: deliveries by
+    /// tools and at the turn boundary share it. Each hands over whole messages in
+    /// arrival order until the next would exceed what is left, always at least one
+    /// when nothing was delivered yet in the turn. The rest stays queued.
     #[serde(default = "delivery_chars")]
     pub delivery_chars: usize,
 }

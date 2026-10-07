@@ -2321,6 +2321,7 @@ async fn an_oversized_message_still_goes_through_and_the_rest_follows() {
                         json!({"task": "worker task", "name": "worker"}),
                     ),
                     call("receive", json!({"yield_after": 30})),
+                    text("reading"),
                     call("cancel_agent", json!({"to": "worker"})),
                     text("done"),
                 ],
@@ -2351,8 +2352,8 @@ async fn an_oversized_message_still_goes_through_and_the_rest_follows() {
         TraceSink::ephemeral(),
     );
     assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
-    // The first message exceeds the budget alone and is still handed over whole;
-    // the rest follows at the same boundary, in order, within its own budget.
+    // The first message exceeds the budget alone and is still handed over whole.
+    // It uses up the turn's budget, so the rest follows at the next turn, in order.
     let boundary = last(&provider.request("root task", 2));
     assert_eq!(
         results(&boundary),
@@ -2365,6 +2366,10 @@ async fn an_oversized_message_still_goes_through_and_the_rest_follows() {
     );
     assert_eq!(
         texts(&boundary),
+        vec!["[2 more messages waiting; they follow at your next turn]"]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
         vec![
             "[message from agent 1 (worker)]\nsmall one",
             "[message from agent 1 (worker)]\nsmall two",
@@ -2386,6 +2391,7 @@ async fn wait_defers_a_result_behind_progress_that_does_not_fit() {
                     ),
                     call("wait", json!({})),
                     text("reading"),
+                    text("still reading"),
                     text("done"),
                 ],
             ),
@@ -2422,9 +2428,9 @@ async fn wait_defers_a_result_behind_progress_that_does_not_fit() {
         TraceSink::ephemeral(),
     );
     let outcome = runtime.run(spec()).await.unwrap();
-    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 4));
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 5));
     let line = |digit| format!("[message from agent 1 (chatty)]\n{}", progress(digit));
-    // The result never overtakes the progress: one message per page, then the result.
+    // The result never overtakes the progress: one message per turn, then the result.
     let first = last(&provider.request("root task", 2));
     assert_eq!(
         results(&first),
@@ -2438,13 +2444,17 @@ async fn wait_defers_a_result_behind_progress_that_does_not_fit() {
     );
     assert_eq!(
         texts(&first),
+        vec!["[2 more messages waiting; they follow at your next turn]"]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
         vec![
             line('2'),
             "[1 more message waiting; it follows at your next turn]".into(),
         ]
     );
     assert_eq!(
-        texts(&last(&provider.request("root task", 3))),
+        texts(&last(&provider.request("root task", 4))),
         vec!["[result from agent 1 (chatty): completed]\nfinal"]
     );
 }
@@ -2460,6 +2470,7 @@ async fn cancel_agent_defers_a_notice_that_does_not_fit() {
                     call("spawn_agent", json!({"task": "slow task", "name": "slow"})),
                     call("cancel_agent", json!({"to": "slow"})),
                     text("reading"),
+                    text("still reading"),
                     text("done"),
                 ],
             ),
@@ -2494,7 +2505,7 @@ async fn cancel_agent_defers_a_notice_that_does_not_fit() {
         TraceSink::ephemeral(),
     );
     let outcome = runtime.run(spec()).await.unwrap();
-    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 4));
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 5));
     let line = |digit| format!("[message from agent 1 (slow)]\n{}", progress(digit));
     let first = last(&provider.request("root task", 2));
     assert_eq!(
@@ -2509,13 +2520,17 @@ async fn cancel_agent_defers_a_notice_that_does_not_fit() {
     );
     assert_eq!(
         texts(&first),
+        vec!["[2 more messages waiting; they follow at your next turn]"]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
         vec![
             line('2'),
             "[1 more message waiting; it follows at your next turn]".into(),
         ]
     );
     assert_eq!(
-        texts(&last(&provider.request("root task", 3))),
+        texts(&last(&provider.request("root task", 4))),
         vec!["[cancelled from agent 1 (slow): cancelled]"]
     );
 }
@@ -2671,5 +2686,83 @@ async fn cancel_agent_reports_a_cell_owned_childs_outcome_after_its_messages() {
                 .into(),
             false
         )]
+    );
+}
+
+#[tokio::test]
+async fn messages_a_tool_delivers_share_the_turn_budget() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "worker task", "name": "worker"}),
+                    ),
+                    call("receive", json!({"yield_after": 30})),
+                    text("reading"),
+                    call("cancel_agent", json!({"to": "worker"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "worker task",
+                1,
+                vec![calls(vec![
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('1')}),
+                    ),
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('2')}),
+                    ),
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('3')}),
+                    ),
+                ])],
+            ),
+        ],
+        vec![
+            (at("worker task", 0), at("root task", 1)),
+            (at("root task", 1), at("worker task", 1)),
+            (at("worker task", 1), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 150,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 5));
+    let line = |digit| format!("[message from agent 1 (worker)]\n{}", progress(digit));
+    // receive used 144 of the 150 characters, so the boundary adds no message.
+    let request = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&request),
+        vec![(
+            format!(
+                "{}\n\n{}\n\n1 more message waiting; it follows at your next turn",
+                line('1'),
+                line('2')
+            ),
+            false
+        )]
+    );
+    assert_eq!(
+        texts(&request),
+        vec!["[1 more message waiting; it follows at your next turn]"]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
+        vec![line('3')]
     );
 }

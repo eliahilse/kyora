@@ -146,13 +146,16 @@ fn take(
     let mut taken = Vec::new();
     let mut left = BTreeMap::new();
     let mut rest = VecDeque::new();
-    let mut used = 0;
+    // Every delivery before the next model request shares one budget. The first
+    // message of a turn always goes, so an oversized one is not stuck.
+    let fresh = state.turn == 0;
+    let mut used = state.turn;
     let mut full = false;
     for envelope in state.queue.drain(..) {
         if pick(&envelope) {
             if !full {
                 let cost = size(&envelope);
-                if taken.is_empty() || used + cost <= budget {
+                if (fresh && taken.is_empty()) || used + cost <= budget {
                     used += cost;
                     taken.push(envelope);
                     continue;
@@ -165,6 +168,7 @@ fn take(
         rest.push_back(envelope);
     }
     state.queue = rest;
+    state.turn = used;
     state.plain -= taken
         .iter()
         .filter(|envelope| envelope.kind == MessageKind::Message)
@@ -209,6 +213,8 @@ struct State {
     /// Node-owned children whose terminal notice has not been queued yet.
     awaiting: BTreeSet<NodeId>,
     closed: bool,
+    /// Characters of messages handed over since the agent's last model request.
+    turn: usize,
 }
 /// Why a mailbox refused a plain message.
 pub(crate) enum Refusal {
@@ -282,6 +288,10 @@ impl Mailbox {
         };
         self.wake();
         result
+    }
+    /// Starts a new turn's delivery budget, right before the agent's next model request.
+    pub(crate) fn new_turn(&self) {
+        self.lock().turn = 0;
     }
     /// Wakes waiters without changing the queue, after a child publishes its outcome.
     pub(crate) fn touch(&self) {

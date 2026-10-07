@@ -159,7 +159,13 @@ impl Tool for Receive {
             Err(error) => return ToolOutput::error(error),
         };
         match cx.node.receive(yield_after).await {
-            Ok(taken) if taken.is_empty() => ToolOutput::text("no messages"),
+            Ok(taken) if taken.is_empty() => match cx.node.pending_messages() {
+                0 => ToolOutput::text("no messages"),
+                left => ToolOutput::text(format!(
+                    "no more messages fit this turn; {}",
+                    messages::more(left)
+                )),
+            },
             Ok(taken) => {
                 let mut parts = taken
                     .iter()

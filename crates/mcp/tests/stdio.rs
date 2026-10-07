@@ -248,8 +248,13 @@ async fn timeouts_and_cancellation_notify_the_server() {
         .insert("KYORA_MCP_TEST_LOG".into(), log.display().to_string());
     let server = start(dir.path(), &config).await;
     let trigger = cancel.clone();
+    let watched = log.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Cancel once the server has the call, not after a guessed delay.
+        logged(&watched, |m| {
+            m["method"] == "tools/call" && m["params"]["name"] == "slow"
+        })
+        .await;
         trigger.cancel();
     });
     let output = server.call("slow", json!({}), &cancel).await;
@@ -387,6 +392,28 @@ async fn shutdown_escalates_to_signals_when_a_server_ignores_end_of_file() {
     let elapsed = started.elapsed();
     assert!(elapsed >= kyora_mcp::defaults::EXIT_GRACE, "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    wait_gone(pid(&log)).await;
+}
+
+#[tokio::test]
+async fn shutdown_kills_a_server_that_also_ignores_sigterm() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let mut config = server_config(&log, &[("KYORA_MCP_TEST_MODE", "linger")]);
+    // An ignored signal stays ignored across exec, so the server inherits it.
+    config.command = Some("sh".into());
+    config.args = vec![
+        "-c".into(),
+        "trap '' TERM; exec \"$0\"".into(),
+        SERVER.into(),
+    ];
+    let server = start(dir.path(), &config).await;
+    let started = Instant::now();
+    server.shutdown().await;
+    let elapsed = started.elapsed();
+    let escalation = kyora_mcp::defaults::EXIT_GRACE + kyora_mcp::defaults::TERM_GRACE;
+    assert!(elapsed >= escalation, "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     wait_gone(pid(&log)).await;
 }
 

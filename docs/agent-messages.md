@@ -38,7 +38,7 @@ An agent can address its parent, its children and its siblings, and nothing else
 
 A send returns a message id once the message is queued in the recipient's mailbox, or an error, in which case nothing was queued. Inside the process an accepted message leaves its mailbox exactly once, in one of two ways:
 
-- delivered: appended to the recipient's conversation at a turn boundary, returned by `receive`, or (for a notice) consumed by `wait`;
+- delivered: appended to the recipient's conversation at a turn boundary, returned by `receive`, or taken by `wait` or `cancel_agent`, which return a finished child's unread messages together with its notice, so the child's order is kept;
 - undelivered: still queued when the recipient ended, and recorded in the trace.
 
 Nothing is duplicated and nothing disappears silently. Delivery into a conversation is at most once. The mailbox is a single FIFO queue, so messages from one sender arrive in send order, and a child's progress messages always arrive before its own result.
@@ -148,7 +148,7 @@ NodeCtx::render_outcome(&self, outcome: &AgentOutcome) -> String
 Envelope::render(&self, sender: &str) -> String
 ```
 
-`ChildSpec::output` sets the output schema. `CancelOutcome` carries the stopped agent's outcome and whether it had already finished. `Waited` lists the outcomes of the waited children that finished and the ids of those still running. `wait` takes the queued notices of the finished children, so their results are not delivered again at the next turn; `AgentHandle::result` is a plain observer and takes nothing. Errors: `MailboxFull` and `AgentFinished` for the recipient's state, `InvalidRequest` for unknown, ambiguous or unrelated addresses, messages to oneself and oversized bodies, and `Cancelled` when the calling agent has ended or is cancelled.
+`ChildSpec::output` sets the output schema. `CancelOutcome` carries the stopped agent's outcome and whether it had already finished. `Waited` holds what the finished children had queued (their unread messages and notices, in arrival order), their outcomes, and the ids of the children still running. `CancelOutcome::messages` holds the same for a cancelled direct child. `wait` takes the queued notices of the finished children, so their results are not delivered again at the next turn; `AgentHandle::result` is a plain observer and takes nothing. Errors: `MailboxFull` and `AgentFinished` for the recipient's state, `InvalidRequest` for unknown, ambiguous or unrelated addresses, messages to oneself and oversized bodies, and `Cancelled` when the calling agent has ended or is cancelled.
 
 ## Trace events
 

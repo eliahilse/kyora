@@ -94,6 +94,9 @@ pub struct CancelOutcome {
     pub outcome: AgentOutcome,
     /// The agent had already finished when it was cancelled.
     pub already_finished: bool,
+    /// For a direct child, what it had queued for the caller: its unread messages
+    /// and its terminal notice, in arrival order.
+    pub messages: Vec<crate::Envelope>,
 }
 /// Live counters for a child; status is absent until shutdown completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]

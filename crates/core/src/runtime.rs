@@ -1581,8 +1581,9 @@ impl NodeCtx {
     }
     /// Waits until the given children have finished; with None, every child whose
     /// result has not been delivered yet. Returns early, listing the children still
-    /// running, when `timeout` passes. Takes the queued notices of finished children,
-    /// so their results are not delivered again at the next turn.
+    /// running, when `timeout` passes. Takes what the finished children had queued,
+    /// their unread messages and notices in arrival order, so none of it is delivered
+    /// again at the next turn and each child's order is kept.
     pub async fn wait(
         &self,
         agents: Option<&[NodeId]>,
@@ -1650,7 +1651,7 @@ impl NodeCtx {
             .copied()
             .filter(finished)
             .collect::<BTreeSet<_>>();
-        let taken = self.state.mailbox.take_notices(&done);
+        let taken = self.state.mailbox.take_from(&done);
         if !taken.is_empty() {
             let _ = self
                 .runtime
@@ -1661,8 +1662,8 @@ impl NodeCtx {
                 })
                 .await;
         }
-        taken.finish();
         Ok(Waited {
+            messages: taken.finish(),
             finished: done
                 .iter()
                 .map(|id| {
@@ -1715,6 +1716,7 @@ impl NodeCtx {
                 Some(outcome) => Ok(CancelOutcome {
                     outcome,
                     already_finished,
+                    messages: waited.messages,
                 }),
                 // Only the deadline ends an untimed wait early.
                 None => Err(RecursionError::Cancelled),
@@ -1725,6 +1727,7 @@ impl NodeCtx {
                 return Ok(CancelOutcome {
                     outcome,
                     already_finished,
+                    messages: Vec::new(),
                 });
             }
             tokio::select! {

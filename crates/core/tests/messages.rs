@@ -1121,14 +1121,18 @@ async fn siblings_exchange_messages_by_name() {
         results(&last(&provider.request("child b", 1))),
         vec![("[message from agent 1 (a)]\nhello from a".into(), false)]
     );
+    // Results come back in the order the siblings finished, which either may win.
+    let waited = results(&last(&provider.request("root task", 2)));
+    let mut parts = waited[0].0.split("\n\n").collect::<Vec<_>>();
+    parts.sort();
     assert_eq!(
-        results(&last(&provider.request("root task", 2))),
-        vec![(
-            "[result from agent 1 (a): completed]\na done\n\n[result from agent 2 (b): completed]\nb done"
-                .into(),
-            false
-        )]
+        parts,
+        vec![
+            "[result from agent 1 (a): completed]\na done",
+            "[result from agent 2 (b): completed]\nb done",
+        ]
     );
+    assert!(!waited[0].1);
     let live = records(rx);
     let greeting = &sent(&live)[0];
     assert_eq!((greeting.from, greeting.to, greeting.spawn), (1, 2, None));
@@ -1898,4 +1902,101 @@ async fn an_accepted_result_survives_a_later_cancel() {
         *ended.lock().unwrap(),
         Some((Status::Completed, "{\"dates\":[\"2026-10-07\"]}".into()))
     );
+}
+
+#[tokio::test]
+async fn wait_returns_a_childs_progress_before_its_result() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "chatty task", "name": "chatty"}),
+                    ),
+                    call("wait", json!({})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "chatty task",
+                1,
+                vec![
+                    call("send_message", json!({"to": "parent", "body": "progress"})),
+                    text("final"),
+                ],
+            ),
+        ],
+        vec![
+            // The progress message is queued behind the parent's turn boundary.
+            (at("chatty task", 0), at("root task", 1)),
+            (at("root task", 1), at("chatty task", 1)),
+        ],
+    );
+    let trace = TraceSink::ephemeral();
+    let rx = trace.subscribe();
+    let runtime = setup(provider.clone(), idle_tool(), Limits::default(), trace);
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    let waited = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&waited),
+        vec![(
+            "[message from agent 1 (chatty)]\nprogress\n\n[result from agent 1 (chatty): completed]\nfinal"
+                .into(),
+            false
+        )]
+    );
+    assert!(texts(&waited).is_empty());
+    let live = records(rx);
+    let ids = sent(&live).iter().map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(delivered(&live), vec![(0, ids, Delivery::Wait)]);
+}
+
+#[tokio::test]
+async fn cancel_agent_returns_a_childs_progress_before_its_notice() {
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call("spawn_agent", json!({"task": "slow task", "name": "slow"})),
+                    call("cancel_agent", json!({"to": "slow"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "slow task",
+                1,
+                vec![call(
+                    "send_message",
+                    json!({"to": "parent", "body": "progress"}),
+                )],
+            ),
+        ],
+        vec![
+            (at("slow task", 0), at("root task", 1)),
+            (at("root task", 1), at("slow task", 1)),
+            (at("slow task", 1), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits::default(),
+        TraceSink::ephemeral(),
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    let cancelled = last(&provider.request("root task", 2));
+    assert_eq!(
+        results(&cancelled),
+        vec![(
+            "[message from agent 1 (slow)]\nprogress\n\n[cancelled from agent 1 (slow): cancelled]"
+                .into(),
+            false
+        )]
+    );
+    assert!(texts(&cancelled).is_empty());
 }

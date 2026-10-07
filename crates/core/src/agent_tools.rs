@@ -4,7 +4,9 @@
 //! `cancel_agent`. They hold no state of their own, so one set can serve every node
 //! of a toolset factory. The runtime adds `submit_result` itself to a child spawned
 //! with an output schema.
-use crate::{Answer, ChildSpec, Effect, Owner, Tool, ToolCx, ToolOutput, ToolSelection, tool};
+use crate::{
+    Answer, ChildSpec, Effect, MessageKind, Owner, Tool, ToolCx, ToolOutput, ToolSelection, tool,
+};
 use async_trait::async_trait;
 use kyora_protocol::ToolSpec;
 use serde_json::{Value, json};
@@ -208,10 +210,25 @@ impl Tool for Wait {
             Ok(waited) => waited,
             Err(error) => return ToolOutput::error(error.to_string()),
         };
-        let mut parts = waited
-            .finished
+        // Queued messages come first, in arrival order. A finished child whose
+        // notice was delivered earlier is reported from its outcome.
+        let noticed = waited
+            .messages
             .iter()
-            .map(|outcome| cx.node.render_outcome(outcome))
+            .filter(|message| message.kind != MessageKind::Message)
+            .map(|message| message.from)
+            .collect::<Vec<_>>();
+        let mut parts = waited
+            .messages
+            .iter()
+            .map(|message| cx.node.render(message))
+            .chain(
+                waited
+                    .finished
+                    .iter()
+                    .filter(|outcome| !noticed.contains(&outcome.node))
+                    .map(|outcome| cx.node.render_outcome(outcome)),
+            )
             .collect::<Vec<_>>();
         if !waited.running.is_empty() {
             parts.push(format!(
@@ -255,12 +272,28 @@ impl Tool for CancelAgent {
             Err(error) => Err(error),
         };
         match cancelled {
-            Ok(cancelled) if cancelled.already_finished => ToolOutput::text(format!(
-                "agent {} had already finished\n{}",
-                cancelled.outcome.node,
-                cx.node.render_outcome(&cancelled.outcome)
-            )),
-            Ok(cancelled) => ToolOutput::text(cx.node.render_outcome(&cancelled.outcome)),
+            Ok(cancelled) => {
+                // The child's unread messages and its notice, in arrival order, or
+                // its outcome when the notice was delivered before.
+                let report = if cancelled.messages.is_empty() {
+                    cx.node.render_outcome(&cancelled.outcome)
+                } else {
+                    cancelled
+                        .messages
+                        .iter()
+                        .map(|message| cx.node.render(message))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+                if cancelled.already_finished {
+                    ToolOutput::text(format!(
+                        "agent {} had already finished\n{report}",
+                        cancelled.outcome.node
+                    ))
+                } else {
+                    ToolOutput::text(report)
+                }
+            }
             Err(error) => ToolOutput::error(error.to_string()),
         }
     }

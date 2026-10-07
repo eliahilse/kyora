@@ -116,6 +116,9 @@ pub(crate) fn render(
 /// Children that finished and children still running when a wait returns.
 #[derive(Debug, Clone, Default)]
 pub struct Waited {
+    /// What the finished children had queued: their unread messages and terminal
+    /// notices, in arrival order.
+    pub messages: Vec<Envelope>,
     /// Outcomes of the waited children that finished, in node id order.
     pub finished: Vec<AgentOutcome>,
     /// Waited children that were still running.
@@ -227,16 +230,22 @@ impl Mailbox {
             envelopes,
         }
     }
-    /// Takes the queued terminal notices of the given children.
-    pub(crate) fn take_notices(&self, children: &BTreeSet<NodeId>) -> Taken<'_> {
+    /// Takes everything queued from the given children, in arrival order. For a
+    /// finished child that is its unread messages followed by its terminal notice,
+    /// so the sender's order is kept.
+    pub(crate) fn take_from(&self, children: &BTreeSet<NodeId>) -> Taken<'_> {
         let envelopes = {
             let mut state = self.lock();
-            let (notices, rest): (VecDeque<_>, VecDeque<_>) =
-                state.queue.drain(..).partition(|envelope| {
-                    envelope.kind != MessageKind::Message && children.contains(&envelope.from)
-                });
+            let (taken, rest): (VecDeque<_>, VecDeque<_>) = state
+                .queue
+                .drain(..)
+                .partition(|envelope| children.contains(&envelope.from));
             state.queue = rest;
-            notices.into()
+            state.plain -= taken
+                .iter()
+                .filter(|envelope| envelope.kind == MessageKind::Message)
+                .count();
+            taken.into()
         };
         Taken {
             mailbox: self,

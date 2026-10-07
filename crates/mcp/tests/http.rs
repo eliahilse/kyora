@@ -383,9 +383,10 @@ async fn failed_http_startups_delete_the_session_they_opened() {
     }
 }
 
-/// A server that opens an SSE response to initialize, assigns a session and never
-/// sends an event, so startup can only be abandoned. It records each request as
-/// "METHOD session".
+/// A server that answers initialize with a session over SSE and never answers
+/// notifications/initialized, so startup can only be abandoned. It records each
+/// request as "METHOD what", where what is the JSON-RPC method of a POST and the
+/// session and protocol version of a DELETE.
 async fn hanging_server() -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -403,32 +404,71 @@ async fn answer(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<String>>>)
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut request = Vec::new();
     let mut chunk = [0; 4096];
-    let head = loop {
+    let (head, body_start) = loop {
         let Ok(read @ 1..) = stream.read(&mut chunk).await else {
             return;
         };
         request.extend_from_slice(&chunk[..read]);
         if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-            break String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            break (
+                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase(),
+                end + 4,
+            );
         }
     };
-    let method = head.split(' ').next().unwrap_or_default().to_uppercase();
-    let session = head
-        .lines()
-        .find_map(|line| line.strip_prefix("mcp-session-id: "))
-        .unwrap_or("-")
-        .to_owned();
-    log.lock().unwrap().push(format!("{method} {session}"));
-    let reply: &[u8] = match method.as_str() {
-        "POST" => b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: hanging\r\ntransfer-encoding: chunked\r\n\r\n",
-        "DELETE" => b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-        _ => b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    let header = |name: &str| {
+        head.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+            .map(str::to_owned)
     };
-    let _ = stream.write_all(reply).await;
-    if method == "POST" {
-        // Hold the stream open without ever finishing the response.
-        tokio::time::sleep(Duration::from_secs(600)).await;
+    let length: usize = header("content-length").map_or(0, |n| n.parse().unwrap());
+    while request.len() < body_start + length {
+        let Ok(read @ 1..) = stream.read(&mut chunk).await else {
+            return;
+        };
+        request.extend_from_slice(&chunk[..read]);
     }
+    let method = head.split(' ').next().unwrap_or_default().to_uppercase();
+    let message: Value =
+        serde_json::from_slice(&request[body_start..body_start + length]).unwrap_or_default();
+    let what = match method.as_str() {
+        "DELETE" => format!(
+            "{} {}",
+            header("mcp-session-id").unwrap_or_default(),
+            header("mcp-protocol-version").unwrap_or_default()
+        ),
+        _ => message["method"].as_str().unwrap_or_default().to_owned(),
+    };
+    log.lock().unwrap().push(format!("{method} {what}"));
+    let reply = match (method.as_str(), what.as_str()) {
+        ("POST", "initialize") => {
+            let result = json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {
+                    "protocolVersion": message["params"]["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "hanging", "version": "1"},
+                },
+            });
+            let event = format!("event: message\ndata: {result}\n\n");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: hanging\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{event}",
+                event.len()
+            )
+        }
+        ("POST", _) => {
+            // Never answer: hold the request open.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            return;
+        }
+        ("DELETE", _) => {
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+        }
+        _ => "HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_owned(),
+    };
+    let _ = stream.write_all(reply.as_bytes()).await;
 }
 
 async fn deleted(log: &Arc<Mutex<Vec<String>>>) -> bool {
@@ -438,7 +478,7 @@ async fn deleted(log: &Arc<Mutex<Vec<String>>>) -> bool {
             .lock()
             .unwrap()
             .iter()
-            .any(|line| line == "DELETE hanging")
+            .any(|line| line == "DELETE hanging 2025-11-25")
         {
             return true;
         }
@@ -447,15 +487,17 @@ async fn deleted(log: &Arc<Mutex<Vec<String>>>) -> bool {
     false
 }
 
-async fn initialize_sent(log: &Arc<Mutex<Vec<String>>>) {
+/// Waits for notifications/initialized, which the client sends only after it has
+/// read the initialize response and with it the session.
+async fn initialized_sent(log: &Arc<Mutex<Vec<String>>>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !log
         .lock()
         .unwrap()
         .iter()
-        .any(|line| line.starts_with("POST"))
+        .any(|line| line == "POST notifications/initialized")
     {
-        assert!(Instant::now() < deadline, "initialize not sent");
+        assert!(Instant::now() < deadline, "{:?}", log.lock().unwrap());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -473,7 +515,7 @@ async fn an_abandoned_http_startup_deletes_its_session() {
     let trigger = cancel.clone();
     let watched = log.clone();
     tokio::spawn(async move {
-        initialize_sent(&watched).await;
+        initialized_sent(&watched).await;
         trigger.cancel();
     });
     let started = Server::start_until("remote", &config, dir.path(), &[], &cancel).await;
@@ -489,7 +531,7 @@ async fn an_abandoned_http_startup_deletes_its_session() {
     let path = dir.path().to_owned();
     let starting =
         tokio::spawn(async move { Server::start("remote", &config, &path, &[]).await.is_ok() });
-    initialize_sent(&log).await;
+    initialized_sent(&log).await;
     starting.abort();
     assert!(deleted(&log).await, "{:?}", log.lock().unwrap());
 }

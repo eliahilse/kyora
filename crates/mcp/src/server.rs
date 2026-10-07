@@ -30,7 +30,7 @@ use std::{
     ffi::OsString,
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -257,7 +257,6 @@ impl Drop for Pending {
 /// A running MCP server and the tools it currently offers.
 pub struct Server {
     name: String,
-    config: ServerConfig,
     connection: Arc<Connection>,
     tools: RwLock<Vec<Arc<dyn Tool>>>,
     service: Mutex<Option<RunningService<RoleClient, Handler>>>,
@@ -363,7 +362,6 @@ impl Server {
         };
         let server = Arc::new(Self {
             name: name.to_owned(),
-            config: config.clone(),
             connection,
             tools: RwLock::new(tools),
             service: Mutex::new(Some(service)),
@@ -371,18 +369,13 @@ impl Server {
             http: http.map(|(client, _)| client),
             closed: CancellationToken::new(),
         });
-        let weak = Arc::downgrade(&server);
-        let closed = server.closed.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = closed.cancelled() => break,
-                    _ = changed.notified() => {}
-                }
-                let Some(server) = weak.upgrade() else { break };
-                server.refresh().await;
-            }
-        });
+        tokio::spawn(refresh(
+            Arc::downgrade(&server),
+            server.connection.clone(),
+            config.clone(),
+            changed,
+            server.closed.clone(),
+        ));
         Ok(server)
     }
 
@@ -400,15 +393,6 @@ impl Server {
     pub async fn call(&self, tool: &str, input: Value, cancel: &CancellationToken) -> ToolOutput {
         let deadline = Instant::now() + self.connection.timeout;
         self.connection.call(tool, input, cancel, deadline).await
-    }
-
-    /// Lists the tools again after `notifications/tools/list_changed`. A failed refresh
-    /// keeps the previous list.
-    async fn refresh(&self) {
-        let deadline = Instant::now() + self.config.startup_timeout();
-        if let Ok(tools) = list(&self.connection, &self.config, &self.closed, deadline).await {
-            *self.tools.write().expect("tool list poisoned") = tools;
-        }
     }
 
     /// Closes the connection. A stdio server gets end of file on stdin, then SIGTERM and
@@ -431,6 +415,32 @@ impl Drop for Server {
     fn drop(&mut self) {
         // Ends the refresh task when a server is dropped without shutdown.
         self.closed.cancel();
+    }
+}
+
+/// Lists the tools again after each `notifications/tools/list_changed`; a failed
+/// refresh keeps the previous list. The listing runs on the connection alone, so
+/// dropping the server is never held up by it.
+async fn refresh(
+    server: Weak<Server>,
+    connection: Arc<Connection>,
+    config: ServerConfig,
+    changed: Arc<Notify>,
+    closed: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = closed.cancelled() => return,
+            _ = changed.notified() => {}
+        }
+        let deadline = Instant::now() + config.startup_timeout();
+        let Ok(tools) = list(&connection, &config, &closed, deadline).await else {
+            continue;
+        };
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        *server.tools.write().expect("tool list poisoned") = tools;
     }
 }
 

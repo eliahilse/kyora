@@ -563,6 +563,20 @@ async fn a_refresh_that_times_out_is_cancelled_on_the_server() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn dropping_a_server_is_not_held_up_by_a_pending_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    // The refresh would wait up to the 30 s default startup timeout.
+    let config = server_config(&log, &[("KYORA_MCP_TEST_MODE", "stall-list")]);
+    let server = start(dir.path(), &config).await;
+    trigger_refresh(&server, &log).await;
+    let started = Instant::now();
+    drop(server);
+    wait_gone(pid(&log)).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
 fn scripted(toolsets: McpToolsets, tool: &str, input: Value) -> (Runtime, TraceSink) {
     let tool = tool.to_owned();
     let provider = FnProvider::new(move |request: &ModelRequest| {

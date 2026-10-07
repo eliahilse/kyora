@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TOKEN: &str = "test-only-bearer-token";
+const KEY: &str = "test-only-header-key";
 const SESSION: &str = "session-1";
 
 /// A streamable HTTP MCP server: JSON replies for some requests, SSE for others.
@@ -51,6 +52,16 @@ impl Respond for Fake {
                 "echo" => sse_reply(
                     &id,
                     json!({"content": [{"type": "text", "text": params["arguments"]["text"]}]}),
+                ),
+                // Servers can echo credentials back in errors and results.
+                "leak" => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": format!("invalid token {TOKEN}")},
+                })),
+                "leak_result" => json_reply(
+                    &id,
+                    json!({"content": [{"type": "text", "text": format!("key {KEY} rejected")}], "isError": true}),
                 ),
                 "fail" => json_reply(
                     &id,
@@ -107,7 +118,7 @@ async fn streamable_http_handshake_paging_calls_and_cleanup() {
     };
     let env: Vec<(OsString, OsString)> = vec![
         ("REMOTE_TOKEN".into(), TOKEN.into()),
-        ("REMOTE_KEY".into(), "test-only-header-key".into()),
+        ("REMOTE_KEY".into(), KEY.into()),
     ];
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start("remote", &config, dir.path(), &env)
@@ -132,6 +143,13 @@ async fn streamable_http_handshake_paging_calls_and_cleanup() {
     let failed = server.call("fail", json!({}), &cancel).await;
     assert!(failed.is_error);
     assert_eq!(failed.text_content(), "remote failure");
+    for tool in ["leak", "leak_result"] {
+        let leaked = server.call(tool, json!({}), &cancel).await;
+        assert!(leaked.is_error);
+        let text = leaked.text_content();
+        assert!(text.contains(kyora_mcp::REDACTED), "{text}");
+        assert!(!text.contains(TOKEN) && !text.contains(KEY), "{text}");
+    }
     let started = Instant::now();
     let slow = server.call("slow", json!({}), &cancel).await;
     assert!(
@@ -168,7 +186,7 @@ async fn streamable_http_handshake_paging_calls_and_cleanup() {
             Some(format!("Bearer {TOKEN}").as_str())
         );
         assert_eq!(header(request, "x-team"), Some("core"));
-        assert_eq!(header(request, "x-api-key"), Some("test-only-header-key"));
+        assert_eq!(header(request, "x-api-key"), Some(KEY));
         if method(request) != "initialize" {
             assert_eq!(header(request, "mcp-session-id"), Some(SESSION));
             assert_eq!(header(request, "mcp-protocol-version"), Some("2025-11-25"));
@@ -201,6 +219,23 @@ async fn http_failures_are_startup_errors() {
     );
     assert!(!message.contains("rmcp::"), "{message}");
     assert!(!message.contains(TOKEN), "{message}");
+
+    // An error body that echoes the token is redacted before it is reported.
+    let echoing = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500).set_body_string(format!("invalid token {TOKEN}")))
+        .mount(&echoing)
+        .await;
+    let config = ServerConfig {
+        url: Some(echoing.uri()),
+        ..config
+    };
+    let refused = Server::start("remote", &config, dir.path(), &env).await;
+    let message = format!("{:#}", refused.err().unwrap());
+    assert!(message.contains("HTTP 500"), "{message}");
+    assert!(message.contains(kyora_mcp::REDACTED), "{message}");
+    assert!(!message.contains(TOKEN), "{message}");
+    assert!(!message.contains(&echoing.uri()), "{message}");
 }
 
 #[tokio::test]
@@ -226,7 +261,7 @@ async fn redirects_are_refused_so_headers_stay_with_the_configured_origin() {
     };
     let env: Vec<(OsString, OsString)> = vec![
         ("REMOTE_TOKEN".into(), TOKEN.into()),
-        ("REMOTE_KEY".into(), "test-only-header-key".into()),
+        ("REMOTE_KEY".into(), KEY.into()),
     ];
     let dir = tempfile::tempdir().unwrap();
     let started = Server::start("remote", &config, dir.path(), &env).await;

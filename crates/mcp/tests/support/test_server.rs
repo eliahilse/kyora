@@ -41,7 +41,8 @@ fn main() {
     record(&json!({"pid": std::process::id()}));
     eprintln!("test server starting");
     if mode == "exit" {
-        eprintln!("fatal: refusing to start");
+        let secret = std::env::var("KYORA_MCP_TEST_SECRET").unwrap_or_default();
+        eprintln!("fatal: refusing to start with secret {secret}");
         std::process::exit(2);
     }
     let page: usize = std::env::var("KYORA_MCP_TEST_PAGE")

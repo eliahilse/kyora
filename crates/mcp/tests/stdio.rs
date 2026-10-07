@@ -17,6 +17,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const SERVER: &str = env!("CARGO_BIN_EXE_kyora-mcp-test-server");
+const STDIO_SECRET: &str = "test-only-stdio-secret";
 
 fn server_config(log: &Path, settings: &[(&str, &str)]) -> ServerConfig {
     let mut env = BTreeMap::from([("KYORA_MCP_TEST_LOG".to_owned(), log.display().to_string())]);
@@ -38,6 +39,7 @@ fn environment() -> Vec<(OsString, OsString)> {
         ("ANTHROPIC_API_KEY", "test-only-must-not-leak"),
         ("KYORA_TEST_FORWARD", "forwarded"),
         ("KYORA_TEST_UNLISTED", "dropped"),
+        ("KYORA_MCP_TEST_SECRET", STDIO_SECRET),
     ] {
         env.push((name.into(), value.into()));
     }
@@ -324,7 +326,8 @@ async fn environment_and_working_directory_are_controlled() {
     let mut seen: Vec<_> = vars.keys().map(String::as_str).collect();
     seen.sort_unstable();
     assert_eq!(seen, ["KYORA_TEST_FORWARD", "MODE", "PATH"]);
-    assert_eq!(vars["KYORA_TEST_FORWARD"], "forwarded");
+    // Forwarded values count as credentials and never reach the model.
+    assert_eq!(vars["KYORA_TEST_FORWARD"], kyora_mcp::REDACTED);
     assert_eq!(
         PathBuf::from(report["cwd"].as_str().unwrap())
             .canonicalize()
@@ -386,7 +389,10 @@ async fn startup_failures_are_reported_and_other_servers_keep_running() {
             ),
             (
                 "exits".into(),
-                server_config(&log("exits"), &[("KYORA_MCP_TEST_MODE", "exit")]),
+                ServerConfig {
+                    env_vars: vec!["KYORA_MCP_TEST_SECRET".into()],
+                    ..server_config(&log("exits"), &[("KYORA_MCP_TEST_MODE", "exit")])
+                },
             ),
             ("hangs".into(), hangs),
             (
@@ -415,11 +421,10 @@ async fn startup_failures_are_reported_and_other_servers_keep_running() {
             .unwrap_or_else(|| panic!("no failure for {name}: {failures:?}"))
     };
     assert!(failure("missing").contains("spawn"));
-    assert!(
-        failure("exits").contains("refusing to start"),
-        "{}",
-        failure("exits")
-    );
+    let exits = failure("exits");
+    assert!(exits.contains("refusing to start"), "{exits}");
+    assert!(exits.contains(kyora_mcp::REDACTED), "{exits}");
+    assert!(!exits.contains(STDIO_SECRET), "{exits}");
     assert!(failure("hangs").contains("timed out"));
     assert!(failure("old").contains("unsupported protocol version 1999-01-01"));
     assert!(!log("disabled").exists());

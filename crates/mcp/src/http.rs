@@ -73,7 +73,7 @@ impl StreamableHttpClient for HttpClient {
         let response = headers(request, session_id, auth_header, custom_headers)
             .send()
             .await
-            .map_err(StreamableHttpError::Client)?;
+            .map_err(client_error)?;
         let status = response.status();
         if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
             return Ok(StreamableHttpPostResponse::Accepted);
@@ -109,10 +109,7 @@ impl StreamableHttpClient for HttpClient {
             ));
         }
         if kind.starts_with(JSON) {
-            let body = response
-                .bytes()
-                .await
-                .map_err(StreamableHttpError::Client)?;
+            let body = response.bytes().await.map_err(client_error)?;
             return match serde_json::from_slice(&body) {
                 Ok(reply) => Ok(StreamableHttpPostResponse::Json(reply, session)),
                 // Notifications and replies need no answer; tolerate a stray body.
@@ -139,13 +136,11 @@ impl StreamableHttpClient for HttpClient {
         let response = headers(request, Some(session_id), auth_header, custom_headers)
             .send()
             .await
-            .map_err(StreamableHttpError::Client)?;
+            .map_err(client_error)?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
-        response
-            .error_for_status()
-            .map_err(StreamableHttpError::Client)?;
+        response.error_for_status().map_err(client_error)?;
         Ok(())
     }
 
@@ -184,14 +179,12 @@ impl StreamableHttpClient for HttpClient {
         let response = headers(request, session_id, auth_header, custom_headers)
             .send()
             .await
-            .map_err(StreamableHttpError::Client)?;
+            .map_err(client_error)?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
         auth_required(&response)?;
-        let response = response
-            .error_for_status()
-            .map_err(StreamableHttpError::Client)?;
+        let response = response.error_for_status().map_err(client_error)?;
         let kind = content_type(&response);
         if !kind.starts_with(EVENT_STREAM) && !kind.starts_with(JSON) {
             return Err(StreamableHttpError::UnexpectedContentType(
@@ -200,6 +193,11 @@ impl StreamableHttpClient for HttpClient {
         }
         Ok(events(response, max_sse_event_size))
     }
+}
+
+/// reqwest errors name the request URL; keep what happened without it.
+fn client_error(error: reqwest::Error) -> Error {
+    StreamableHttpError::Client(error.without_url())
 }
 
 fn headers(

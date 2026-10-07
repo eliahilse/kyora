@@ -4,6 +4,7 @@ use crate::{
     defaults,
     http::HttpClient,
     process::Process,
+    secrets::Secrets,
     tool::{McpTool, render_result},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -67,6 +68,7 @@ pub(crate) struct Connection {
     server: String,
     peer: Peer<RoleClient>,
     timeout: Duration,
+    secrets: Secrets,
 }
 
 impl Connection {
@@ -79,8 +81,20 @@ impl Connection {
     }
 
     /// Calls `tool` until it answers, `cancel` fires or `deadline` passes. The last two
-    /// send `notifications/cancelled` for the request.
+    /// send `notifications/cancelled` for the request. Credential values are redacted
+    /// from the output, whether it is a result or an error.
     pub(crate) async fn call(
+        &self,
+        tool: &str,
+        input: Value,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolOutput {
+        let output = self.call_unredacted(tool, input, cancel, deadline).await;
+        self.secrets.output(output)
+    }
+
+    async fn call_unredacted(
         &self,
         tool: &str,
         input: Value,
@@ -221,6 +235,7 @@ impl Server {
     ) -> Result<Arc<Self>> {
         validate_name(name)?;
         config.validate()?;
+        let secrets = Secrets::resolve(config, env);
         let changed = Arc::new(Notify::new());
         let handler = Handler {
             changed: changed.clone(),
@@ -256,6 +271,7 @@ impl Server {
                 server: name.to_owned(),
                 peer: service.peer().clone(),
                 timeout: config.tool_timeout(),
+                secrets: secrets.clone(),
             });
             // Servers without the tools capability contribute nothing.
             let tools = if info.capabilities.tools.is_some() {
@@ -277,10 +293,13 @@ impl Server {
                     Some(process) => process.kill().await,
                     None => String::new(),
                 };
-                if stderr.is_empty() {
-                    return Err(error);
-                }
-                return Err(anyhow!("{error:#} (stderr: {stderr})"));
+                let message = if stderr.is_empty() {
+                    format!("{error:#}")
+                } else {
+                    format!("{error:#} (stderr: {stderr})")
+                };
+                // Bodies, JSON-RPC errors and stderr can echo a credential back.
+                return Err(anyhow!(secrets.redact(&message)));
             }
         };
         let server = Arc::new(Self {

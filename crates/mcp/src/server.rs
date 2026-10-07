@@ -416,7 +416,13 @@ fn http_transport(
     if let Some(variable) = &config.bearer_token_env {
         transport = transport.auth_header(lookup(variable)?);
     }
-    let client = HttpClient(reqwest::Client::builder().build()?);
+    // Redirects are refused: following one would send env-sourced headers, and on a
+    // scheme downgrade the bearer token, to a location the config never named.
+    let client = HttpClient(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+    );
     Ok(StreamableHttpClientTransport::with_client(
         client, transport,
     ))

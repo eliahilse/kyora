@@ -202,3 +202,35 @@ async fn http_failures_are_startup_errors() {
     assert!(!message.contains("rmcp::"), "{message}");
     assert!(!message.contains(TOKEN), "{message}");
 }
+
+#[tokio::test]
+async fn redirects_are_refused_so_headers_stay_with_the_configured_origin() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(Fake)
+        .mount(&elsewhere)
+        .await;
+    let origin = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/mcp", elsewhere.uri())),
+        )
+        .mount(&origin)
+        .await;
+    let config = ServerConfig {
+        url: Some(format!("{}/mcp", origin.uri())),
+        bearer_token_env: Some("REMOTE_TOKEN".into()),
+        env_headers: BTreeMap::from([("X-Api-Key".into(), "REMOTE_KEY".into())]),
+        ..ServerConfig::default()
+    };
+    let env: Vec<(OsString, OsString)> = vec![
+        ("REMOTE_TOKEN".into(), TOKEN.into()),
+        ("REMOTE_KEY".into(), "test-only-header-key".into()),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let started = Server::start("remote", &config, dir.path(), &env).await;
+    assert!(started.is_err());
+    assert!(!origin.received_requests().await.unwrap().is_empty());
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+}

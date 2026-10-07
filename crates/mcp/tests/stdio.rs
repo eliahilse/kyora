@@ -437,6 +437,53 @@ async fn startup_failures_are_reported_and_other_servers_keep_running() {
 }
 
 #[tokio::test]
+async fn oversized_messages_and_listings_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = |name: &str| dir.path().join(format!("{name}.jsonl"));
+    let server = |mode: &str, page: &str| ServerConfig {
+        startup_timeout_s: Some(20.0),
+        ..server_config(
+            &log(mode),
+            &[("KYORA_MCP_TEST_MODE", mode), ("KYORA_MCP_TEST_PAGE", page)],
+        )
+    };
+    let config = McpConfig {
+        servers: BTreeMap::from([
+            ("flood".into(), server("flood", "2")),
+            ("many".into(), server("many", "600")),
+            ("bulky".into(), server("bulky", "1")),
+        ]),
+    };
+    let started = Instant::now();
+    let (servers, failures) = Servers::start_with_env(&config, dir.path(), &environment()).await;
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(servers.servers().is_empty());
+    let failures: Vec<_> = failures.iter().map(|e| format!("{e:#}")).collect();
+    let failure = |name: &str| {
+        failures
+            .iter()
+            .find(|f| f.starts_with(&format!("mcp server {name}: ")))
+            .unwrap_or_else(|| panic!("no failure for {name}: {failures:?}"))
+            .clone()
+    };
+    assert!(
+        failure("flood").contains("exceeded the 16777216 byte limit"),
+        "{failures:?}"
+    );
+    assert!(
+        failure("many").contains("more than 1024 tools"),
+        "{failures:?}"
+    );
+    assert!(
+        failure("bulky").contains("exceed 8388608 bytes"),
+        "{failures:?}"
+    );
+    for name in ["flood", "many", "bulky"] {
+        wait_gone(pid(&log(name))).await;
+    }
+}
+
+#[tokio::test]
 async fn list_changed_refreshes_the_tools_later_nodes_receive() {
     let dir = tempfile::tempdir().unwrap();
     let config = McpConfig {

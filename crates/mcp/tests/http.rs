@@ -269,3 +269,29 @@ async fn redirects_are_refused_so_headers_stay_with_the_configured_origin() {
     assert!(!origin.received_requests().await.unwrap().is_empty());
     assert!(elsewhere.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn oversized_http_bodies_are_refused() {
+    let mock = MockServer::start().await;
+    let huge = "x".repeat(17 * 1024 * 1024);
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": {"name": huge, "version": "1"},
+            },
+        })))
+        .mount(&mock)
+        .await;
+    let config = ServerConfig {
+        url: Some(mock.uri()),
+        ..ServerConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let started = Server::start("remote", &config, dir.path(), &[]).await;
+    let message = format!("{:#}", started.err().expect("oversized body accepted"));
+    assert!(message.contains("exceeds 16777216 bytes"), "{message}");
+}

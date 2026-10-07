@@ -29,7 +29,10 @@ use std::{
     collections::{BTreeSet, HashMap},
     ffi::OsString,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -69,6 +72,7 @@ pub(crate) struct Connection {
     peer: Peer<RoleClient>,
     timeout: Duration,
     secrets: Secrets,
+    oversized: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -154,14 +158,28 @@ impl Connection {
     fn failure(&self, error: ServiceError) -> ToolOutput {
         ToolOutput::error(match error {
             ServiceError::McpError(error) => format!("error {}: {}", error.code.0, error.message),
-            ServiceError::TransportClosed => {
-                format!("mcp server {} closed the connection", self.server)
-            }
+            ServiceError::TransportClosed => format!(
+                "mcp server {} closed the connection{}",
+                self.server,
+                limit_note(&self.oversized)
+            ),
             ServiceError::TransportSend(error) => {
                 format!("mcp server {}: {}", self.server, chain(&*error.error))
             }
             error => format!("mcp server {}: {error}", self.server),
         })
+    }
+}
+
+/// Explains a closed connection caused by an oversized message.
+fn limit_note(oversized: &AtomicBool) -> String {
+    if oversized.load(Ordering::SeqCst) {
+        format!(
+            ": a message exceeded the {} byte limit",
+            defaults::MAX_MESSAGE_BYTES
+        )
+    } else {
+        String::new()
     }
 }
 
@@ -241,6 +259,7 @@ impl Server {
             changed: changed.clone(),
         };
         let mut process = None;
+        let oversized = Arc::new(AtomicBool::new(false));
         let startup = config.startup_timeout();
         let started = tokio::time::timeout(startup, async {
             let service = if let Some(command) = &config.command {
@@ -248,7 +267,8 @@ impl Server {
                     .cwd
                     .as_ref()
                     .map_or_else(|| cwd.to_path_buf(), |dir| cwd.join(dir));
-                let (child, stdout, stdin) = Process::spawn(config, command, &dir, env)?;
+                let (child, stdout, stdin) =
+                    Process::spawn(config, command, &dir, env, oversized.clone())?;
                 process = Some(child);
                 handler
                     .serve((stdout, stdin))
@@ -256,7 +276,7 @@ impl Server {
                     .map_err(initialize_error)?
             } else {
                 handler
-                    .serve(http_transport(config, env)?)
+                    .serve(http_transport(config, env, oversized.clone())?)
                     .await
                     .map_err(initialize_error)?
             };
@@ -272,6 +292,7 @@ impl Server {
                 peer: service.peer().clone(),
                 timeout: config.tool_timeout(),
                 secrets: secrets.clone(),
+                oversized: oversized.clone(),
             });
             // Servers without the tools capability contribute nothing.
             let tools = if info.capabilities.tools.is_some() {
@@ -293,11 +314,10 @@ impl Server {
                     Some(process) => process.kill().await,
                     None => String::new(),
                 };
-                let message = if stderr.is_empty() {
-                    format!("{error:#}")
-                } else {
-                    format!("{error:#} (stderr: {stderr})")
-                };
+                let mut message = format!("{error:#}{}", limit_note(&oversized));
+                if !stderr.is_empty() {
+                    message.push_str(&format!(" (stderr: {stderr})"));
+                }
                 // Bodies, JSON-RPC errors and stderr can echo a credential back.
                 return Err(anyhow!(secrets.redact(&message)));
             }
@@ -374,6 +394,7 @@ impl Drop for Server {
 /// Follows `nextCursor` until the listing ends.
 async fn list(connection: &Arc<Connection>, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>> {
     let mut listed = Vec::new();
+    let mut bytes = 0;
     let mut cursor = None;
     for _ in 0..defaults::MAX_LIST_PAGES {
         let page = connection
@@ -381,7 +402,22 @@ async fn list(connection: &Arc<Connection>, config: &ServerConfig) -> Result<Vec
             .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
             .await
             .context("tools/list")?;
+        // Each page is bounded by the message limit; the listing as a whole by these.
+        bytes += page
+            .tools
+            .iter()
+            .map(|tool| serde_json::to_vec(tool).map_or(0, |json| json.len()))
+            .sum::<usize>();
         listed.extend(page.tools);
+        if listed.len() > defaults::MAX_TOOLS {
+            bail!("the server offers more than {} tools", defaults::MAX_TOOLS);
+        }
+        if bytes > defaults::MAX_LISTING_BYTES {
+            bail!(
+                "the server's tool definitions exceed {} bytes",
+                defaults::MAX_LISTING_BYTES
+            );
+        }
         match page.next_cursor {
             Some(next) if !next.is_empty() => cursor = Some(next),
             _ => {
@@ -406,6 +442,7 @@ async fn list(connection: &Arc<Connection>, config: &ServerConfig) -> Result<Vec
 fn http_transport(
     config: &ServerConfig,
     env: &[(OsString, OsString)],
+    oversized: Arc<AtomicBool>,
 ) -> Result<StreamableHttpClientTransport<HttpClient>> {
     let lookup = |variable: &str| {
         env.iter()
@@ -431,17 +468,18 @@ fn http_transport(
     let url = config.url.as_deref().expect("validated url");
     let mut transport = StreamableHttpClientTransportConfig::with_uri(url)
         .custom_headers(headers)
-        .max_sse_event_size(defaults::MAX_SSE_EVENT_BYTES);
+        .max_sse_event_size(defaults::MAX_MESSAGE_BYTES);
     if let Some(variable) = &config.bearer_token_env {
         transport = transport.auth_header(lookup(variable)?);
     }
     // Redirects are refused: following one would send env-sourced headers, and on a
     // scheme downgrade the bearer token, to a location the config never named.
-    let client = HttpClient(
-        reqwest::Client::builder()
+    let client = HttpClient {
+        http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
-    );
+        oversized,
+    };
     Ok(StreamableHttpClientTransport::with_client(
         client, transport,
     ))

@@ -3,6 +3,7 @@
 //! rmcp's bundled client is written against a newer reqwest with a different TLS
 //! stack. This adapter implements the transport's small client trait instead, so
 //! the binary keeps one HTTP and TLS implementation.
+use crate::defaults;
 use futures::{StreamExt, stream::BoxStream};
 use reqwest::{
     RequestBuilder, Response, StatusCode,
@@ -16,7 +17,14 @@ use rmcp::{
     },
 };
 use sse_stream::{Sse, SseStream};
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 const SESSION_ID: &str = "mcp-session-id";
 const LAST_EVENT_ID: &str = "last-event-id";
@@ -30,7 +38,11 @@ type Error = StreamableHttpError<reqwest::Error>;
 type Events = BoxStream<'static, Result<Sse, SseError>>;
 
 #[derive(Clone)]
-pub(crate) struct HttpClient(pub(crate) reqwest::Client);
+pub(crate) struct HttpClient {
+    pub(crate) http: reqwest::Client,
+    /// Set when a body or event outgrew its limit, to explain the failure.
+    pub(crate) oversized: Arc<AtomicBool>,
+}
 
 impl StreamableHttpClient for HttpClient {
     type Error = reqwest::Error;
@@ -49,7 +61,7 @@ impl StreamableHttpClient for HttpClient {
             session_id,
             auth_header,
             custom_headers,
-            crate::defaults::MAX_SSE_EVENT_BYTES,
+            defaults::MAX_MESSAGE_BYTES,
         )
         .await
     }
@@ -66,7 +78,7 @@ impl StreamableHttpClient for HttpClient {
         let attached = session_id.is_some();
         let expects_reply = matches!(message, JsonRpcMessage::Request(_));
         let request = self
-            .0
+            .http
             .post(uri.as_ref())
             .header(ACCEPT, ACCEPTS)
             .json(&message);
@@ -89,14 +101,18 @@ impl StreamableHttpClient for HttpClient {
             .map(str::to_owned);
         let kind = content_type(&response);
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let (body, whole) = read_body(response, defaults::ERROR_BODY_BYTES)
+                .await
+                .unwrap_or_default();
             // JSON-RPC errors sent with an HTTP error status still answer the request.
-            if kind.starts_with(JSON)
+            if whole
+                && kind.starts_with(JSON)
                 && let Ok(error @ JsonRpcMessage::Error(_)) =
-                    serde_json::from_str::<ServerJsonRpcMessage>(&body)
+                    serde_json::from_slice::<ServerJsonRpcMessage>(&body)
             {
                 return Ok(StreamableHttpPostResponse::Json(error, session));
             }
+            let body = String::from_utf8_lossy(&body);
             let excerpt: String = body.chars().take(BODY_EXCERPT).collect();
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                 format!("HTTP {status}: {}", excerpt.trim()),
@@ -104,12 +120,23 @@ impl StreamableHttpClient for HttpClient {
         }
         if kind.starts_with(EVENT_STREAM) {
             return Ok(StreamableHttpPostResponse::Sse(
-                events(response, max_sse_event_size),
+                events(response, max_sse_event_size, self.oversized.clone()),
                 session,
             ));
         }
         if kind.starts_with(JSON) {
-            let body = response.bytes().await.map_err(client_error)?;
+            let (body, whole) = read_body(response, defaults::MAX_MESSAGE_BYTES)
+                .await
+                .map_err(client_error)?;
+            if !whole {
+                self.oversized.store(true, Ordering::SeqCst);
+                return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                    format!(
+                        "response body exceeds {} bytes",
+                        defaults::MAX_MESSAGE_BYTES
+                    ),
+                )));
+            }
             return match serde_json::from_slice(&body) {
                 Ok(reply) => Ok(StreamableHttpPostResponse::Json(reply, session)),
                 // Notifications and replies need no answer; tolerate a stray body.
@@ -132,7 +159,7 @@ impl StreamableHttpClient for HttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), Error> {
-        let request = self.0.delete(uri.as_ref());
+        let request = self.http.delete(uri.as_ref());
         let response = headers(request, Some(session_id), auth_header, custom_headers)
             .send()
             .await
@@ -158,7 +185,7 @@ impl StreamableHttpClient for HttpClient {
             last_event_id,
             auth_header,
             custom_headers,
-            crate::defaults::MAX_SSE_EVENT_BYTES,
+            defaults::MAX_MESSAGE_BYTES,
         )
         .await
     }
@@ -172,7 +199,7 @@ impl StreamableHttpClient for HttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<Events, Error> {
-        let mut request = self.0.get(uri.as_ref()).header(ACCEPT, ACCEPTS);
+        let mut request = self.http.get(uri.as_ref()).header(ACCEPT, ACCEPTS);
         if let Some(id) = last_event_id {
             request = request.header(LAST_EVENT_ID, id);
         }
@@ -191,7 +218,7 @@ impl StreamableHttpClient for HttpClient {
                 (!kind.is_empty()).then_some(kind),
             ));
         }
-        Ok(events(response, max_sse_event_size))
+        Ok(events(response, max_sse_event_size, self.oversized.clone()))
     }
 }
 
@@ -239,12 +266,28 @@ fn content_type(response: &Response) -> String {
         .unwrap_or_default()
 }
 
+/// Reads at most `limit` bytes of the body; the flag is false when there was more.
+async fn read_body(
+    mut response: Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            body.extend_from_slice(&chunk[..limit - body.len()]);
+            return Ok((body, false));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, true))
+}
+
 /// Parses the body as SSE, failing once a single event grows past `limit` bytes.
-fn events(response: Response, limit: usize) -> Events {
+fn events(response: Response, limit: usize, oversized: Arc<AtomicBool>) -> Events {
     let mut size = 0usize;
     let mut line_start = true;
     let bytes = response.bytes_stream().map(move |chunk| {
-        let chunk = chunk.map_err(std::io::Error::other)?;
+        let chunk = chunk.map_err(|error| std::io::Error::other(error.without_url()))?;
         for &byte in chunk.iter() {
             match byte {
                 // A blank line ends the event.
@@ -255,6 +298,7 @@ fn events(response: Response, limit: usize) -> Events {
                     line_start = false;
                     size += 1;
                     if size > limit {
+                        oversized.store(true, Ordering::SeqCst);
                         return Err(std::io::Error::other("SSE event exceeds the size limit"));
                     }
                 }

@@ -13,10 +13,17 @@ pub const TERM_GRACE: Duration = Duration::from_secs(2);
 pub const CANCEL_NOTICE: Duration = Duration::from_secs(1);
 /// Bytes of server stderr kept for startup diagnostics.
 pub const STDERR_TAIL_BYTES: usize = 2048;
-/// Largest SSE event accepted from an HTTP server.
-pub const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// Largest single message accepted from a server: a stdio line, an HTTP JSON body or
+/// an SSE event.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Bytes of an HTTP error body read for diagnostics.
+pub const ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Upper bound on tools/list pages, against servers that never stop paging.
 pub const MAX_LIST_PAGES: usize = 100;
+/// Most tools one server may offer.
+pub const MAX_TOOLS: usize = 1024;
+/// Most bytes of serialized tool definitions one server may offer.
+pub const MAX_LISTING_BYTES: usize = 8 * 1024 * 1024;
 /// Provider limit on tool names (Anthropic and OpenAI both allow 64 characters).
 pub const MAX_TOOL_NAME: usize = 64;
 /// Longest accepted server name, so every tool keeps a readable suffix.

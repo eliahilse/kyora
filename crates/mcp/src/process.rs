@@ -13,12 +13,17 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     path::Path,
+    pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{self, Poll, ready},
     time::Duration,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt, ReadBuf},
     process::{Child, ChildStdin, ChildStdout, Command},
     task::JoinHandle,
 };
@@ -51,7 +56,8 @@ impl Process {
         command: &str,
         cwd: &Path,
         env: &[(OsString, OsString)],
-    ) -> Result<(Self, ChildStdout, ChildStdin)> {
+        oversized: Arc<AtomicBool>,
+    ) -> Result<(Self, BoundedLines<ChildStdout>, ChildStdin)> {
         let mut cmd = Command::new(command);
         cmd.args(&config.args)
             .current_dir(cwd)
@@ -71,7 +77,11 @@ impl Process {
             .lock()
             .expect("server registry poisoned")
             .insert(group.as_raw());
-        let stdout = child.stdout.take().expect("piped stdout");
+        let stdout = BoundedLines {
+            inner: child.stdout.take().expect("piped stdout"),
+            line: 0,
+            exceeded: oversized,
+        };
         let stdin = child.stdin.take().expect("piped stdin");
         let mut pipe = child.stderr.take().expect("piped stderr");
         let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -133,6 +143,49 @@ impl Drop for Process {
             .lock()
             .expect("server registry poisoned")
             .remove(&self.group.as_raw());
+    }
+}
+
+/// Server stdout that fails once one line outgrows [`defaults::MAX_MESSAGE_BYTES`], so
+/// a server cannot make the line reader buffer without bound.
+pub(crate) struct BoundedLines<R> {
+    inner: R,
+    line: usize,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for BoundedLines<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let start = buf.filled().len();
+        ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        let fresh = &buf.filled()[start..];
+        let longest = match (
+            fresh.iter().position(|&b| b == b'\n'),
+            fresh.iter().rposition(|&b| b == b'\n'),
+        ) {
+            (Some(first), Some(last)) => {
+                let longest = this.line + first;
+                this.line = fresh.len() - last - 1;
+                longest.max(this.line)
+            }
+            _ => {
+                this.line += fresh.len();
+                this.line
+            }
+        };
+        if longest > defaults::MAX_MESSAGE_BYTES {
+            this.exceeded.store(true, Ordering::SeqCst);
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "message exceeds the size limit",
+            )));
+        }
+        Poll::Ready(Ok(()))
     }
 }
 

@@ -1,8 +1,8 @@
 //! Scripted MCP server for the kyora-mcp tests: newline-delimited JSON-RPC on stdio.
 //!
 //! KYORA_MCP_TEST_LOG appends every received message (and the pid) as JSON lines.
-//! KYORA_MCP_TEST_MODE selects a startup failure (exit, hang, bad-version, no-tools) or
-//! linger, which keeps running after stdin closes.
+//! KYORA_MCP_TEST_MODE selects a startup failure (exit, hang, bad-version, no-tools,
+//! flood, many, bulky) or linger, which keeps running after stdin closes.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
 use serde_json::{Value, json};
 use std::{
@@ -62,6 +62,12 @@ fn main() {
         let params = &message["params"];
         match message["method"].as_str().unwrap_or_default() {
             "initialize" if mode == "hang" => {}
+            "initialize" if mode == "flood" => {
+                // One line longer than any message limit, never terminated.
+                let mut out = out.lock().unwrap();
+                let _ = out.write_all(&vec![b'a'; 17 * 1024 * 1024]);
+                let _ = out.flush();
+            }
             "initialize" => {
                 let version = if mode == "bad-version" {
                     json!("1999-01-01")
@@ -91,7 +97,7 @@ fn main() {
             }
             "ping" => reply(&out, &id, json!({})),
             "tools/list" => {
-                let tools = tools(added.load(Ordering::SeqCst));
+                let tools = tools(&mode, added.load(Ordering::SeqCst));
                 let start: usize = params["cursor"]
                     .as_str()
                     .and_then(|cursor| cursor.parse().ok())
@@ -183,8 +189,19 @@ fn main() {
     }
 }
 
-fn tools(added: bool) -> Vec<Value> {
+fn tools(mode: &str, added: bool) -> Vec<Value> {
     let object = json!({"type": "object"});
+    if mode == "many" {
+        return (0..=1024)
+            .map(|i| json!({"name": format!("t{i}"), "inputSchema": object}))
+            .collect();
+    }
+    if mode == "bulky" {
+        let description = "x".repeat(3 * 1024 * 1024);
+        return (0..3)
+            .map(|i| json!({"name": format!("t{i}"), "description": description, "inputSchema": object}))
+            .collect();
+    }
     let mut tools = vec![
         json!({"name": "echo", "description": "Echo text.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         json!({"name": "fail", "inputSchema": object}),

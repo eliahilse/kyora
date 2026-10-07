@@ -40,6 +40,7 @@ fn environment() -> Vec<(OsString, OsString)> {
         ("KYORA_TEST_FORWARD", "forwarded"),
         ("KYORA_TEST_UNLISTED", "dropped"),
         ("KYORA_MCP_TEST_SECRET", STDIO_SECRET),
+        ("KYORA_TEST_SHORT", "abc"),
     ] {
         env.push((name.into(), value.into()));
     }
@@ -341,7 +342,7 @@ async fn environment_and_working_directory_are_controlled() {
             ("KYORA_MCP_TEST_EXTRA_DESCRIPTION", "Uses forwarded."),
         ],
     );
-    config.env_vars = vec!["KYORA_TEST_FORWARD".into()];
+    config.env_vars = vec!["KYORA_TEST_FORWARD".into(), "KYORA_TEST_SHORT".into()];
     config.cwd = Some("sub".into());
     let server = start(dir.path(), &config).await;
     let names = [
@@ -359,8 +360,14 @@ async fn environment_and_working_directory_are_controlled() {
     let mut seen: Vec<_> = vars.keys().map(String::as_str).collect();
     seen.sort_unstable();
     assert_eq!(seen, ["KYORA_TEST_FORWARD", "MODE", "PATH"]);
-    // Forwarded values count as credentials and never reach the model.
+    // Forwarded values count as credentials and never reach the model, unless they
+    // are too short to redact without shredding the output, which is reported.
     assert_eq!(vars["KYORA_TEST_FORWARD"], kyora_mcp::REDACTED);
+    let warnings = server.warnings();
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("KYORA_TEST_SHORT"),
+        "{warnings:?}"
+    );
     let described = server
         .tools()
         .into_iter()

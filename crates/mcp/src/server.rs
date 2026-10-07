@@ -267,6 +267,8 @@ pub struct Server {
     process: Mutex<Option<Process>>,
     http: Option<HttpClient>,
     closed: CancellationToken,
+    /// Startup notes, such as credential values too short to redact.
+    notes: Vec<String>,
 }
 
 impl Server {
@@ -374,6 +376,7 @@ impl Server {
             service: Mutex::new(Some(service)),
             process: Mutex::new(process),
             http: http.map(|(client, _)| client),
+            notes: secrets.warnings(),
             closed: CancellationToken::new(),
         });
         tokio::spawn(refresh(
@@ -400,14 +403,15 @@ impl Server {
             .clone()
     }
 
-    /// Problems with the current tool list, such as tools left out because their
-    /// names collide.
+    /// Problems worth reporting: credential values too short to redact, and tools
+    /// left out of the current list, for example because their names collide.
     pub fn warnings(&self) -> Vec<String> {
-        self.listing
-            .read()
-            .expect("tool list poisoned")
-            .warnings
-            .clone()
+        let listing = self.listing.read().expect("tool list poisoned");
+        self.notes
+            .iter()
+            .chain(&listing.warnings)
+            .cloned()
+            .collect()
     }
 
     /// Calls a tool by its server-side name with the configured timeout.

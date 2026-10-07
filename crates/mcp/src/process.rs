@@ -3,6 +3,7 @@
 use crate::{
     config::{ServerConfig, credential},
     defaults,
+    secrets::Secrets,
 };
 use anyhow::{Context, Result, anyhow};
 use nix::{
@@ -45,8 +46,16 @@ pub fn kill_servers() {
 pub(crate) struct Process {
     child: Child,
     group: Pid,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Tail>>,
+    slack: usize,
     drain: Option<JoinHandle<()>>,
+}
+
+/// The last stderr bytes, and whether earlier ones were discarded.
+#[derive(Default)]
+struct Tail {
+    bytes: Vec<u8>,
+    cut: bool,
 }
 
 impl Process {
@@ -57,6 +66,7 @@ impl Process {
         cwd: &Path,
         env: &[(OsString, OsString)],
         oversized: Arc<AtomicBool>,
+        secrets: &Secrets,
     ) -> Result<(Self, BoundedLines<ChildStdout>, ChildStdin)> {
         let mut cmd = Command::new(command);
         cmd.args(&config.args)
@@ -84,21 +94,29 @@ impl Process {
         };
         let stdin = child.stdin.take().expect("piped stdin");
         let mut pipe = child.stderr.take().expect("piped stderr");
-        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Tail::default()));
         let tail = stderr.clone();
+        // Room in front of the tail for the longest credential value, so a value cut
+        // by the ring's start can still be recognized and dropped.
+        let slack = secrets.longest();
+        let capacity = defaults::STDERR_TAIL_BYTES + slack;
         let drain = tokio::spawn(async move {
             let mut chunk = [0; 1024];
             while let Ok(read @ 1..) = pipe.read(&mut chunk).await {
                 let mut tail = tail.lock().expect("stderr tail poisoned");
-                tail.extend_from_slice(&chunk[..read]);
-                let excess = tail.len().saturating_sub(defaults::STDERR_TAIL_BYTES);
-                tail.drain(..excess);
+                tail.bytes.extend_from_slice(&chunk[..read]);
+                let excess = tail.bytes.len().saturating_sub(capacity);
+                if excess > 0 {
+                    tail.bytes.drain(..excess);
+                    tail.cut = true;
+                }
             }
         });
         let process = Self {
             child,
             group,
             stderr,
+            slack,
             drain: Some(drain),
         };
         Ok((process, stdout, stdin))
@@ -123,8 +141,9 @@ impl Process {
         // Drop kills anything the server left behind in its group.
     }
 
-    /// Kills the group and returns the last stderr output, for startup failures.
-    pub(crate) async fn kill(mut self) -> String {
+    /// Kills the group and returns the last stderr output, redacted, for startup
+    /// failures.
+    pub(crate) async fn kill(mut self, secrets: &Secrets) -> String {
         let _ = killpg(self.group, Signal::SIGKILL);
         let _ = self.child.wait().await;
         if let Some(drain) = self.drain.take() {
@@ -132,7 +151,24 @@ impl Process {
             let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
         }
         let tail = self.stderr.lock().expect("stderr tail poisoned");
-        String::from_utf8_lossy(&tail).trim().to_owned()
+        // After a cut, skip a split character so byte offsets stay aligned.
+        let start = match tail.cut {
+            true => tail
+                .bytes
+                .iter()
+                .take(3)
+                .take_while(|&&byte| (0x80..0xC0).contains(&byte))
+                .count(),
+            false => 0,
+        };
+        let text = String::from_utf8_lossy(&tail.bytes[start..]);
+        // Redact before cutting: the slack may start inside a value.
+        let from = if tail.cut {
+            self.slack.saturating_sub(start)
+        } else {
+            0
+        };
+        secrets.redact_from(&text, from).trim().to_owned()
     }
 }
 

@@ -236,6 +236,21 @@ async fn http_failures_are_startup_errors() {
     assert!(message.contains(kyora_mcp::REDACTED), "{message}");
     assert!(!message.contains(TOKEN), "{message}");
     assert!(!message.contains(&echoing.uri()), "{message}");
+
+    // The excerpt is cut after redaction, so a value at the cut leaves nothing behind.
+    let cut = MockServer::start().await;
+    let body = format!("{}{TOKEN}", "x".repeat(190));
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500).set_body_string(body))
+        .mount(&cut)
+        .await;
+    let config = ServerConfig {
+        url: Some(cut.uri()),
+        ..config
+    };
+    let refused = Server::start("remote", &config, dir.path(), &env).await;
+    let message = format!("{:#}", refused.err().unwrap());
+    assert!(!message.contains(&TOKEN[..10]), "{message}");
 }
 
 #[tokio::test]

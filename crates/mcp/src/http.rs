@@ -5,7 +5,7 @@
 //! the binary keeps one HTTP and TLS implementation. It also owns every request it
 //! sends: all of them can be cancelled at once, wait at most a bounded time for a
 //! response, and the session the server assigned is remembered until it is deleted.
-use crate::defaults;
+use crate::{defaults, secrets::Secrets};
 use futures::{StreamExt, stream::BoxStream};
 use reqwest::{
     RequestBuilder, Response, StatusCode,
@@ -54,6 +54,8 @@ struct Shared {
     timeout: Duration,
     /// Set when a body or event outgrew its limit, to explain the failure.
     oversized: Arc<AtomicBool>,
+    /// Redacts error bodies before they are shortened to an excerpt.
+    secrets: Secrets,
     /// What a DELETE of a leftover session needs.
     uri: Arc<str>,
     auth_header: Option<String>,
@@ -67,6 +69,7 @@ impl HttpClient {
         http: reqwest::Client,
         timeout: Duration,
         oversized: Arc<AtomicBool>,
+        secrets: Secrets,
         uri: Arc<str>,
         auth_header: Option<String>,
         headers: HashMap<HeaderName, HeaderValue>,
@@ -75,6 +78,7 @@ impl HttpClient {
             cancel: CancellationToken::new(),
             timeout,
             oversized,
+            secrets,
             uri,
             auth_header,
             headers,
@@ -239,7 +243,8 @@ impl StreamableHttpClient for HttpClient {
             {
                 return Ok(StreamableHttpPostResponse::Json(error, session));
             }
-            let body = String::from_utf8_lossy(&body);
+            // Redact the whole bounded body first: cutting first could split a value.
+            let body = self.shared.secrets.redact(&String::from_utf8_lossy(&body));
             let excerpt: String = body.chars().take(BODY_EXCERPT).collect();
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                 format!("HTTP {status}: {}", excerpt.trim()),

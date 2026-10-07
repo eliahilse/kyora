@@ -78,16 +78,32 @@ impl Secrets {
             .collect()
     }
 
+    /// Length in bytes of the longest value.
+    pub(crate) fn longest(&self) -> usize {
+        self.0.values.first().map_or(0, String::len)
+    }
+
     /// Replaces every value in one pass over `text`. Placeholders are never scanned
     /// again, so the output grows by at most the placeholder per matched value.
     pub(crate) fn redact(&self, text: &str) -> String {
+        self.redact_from(text, 0)
+    }
+
+    /// Like [`Self::redact`], but keeps only what follows byte `from`. Values are
+    /// matched in the whole text, so one that straddles `from` is still replaced
+    /// instead of leaving its tail behind.
+    pub(crate) fn redact_from(&self, text: &str, from: usize) -> String {
+        let mut from = from.min(text.len());
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
         let patterns = &self.0;
         if patterns.values.is_empty() {
-            return text.to_owned();
+            return text[from..].to_owned();
         }
         let bytes = text.as_bytes();
-        let mut out = String::with_capacity(text.len());
-        let (mut copied, mut at) = (0, 0);
+        let mut out = String::with_capacity(text.len() - from);
+        let (mut copied, mut at) = (from, 0);
         while at < bytes.len() {
             if patterns.first[usize::from(bytes[at])]
                 && let Some(value) = patterns
@@ -96,10 +112,13 @@ impl Secrets {
                     .find(|value| bytes[at..].starts_with(value.as_bytes()))
             {
                 // Values are valid UTF-8, so a match starts and ends on char boundaries.
-                out.push_str(&text[copied..at]);
-                out.push_str(REDACTED);
-                at += value.len();
-                copied = at;
+                let end = at + value.len();
+                if end > from {
+                    out.push_str(&text[copied.max(from)..at.max(from)]);
+                    out.push_str(REDACTED);
+                }
+                at = end;
+                copied = end.max(from);
             } else {
                 at += 1;
             }
@@ -197,6 +216,19 @@ mod tests {
         let mut value = serde_json::json!({"nested": ["pa\"ss\\word"]});
         secrets.redact_json(&mut value);
         assert_eq!(value, serde_json::json!({"nested": ["[redacted]"]}));
+    }
+
+    #[test]
+    fn a_value_straddling_the_cut_is_replaced_whole() {
+        let secrets = secrets(&["0123456789"]);
+        let text = "xx0123456789yy";
+        assert_eq!(secrets.redact_from(text, 0), "xx[redacted]yy");
+        assert_eq!(secrets.redact_from(text, 6), "[redacted]yy");
+        assert_eq!(secrets.redact_from(text, 11), "[redacted]yy");
+        // A value that ends at the cut has nothing left to replace.
+        assert_eq!(secrets.redact_from(text, 12), "yy");
+        assert_eq!(secrets.redact_from(text, 13), "y");
+        assert_eq!(secrets.redact_from("ü0123456789", 1), "[redacted]");
     }
 
     #[test]

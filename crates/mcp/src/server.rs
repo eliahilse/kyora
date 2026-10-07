@@ -296,7 +296,12 @@ impl Server {
         let mut process = None;
         let oversized = Arc::new(AtomicBool::new(false));
         let http = match &config.url {
-            Some(_) => Some(http_client(config, env, oversized.clone())?),
+            Some(_) => Some(http_client(
+                config,
+                env,
+                oversized.clone(),
+                secrets.clone(),
+            )?),
             None => None,
         };
         let startup = config.startup_timeout();
@@ -307,7 +312,7 @@ impl Server {
                     .as_ref()
                     .map_or_else(|| cwd.to_path_buf(), |dir| cwd.join(dir));
                 let (child, stdout, stdin) =
-                    Process::spawn(config, command, &dir, env, oversized.clone())?;
+                    Process::spawn(config, command, &dir, env, oversized.clone(), &secrets)?;
                 process = Some(child);
                 handler
                     .serve((stdout, stdin))
@@ -359,7 +364,7 @@ impl Server {
                     _ => anyhow!("startup timed out after {startup:?}"),
                 };
                 let stderr = match process {
-                    Some(process) => process.kill().await,
+                    Some(process) => process.kill(&secrets).await,
                     None => String::new(),
                 };
                 // rmcp leaves startup requests running and sessions open on failure.
@@ -583,6 +588,7 @@ fn http_client(
     config: &ServerConfig,
     env: &[(OsString, OsString)],
     oversized: Arc<AtomicBool>,
+    secrets: Secrets,
 ) -> Result<(HttpClient, StreamableHttpClientTransportConfig)> {
     let lookup = |variable: &str| {
         env.iter()
@@ -624,7 +630,7 @@ fn http_client(
         .build()?;
     // A response may take as long as the slowest call or listing it answers.
     let timeout = config.startup_timeout().max(config.tool_timeout());
-    let client = HttpClient::new(http, timeout, oversized, url, auth_header, headers);
+    let client = HttpClient::new(http, timeout, oversized, secrets, url, auth_header, headers);
     Ok((client, transport))
 }
 

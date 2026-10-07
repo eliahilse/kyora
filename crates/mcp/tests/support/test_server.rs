@@ -1,8 +1,8 @@
 //! Scripted MCP server for the kyora-mcp tests: newline-delimited JSON-RPC on stdio.
 //!
 //! KYORA_MCP_TEST_LOG appends every received message (and the pid) as JSON lines.
-//! KYORA_MCP_TEST_MODE selects a startup failure (exit, hang, bad-version, no-tools,
-//! flood, many, bulky), linger, which keeps running after stdin closes, or stall-list,
+//! KYORA_MCP_TEST_MODE selects a startup failure (exit, spill, hang, bad-version,
+//! no-tools, flood, many, bulky), linger, which keeps running after stdin closes, or stall-list,
 //! which stops answering tools/list once the notify tool has run.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
 //! KYORA_MCP_TEST_EXTRA_TOOL adds a tool with that name, which echoes its arguments;
@@ -44,6 +44,12 @@ fn main() {
     };
     record(&json!({"pid": std::process::id()}));
     eprintln!("test server starting");
+    if mode == "spill" {
+        // A secret followed by just enough output to push its start out of a tail.
+        let secret = std::env::var("KYORA_MCP_TEST_SECRET").unwrap_or_default();
+        eprint!("{secret}{}", "y".repeat(2048 - 8));
+        std::process::exit(2);
+    }
     if mode == "exit" {
         let secret = std::env::var("KYORA_MCP_TEST_SECRET").unwrap_or_default();
         eprintln!("fatal: refusing to start with secret {secret}");

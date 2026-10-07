@@ -510,6 +510,26 @@ async fn shutdown_kills_a_server_that_also_ignores_sigterm() {
 }
 
 #[tokio::test]
+async fn a_credential_cut_by_the_stderr_tail_is_still_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig {
+        env_vars: vec!["KYORA_MCP_TEST_SECRET".into()],
+        ..server_config(
+            &dir.path().join("log.jsonl"),
+            &[("KYORA_MCP_TEST_MODE", "spill")],
+        )
+    };
+    let failed = Server::start("fake", &config, dir.path(), &environment()).await;
+    let message = format!("{:#}", failed.err().expect("spill mode fails"));
+    assert!(message.contains("yyyy"), "{message}");
+    // The last 8 characters are all a 2048 byte tail would keep of the value.
+    assert!(
+        !message.contains(&STDIO_SECRET[STDIO_SECRET.len() - 8..]),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn startup_failures_are_reported_and_other_servers_keep_running() {
     let dir = tempfile::tempdir().unwrap();
     let log = |name: &str| dir.path().join(format!("{name}.jsonl"));

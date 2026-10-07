@@ -1207,30 +1207,37 @@ async fn leaf_owner_cancelled_before_its_task_starts_dispatches_nothing() {
 }
 
 #[tokio::test]
-async fn ancestor_shutdown_stops_a_queued_cell_owned_grandchild() {
-    // The child queues a grandchild with an independent cell token while it is
-    // inside a started mutating tool. The parent is woken first, finishes and
-    // cancels the child; the grandchild's task only starts afterwards.
-    let woken = Arc::new(tokio::sync::Notify::new());
-    let wake = woken.clone();
+async fn ancestor_cancellation_stops_a_queued_cell_owned_grandchild() {
+    // From inside a started mutating tool, the child queues a grandchild with an
+    // independent cell token and, in the same step, cancels the root's node token
+    // as the root's shutdown does. Nothing can run in between, so the grandchild's
+    // task provably starts only after its ancestor was cancelled, and it starts
+    // while the child is still finishing its tool, before the child's own shutdown.
+    let root = Arc::new(Mutex::new(None::<NodeCtx>));
+    let slot = root.clone();
     let spawn = tool(move |_, cx| {
-        let woken = wake.clone();
+        let root = slot.clone();
         async move {
             if cx.node.depth == 0 {
+                *root.lock().unwrap() = Some(cx.node.clone());
                 cx.node
                     .spawn_agent(ChildSpec::new("child task"), Owner::Node)
                     .unwrap();
-                woken.notified().await;
-                return finish();
+            } else {
+                cx.node
+                    .spawn_agent(
+                        ChildSpec::new("grandchild"),
+                        Owner::Cell(CancellationToken::new()),
+                    )
+                    .unwrap();
+                root.lock().unwrap().as_ref().unwrap().cancel.cancel();
+                // A started mutation finishes its cleanup after the cancellation.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                return ToolOutput::text("cleaned up");
             }
-            woken.notify_one();
-            cx.node
-                .spawn_agent(
-                    ChildSpec::new("grandchild"),
-                    Owner::Cell(CancellationToken::new()),
-                )
+            tokio::time::timeout(Duration::from_secs(10), cx.cancel.cancelled())
+                .await
                 .unwrap();
-            cx.cancel.cancelled().await;
             ToolOutput::text("cancelled")
         }
     });
@@ -1247,7 +1254,7 @@ async fn ancestor_shutdown_stops_a_queued_cell_owned_grandchild() {
         Limits::default(),
         trace,
     );
-    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Cancelled);
     assert_eq!(*provider.dispatched.lock().unwrap(), vec!["0", "1"]);
     let live = records(rx);
     assert!(

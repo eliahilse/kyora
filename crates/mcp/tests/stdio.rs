@@ -924,6 +924,8 @@ async fn valid_inputs_outside_the_local_schema_subset_reach_the_server() {
     let (servers, _) = Servers::start_with_env(&config, dir.path(), &environment()).await;
     let servers = Arc::new(servers);
     let input = json!({"v": null, "u": 3, "x": 1.0, "c": null, "p_extra": 2});
+    // Core's own subset would refuse this input before the server saw it.
+    assert!(kyora_core::tool::validate(&schema, &input).is_err());
     let (runtime, trace) = scripted(
         McpToolsets::new(&Toolset::default(), servers.clone()),
         "mcp__fake__schema",
@@ -984,8 +986,16 @@ impl Tool for Spawner {
 #[tokio::test]
 async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
     let dir = tempfile::tempdir().unwrap();
-    // The child's input uses a null type, which core's schema subset would reject.
-    let schema = json!({"type": "object", "properties": {"v": {"type": "null"}}});
+    // Valid JSON Schema input that core's subset refuses: an integer written as 1.0,
+    // and a key allowed by patternProperties next to additionalProperties false.
+    let schema = json!({
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "patternProperties": {"^p_": {"type": "integer"}},
+        "additionalProperties": false,
+    });
+    let input = json!({"count": 1.0, "p_extra": 2});
+    assert!(kyora_core::tool::validate(&schema, &input).is_err());
     let config = McpConfig {
         servers: BTreeMap::from([(
             "fake".into(),
@@ -1004,7 +1014,8 @@ async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
     let mut base_tools = kyora_core::agent_tools::tools();
     base_tools.push(Arc::new(Spawner));
     let base = Toolset::new(base_tools).unwrap();
-    let provider = FnProvider::new(|request: &ModelRequest| {
+    let child_input = input.clone();
+    let provider = FnProvider::new(move |request: &ModelRequest| {
         let call = |name: &str, input: Value| ContentBlock::ToolUse {
             id: "call".into(),
             name: name.into(),
@@ -1012,7 +1023,7 @@ async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
         };
         let content = match (request.messages.len(), request.messages[0].text().as_str()) {
             (1, "task") => vec![call("spawner", json!({}))],
-            (1, "use mcp") => vec![call("mcp__fake__schema", json!({"v": null}))],
+            (1, "use mcp") => vec![call("mcp__fake__schema", child_input.clone())],
             _ => vec![ContentBlock::Text {
                 text: "done".into(),
             }],
@@ -1081,10 +1092,7 @@ async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
     );
     let (content, is_error) = &results[with_mcp[0]];
     assert!(!is_error, "{content}");
-    assert_eq!(
-        serde_json::from_str::<Value>(content).unwrap(),
-        json!({"v": null})
-    );
+    assert_eq!(serde_json::from_str::<Value>(content).unwrap(), input);
     servers.shutdown().await;
 }
 

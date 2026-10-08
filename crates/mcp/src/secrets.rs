@@ -49,6 +49,12 @@ impl Secrets {
             if escaped != value {
                 values.push(escaped.to_owned());
             }
+            // ASCII-only encoders, such as Python's json by default, write every other
+            // character as \uXXXX, in either case.
+            if !value.is_ascii() {
+                values.push(ascii_escaped(escaped, false));
+                values.push(ascii_escaped(escaped, true));
+            }
             values.push(value);
         }
         values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
@@ -187,6 +193,25 @@ impl Secrets {
     }
 }
 
+/// `escaped` with every non-ASCII character as JSON `\uXXXX` UTF-16 units.
+fn ascii_escaped(escaped: &str, upper: bool) -> String {
+    let mut out = String::with_capacity(escaped.len() * 2);
+    for c in escaped.chars() {
+        if c.is_ascii() {
+            out.push(c);
+            continue;
+        }
+        for unit in c.encode_utf16(&mut [0; 2]) {
+            out.push_str(&if upper {
+                format!("\\u{unit:04X}")
+            } else {
+                format!("\\u{unit:04x}")
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +299,18 @@ mod tests {
             value,
             serde_json::json!({"pin": "[redacted]", "longer": "[redacted]", "small": 42})
         );
+    }
+
+    #[test]
+    fn unicode_escaped_values_are_redacted_in_text() {
+        let secrets = secrets(&["pässwörd", "key-\u{1f600}-value"]);
+        for text in [
+            r#"{"p":"p\u00e4ssw\u00f6rd"}"#,
+            r#"{"p":"p\u00E4ssw\u00F6rd"}"#,
+            r#"{"p":"key-\ud83d\ude00-value"}"#,
+        ] {
+            assert_eq!(secrets.redact(text), r#"{"p":"[redacted]"}"#, "{text}");
+        }
     }
 
     #[test]

@@ -925,6 +925,8 @@ async fn cell_owned_children_post_no_notice_and_node_owned_cancellation_is_repor
         assert_eq!(waited.running, vec![persistent.id]);
         cell.cancel();
         assert_eq!(scoped.result().await.status, Status::Cancelled);
+        // The cell-owned child ended without posting a notice of its own.
+        assert_eq!(cx.node.pending_messages(), 0);
         persistent.cancel();
         let waited = cx
             .node
@@ -961,16 +963,21 @@ async fn cell_owned_children_post_no_notice_and_node_owned_cancellation_is_repor
     assert_eq!((outcome.status, outcome.turns), (Status::Completed, 2));
     let live = records(rx);
     let messages = sent(&live);
+    // The node-owned child's notice, then the one wait queued to report the
+    // cell-owned child, both taken by that wait.
     assert_eq!(
         messages
             .iter()
             .map(|m| (m.from, m.kind, m.status))
             .collect::<Vec<_>>(),
-        vec![(2, MessageKind::Cancelled, Some(Status::Cancelled))]
+        vec![
+            (2, MessageKind::Cancelled, Some(Status::Cancelled)),
+            (1, MessageKind::Cancelled, Some(Status::Cancelled)),
+        ]
     );
     assert_eq!(
         delivered(&live),
-        vec![(0, vec![messages[0].id], Delivery::Wait)]
+        vec![(0, vec![messages[0].id, messages[1].id], Delivery::Wait)]
     );
     assert!(undelivered(&live).is_empty());
     assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
@@ -2800,4 +2807,96 @@ async fn a_panicking_trace_store_fails_the_run() {
     let runtime = setup(provider, idle_tool(), Limits::default(), trace.clone());
     assert!(runtime.run(spec()).await.is_err());
     assert!(trace.finish().await.is_err());
+}
+
+#[tokio::test]
+async fn a_deferred_cell_owned_outcome_follows_its_messages() {
+    let cell = Arc::new(Mutex::new(None));
+    let kept = cell.clone();
+    let python = tool(move |_, cx| {
+        let kept = kept.clone();
+        async move {
+            let token = CancellationToken::new();
+            cx.node
+                .spawn_agent(
+                    ChildSpec {
+                        name: Some("cell".into()),
+                        ..ChildSpec::new("cell task")
+                    },
+                    Owner::Cell(token.clone()),
+                )
+                .unwrap();
+            *kept.lock().unwrap() = Some(token);
+            ToolOutput::text("spawned")
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call("python", json!({})),
+                    call("cancel_agent", json!({"to": "cell"})),
+                    text("reading"),
+                    text("still reading"),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "cell task",
+                1,
+                vec![calls(vec![
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('1')}),
+                    ),
+                    (
+                        "send_message",
+                        json!({"to": "parent", "body": progress('2')}),
+                    ),
+                ])],
+            ),
+        ],
+        vec![
+            (at("cell task", 0), at("root task", 1)),
+            (at("root task", 1), at("cell task", 1)),
+            (at("cell task", 1), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        python,
+        Limits {
+            delivery_chars: 100,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    let outcome = runtime.run(spec()).await.unwrap();
+    assert_eq!((outcome.status, outcome.turns), (Status::Completed, 5));
+    let line = |digit| format!("[message from agent 1 (cell)]\n{}", progress(digit));
+    // A cell-owned child posts no notice of its own, so one is queued behind its
+    // messages when they do not all fit; its outcome then follows them.
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(
+            format!(
+                "{}\n\nagent 1 finished, but 2 of its messages, its notice last, did not fit; they follow at your next turn",
+                line('1')
+            ),
+            false
+        )]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 3))),
+        vec![
+            line('2'),
+            "[1 more message waiting; it follows at your next turn]".into(),
+        ]
+    );
+    assert_eq!(
+        texts(&last(&provider.request("root task", 4))),
+        vec!["[cancelled from agent 1 (cell): cancelled]"]
+    );
 }

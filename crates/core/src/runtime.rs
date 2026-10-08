@@ -183,7 +183,7 @@ pub struct Runtime(Arc<RuntimeInner>);
 struct Work {
     closed: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Turns true once this node's latest delivery record is written.
+    /// Turns true once this node's latest message record is written.
     recorded: Option<watch::Receiver<bool>>,
     /// Turns true once this node's latest accepted send is queued or refused.
     sent: Option<watch::Receiver<bool>>,
@@ -993,16 +993,7 @@ impl Runtime {
     }
     /// Posts a node-owned child's terminal notice to its parent's mailbox.
     async fn notify(&self, parent: NodeId, mailbox: &Mailbox, outcome: &AgentOutcome) {
-        let message = Envelope {
-            id: self.next_message(),
-            from: outcome.node,
-            to: parent,
-            kind: MessageKind::for_status(outcome.status),
-            body: truncate(&outcome.answer.text(), self.0.config.limits.message_chars),
-            sent_at: chrono::Utc::now(),
-            spawn: Some(outcome.node),
-            status: Some(outcome.status),
-        };
+        let message = self.notice(parent, outcome);
         if !mailbox.is_closed() {
             let _ = self
                 .emit(TraceEvent::MessageSent {
@@ -1012,6 +1003,19 @@ impl Runtime {
         }
         if let Err(message) = mailbox.push(message) {
             self.undelivered(message).await;
+        }
+    }
+    /// The terminal notice reporting a child's outcome to its parent.
+    fn notice(&self, parent: NodeId, outcome: &AgentOutcome) -> Envelope {
+        Envelope {
+            id: self.next_message(),
+            from: outcome.node,
+            to: parent,
+            kind: MessageKind::for_status(outcome.status),
+            body: truncate(&outcome.answer.text(), self.0.config.limits.message_chars),
+            sent_at: chrono::Utc::now(),
+            spawn: Some(outcome.node),
+            status: Some(outcome.status),
         }
     }
     async fn emit_error(&self, node: NodeId, error: &CallError) -> Result<()> {
@@ -1731,6 +1735,22 @@ impl NodeCtx {
         let batch = {
             let mut work = self.state.work.lock().expect("node work mutex poisoned");
             self.check_open(&work)?;
+            // A cell-owned child posts no notice of its own. Reporting it queues one,
+            // once, behind its messages, so its outcome follows the same order and
+            // budget as any notice, and a deferred outcome is not lost.
+            for id in &done {
+                if self.state.mailbox.is_concluded(*id) {
+                    continue;
+                }
+                let outcome = children[id]
+                    .borrow()
+                    .clone()
+                    .expect("finished child has an outcome");
+                let notice = self.runtime.notice(self.id, &outcome);
+                if self.state.mailbox.conclude(notice.clone()) {
+                    self.record(&mut work, TraceEvent::MessageSent { message: notice });
+                }
+            }
             // One delivery of the finished children's messages, in arrival order. A
             // child's notice is its last message, so it never overtakes the others.
             let batch = self.state.mailbox.take(
@@ -1843,20 +1863,26 @@ impl NodeCtx {
         });
         work.tasks.push(task);
     }
-    /// Records the delivery of `messages` as owned work that this node's shutdown
-    /// joins, after the node's earlier delivery records. The receiver turns true once
-    /// the record is written.
+    /// Records the delivery of `messages`; see `record`.
     fn record_delivery(
         &self,
         work: &mut Work,
         messages: &[Envelope],
         via: Delivery,
     ) -> watch::Receiver<bool> {
+        let event = TraceEvent::MessageDelivered {
+            node: self.id,
+            messages: messages.iter().map(|message| message.id).collect(),
+            via,
+        };
+        self.record(work, event)
+    }
+    /// Writes a message record as owned work that this node's shutdown joins, after
+    /// the node's earlier message records. The receiver turns true once it is written.
+    fn record(&self, work: &mut Work, event: TraceEvent) -> watch::Receiver<bool> {
         let (done, written) = watch::channel(false);
         let mut previous = work.recorded.replace(written.clone());
         let runtime = self.runtime.clone();
-        let node = self.id;
-        let messages = messages.iter().map(|message| message.id).collect();
         let task = tokio::spawn(async move {
             if let Some(previous) = &mut previous {
                 while !*previous.borrow_and_update() {
@@ -1865,14 +1891,8 @@ impl NodeCtx {
                     }
                 }
             }
-            // A failed trace write also fails node_end and so surfaces there.
-            let _ = runtime
-                .emit(TraceEvent::MessageDelivered {
-                    node,
-                    messages,
-                    via,
-                })
-                .await;
+            // A failed trace write is latched by the sink and fails the run.
+            let _ = runtime.emit(event).await;
             done.send_replace(true);
         });
         self.own(work, task);

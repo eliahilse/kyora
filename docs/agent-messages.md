@@ -110,7 +110,7 @@ Shutdown cancels every child and leaf task it owns directly and synchronously be
 Ownership decides who hears about a child's ending:
 
 - A node-owned child (`Owner::Node`, the `spawn_agent` tool) is persistent. Its result, error or cancellation is posted to its parent's mailbox. Cancelling it through its handle produces a `cancelled` notice.
-- A cell-owned child (`Owner::Cell`) belongs to the code that started it. That code reads the result from the handle, so no notice is posted. When the cell ends, the child is cancelled.
+- A cell-owned child (`Owner::Cell`) belongs to the code that started it. That code reads the result from the handle, so the child posts no notice of its own. When the cell ends, the child is cancelled. If its parent reports it through `wait` or `cancel_agent`, the runtime queues one notice for it, once, behind its messages, so its outcome follows the same order and budget rules and is not lost when its messages do not all fit.
 
 Both kinds can send, receive and be messaged.
 

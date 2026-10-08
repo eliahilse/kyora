@@ -215,6 +215,8 @@ struct State {
     closed: bool,
     /// Characters of messages handed over since the agent's last model request.
     turn: usize,
+    /// Children whose terminal entry has been queued, by them or on their behalf.
+    concluded: BTreeSet<NodeId>,
 }
 /// Why a mailbox refused a plain message.
 pub(crate) enum Refusal {
@@ -277,6 +279,7 @@ impl Mailbox {
                 state.reserved -= 1;
             } else {
                 state.awaiting.remove(&envelope.from);
+                state.concluded.insert(envelope.from);
             }
             if state.closed {
                 Err(envelope)
@@ -288,6 +291,24 @@ impl Mailbox {
         };
         self.wake();
         result
+    }
+    /// Whether a terminal entry for `child` has been queued.
+    pub(crate) fn is_concluded(&self, child: NodeId) -> bool {
+        self.lock().concluded.contains(&child)
+    }
+    /// Queues a terminal entry on behalf of a child that posts none of its own,
+    /// behind everything it has queued. Returns false if one was queued before or
+    /// the mailbox is closed.
+    pub(crate) fn conclude(&self, notice: Envelope) -> bool {
+        {
+            let mut state = self.lock();
+            if state.closed || !state.concluded.insert(notice.from) {
+                return false;
+            }
+            state.queue.push_back(notice);
+        }
+        self.wake();
+        true
     }
     /// Starts a new turn's delivery budget, right before the agent's next model request.
     pub(crate) fn new_turn(&self) {

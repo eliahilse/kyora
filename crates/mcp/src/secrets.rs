@@ -103,25 +103,43 @@ impl Secrets {
         }
         let bytes = text.as_bytes();
         let mut out = String::with_capacity(text.len() - from);
-        let (mut copied, mut at) = (from, 0);
-        while at < bytes.len() {
-            if patterns.first[usize::from(bytes[at])]
-                && let Some(value) = patterns
-                    .values
-                    .iter()
-                    .find(|value| bytes[at..].starts_with(value.as_bytes()))
-            {
-                // Values are valid UTF-8, so a match starts and ends on char boundaries.
-                let end = at + value.len();
-                if end > from {
-                    out.push_str(&text[copied.max(from)..at.max(from)]);
-                    out.push_str(REDACTED);
-                }
-                at = end;
-                copied = end.max(from);
-            } else {
-                at += 1;
+        let mut copied = from;
+        // Spans of matched values. Every position is tried, also inside a span, so
+        // overlapping values, as in "abcdef" and "defghi" within "abcdefghi", merge
+        // into one span instead of the second being left half visible.
+        let mut span: Option<(usize, usize)> = None;
+        let emit = |(start, end): (usize, usize), out: &mut String, copied: &mut usize| {
+            // Values are valid UTF-8, so spans start and end on char boundaries.
+            if end > *copied {
+                out.push_str(&text[*copied..start.max(*copied)]);
+                out.push_str(REDACTED);
+                *copied = end;
             }
+        };
+        for at in 0..bytes.len() {
+            if !patterns.first[usize::from(bytes[at])] {
+                continue;
+            }
+            let Some(value) = patterns
+                .values
+                .iter()
+                .find(|value| bytes[at..].starts_with(value.as_bytes()))
+            else {
+                continue;
+            };
+            let end = at + value.len();
+            span = match span {
+                // Overlapping or adjacent: one placeholder covers both.
+                Some((start, last)) if at <= last => Some((start, last.max(end))),
+                Some(previous) => {
+                    emit(previous, &mut out, &mut copied);
+                    Some((at, end))
+                }
+                None => Some((at, end)),
+            };
+        }
+        if let Some(last) = span {
+            emit(last, &mut out, &mut copied);
         }
         out.push_str(&text[copied..]);
         out
@@ -229,6 +247,15 @@ mod tests {
         assert_eq!(secrets.redact_from(text, 12), "yy");
         assert_eq!(secrets.redact_from(text, 13), "y");
         assert_eq!(secrets.redact_from("ü0123456789", 1), "[redacted]");
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_values_are_covered_whole() {
+        let secrets = secrets(&["abcdef", "defghijklmnop"]);
+        assert_eq!(secrets.redact("abcdefghijklmnop"), "[redacted]");
+        assert_eq!(secrets.redact("x abcdefghijklmnop y"), "x [redacted] y");
+        assert_eq!(secrets.redact_from("abcdefghijklmnop", 6), "[redacted]");
+        assert_eq!(secrets.redact("abcdefabcdef!"), "[redacted]!");
     }
 
     #[test]

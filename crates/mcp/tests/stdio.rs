@@ -964,7 +964,10 @@ impl Tool for Spawner {
     }
     async fn call(&self, _input: Value, cx: ToolCx) -> ToolOutput {
         let with_mcp = ChildSpec {
-            tools: ToolSelection(Some(vec!["mcp__fake__schema".into()])),
+            tools: ToolSelection(Some(vec![
+                "mcp__fake__schema".into(),
+                "send_message".into(),
+            ])),
             ..ChildSpec::new("use mcp")
         };
         let mut statuses = Vec::new();
@@ -997,7 +1000,10 @@ async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
     };
     let (servers, _) = Servers::start_with_env(&config, dir.path(), &environment()).await;
     let servers = Arc::new(servers);
-    let base = Toolset::new(vec![Arc::new(Spawner)]).unwrap();
+    // Built-in agent tools next to MCP tools, as a frontend wires them.
+    let mut base_tools = kyora_core::agent_tools::tools();
+    base_tools.push(Arc::new(Spawner));
+    let base = Toolset::new(base_tools).unwrap();
     let provider = FnProvider::new(|request: &ModelRequest| {
         let call = |name: &str, input: Value| ContentBlock::ToolUse {
             id: "call".into(),
@@ -1064,13 +1070,13 @@ async fn child_agents_select_mcp_tools_by_name_and_skip_local_validation() {
     assert_eq!(children.len(), 2);
     let (with_mcp, default): (Vec<_>, Vec<_>) = children
         .into_iter()
-        .partition(|node| offered[node] == ["mcp__fake__schema"]);
+        .partition(|node| offered[node] == ["mcp__fake__schema", "send_message"]);
     assert_eq!(with_mcp.len(), 1, "{offered:?}");
-    // The default child selection holds no MCP tools.
+    // The default child selection holds the agent tools and no MCP tools.
+    let default_tools = &offered[default[0]];
     assert!(
-        offered[default[0]]
-            .iter()
-            .all(|name| !name.starts_with("mcp__")),
+        default_tools.contains(&"send_message".to_owned())
+            && default_tools.iter().all(|name| !name.starts_with("mcp__")),
         "{offered:?}"
     );
     let (content, is_error) = &results[with_mcp[0]];

@@ -44,6 +44,7 @@ fn environment() -> Vec<(OsString, OsString)> {
         ("KYORA_MCP_TEST_SECRET", STDIO_SECRET),
         ("KYORA_TEST_SHORT", "abc"),
         ("KYORA_TEST_QUOTED", QUOTED_SECRET),
+        ("KYORA_TEST_NUMBER", "12345678"),
     ] {
         env.push((name.into(), value.into()));
     }
@@ -334,7 +335,7 @@ async fn colliding_names_leave_both_tools_out_with_a_warning() {
 }
 
 /// A schema that repeats the forwarded value in a key, a description, a default and
-/// an enum.
+/// an enum, and a numeric credential as a default.
 fn described_schema() -> Value {
     json!({
         "type": "object",
@@ -345,6 +346,7 @@ fn described_schema() -> Value {
                 "default": "forwarded",
                 "enum": ["forwarded", "other"],
             },
+            "pin": {"type": "integer", "default": 12345678},
         },
     })
 }
@@ -353,9 +355,14 @@ fn described_schema() -> Value {
 async fn credentials_are_redacted_inside_json_results() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = server_config(&dir.path().join("log.jsonl"), &[]);
-    config.env_vars = vec!["KYORA_TEST_QUOTED".into()];
+    config.env_vars = vec!["KYORA_TEST_QUOTED".into(), "KYORA_TEST_NUMBER".into()];
     let server = start(dir.path(), &config).await;
     let cancel = CancellationToken::new();
+    // A numeric credential echoed as a JSON number, not a string.
+    let numeric = server
+        .call("structured", json!({"pin": 12345678}), &cancel)
+        .await;
+    assert_eq!(numeric.text_content(), r#"{"pin":"[redacted]"}"#);
     let structured = server
         .call("structured", json!({"password": QUOTED_SECRET}), &cancel)
         .await;
@@ -407,7 +414,11 @@ async fn environment_and_working_directory_are_controlled() {
             ),
         ],
     );
-    config.env_vars = vec!["KYORA_TEST_FORWARD".into(), "KYORA_TEST_SHORT".into()];
+    config.env_vars = vec![
+        "KYORA_TEST_FORWARD".into(),
+        "KYORA_TEST_SHORT".into(),
+        "KYORA_TEST_NUMBER".into(),
+    ];
     config.cwd = Some("sub".into());
     let server = start(dir.path(), &config).await;
     let names = [
@@ -445,7 +456,8 @@ async fn environment_and_working_directory_are_controlled() {
     // Every string in the schema reaches the model too, keys included.
     let schema = described.spec().input_schema.to_string();
     assert!(!schema.contains("forwarded"), "{schema}");
-    assert_eq!(schema.matches(kyora_mcp::REDACTED).count(), 4, "{schema}");
+    assert!(!schema.contains("12345678"), "{schema}");
+    assert_eq!(schema.matches(kyora_mcp::REDACTED).count(), 5, "{schema}");
     assert_eq!(
         PathBuf::from(report["cwd"].as_str().unwrap())
             .canonicalize()

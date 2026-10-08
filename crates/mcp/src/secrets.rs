@@ -150,13 +150,20 @@ impl Secrets {
         self.redact(text) != text
     }
 
-    /// Redacts every string in `value`, object keys included.
+    /// Redacts every string in `value`, object keys included. A number whose decimal
+    /// form contains a value becomes the placeholder string.
     pub(crate) fn redact_json(&self, value: &mut Value) {
         if self.0.values.is_empty() {
             return;
         }
         match value {
             Value::String(text) => *text = self.redact(text),
+            Value::Number(number) => {
+                let text = number.to_string();
+                if text.len() >= defaults::MIN_SECRET_CHARS && self.found_in(&text) {
+                    *value = Value::String(REDACTED.to_owned());
+                }
+            }
             Value::Array(items) => items.iter_mut().for_each(|item| self.redact_json(item)),
             Value::Object(map) => {
                 *map = std::mem::take(map)
@@ -256,6 +263,17 @@ mod tests {
         assert_eq!(secrets.redact("x abcdefghijklmnop y"), "x [redacted] y");
         assert_eq!(secrets.redact_from("abcdefghijklmnop", 6), "[redacted]");
         assert_eq!(secrets.redact("abcdefabcdef!"), "[redacted]!");
+    }
+
+    #[test]
+    fn numbers_that_carry_a_value_are_replaced() {
+        let secrets = secrets(&["12345678"]);
+        let mut value = serde_json::json!({"pin": 12345678, "longer": 9912345678u64, "small": 42});
+        secrets.redact_json(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({"pin": "[redacted]", "longer": "[redacted]", "small": 42})
+        );
     }
 
     #[test]

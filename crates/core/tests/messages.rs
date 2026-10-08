@@ -2766,3 +2766,38 @@ async fn messages_a_tool_delivers_share_the_turn_budget() {
         vec![line('3')]
     );
 }
+
+#[tokio::test]
+async fn a_panicking_trace_store_fails_the_run() {
+    // The store's acknowledgement panics on delivery records.
+    let trace = TraceSink::with_store(|record: TraceRecord| {
+        let crash = matches!(record.event, TraceEvent::MessageDelivered { .. });
+        async move {
+            if crash {
+                panic!("store crashed");
+            }
+            Ok(())
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "child task", "name": "worker"}),
+                    ),
+                    text("waiting"),
+                    text("done"),
+                ],
+            ),
+            rule("child task", 1, vec![text("child answer")]),
+        ],
+        vec![(at("child task", 0), at("root task", 1))],
+    );
+    let runtime = setup(provider, idle_tool(), Limits::default(), trace.clone());
+    assert!(runtime.run(spec()).await.is_err());
+    assert!(trace.finish().await.is_err());
+}

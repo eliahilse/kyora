@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
+use futures::FutureExt;
 use kyora_protocol::{Message, StopReason, StreamEvent, ToolSpec, Usage};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
@@ -235,8 +236,8 @@ impl TraceSink {
     /// for that event returns, with the acknowledgement's result, once it completes.
     /// Acknowledgements may complete in any order, so storage can confirm records
     /// asynchronously. Records are broadcast to subscribers as they are handed over.
-    /// The first failed acknowledgement is latched: later events fail without being
-    /// stored, and `finish` returns it. An acknowledgement that never completes
+    /// The first failed acknowledgement, including a store future that panics, is
+    /// latched: later events fail without being stored, and `finish` returns it. An acknowledgement that never completes
     /// blocks the node that emitted it, and so shutdown.
     pub fn with_store<F, Fut>(mut store: F) -> Self
     where
@@ -257,8 +258,20 @@ impl TraceSink {
                     .clone()
                     .map(|error| anyhow::anyhow!(error))
             };
+            // An acknowledgement task that did not complete dropped its ack; that is a
+            // storage failure too.
+            let lost = |failed: &std::sync::Mutex<Option<String>>| {
+                failed
+                    .lock()
+                    .expect("trace failure mutex poisoned")
+                    .get_or_insert_with(|| "trace acknowledgement was lost".into());
+            };
             while let Some(command) = rx.recv().await {
-                while acks.try_join_next().is_some() {}
+                while let Some(joined) = acks.try_join_next() {
+                    if joined.is_err() {
+                        lost(&failed);
+                    }
+                }
                 match command {
                     WriteCommand::Event(event, ack) => {
                         // After a failure nothing else is stored, as with a session file.
@@ -272,7 +285,11 @@ impl TraceSink {
                         let stored = store(record);
                         let failed = failed.clone();
                         acks.spawn(async move {
-                            let result = stored.await;
+                            // A store that panics has failed like one that returns an error.
+                            let result = std::panic::AssertUnwindSafe(stored)
+                                .catch_unwind()
+                                .await
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("trace store panicked")));
                             if let Err(error) = &result {
                                 failed
                                     .lock()
@@ -283,7 +300,11 @@ impl TraceSink {
                         });
                     }
                     WriteCommand::Finish(ack) => {
-                        while acks.join_next().await.is_some() {}
+                        while let Some(joined) = acks.join_next().await {
+                            if joined.is_err() {
+                                lost(&failed);
+                            }
+                        }
                         let _ = ack.send(latched(&failed).map_or(Ok(()), Err));
                         break;
                     }

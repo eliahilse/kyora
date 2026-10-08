@@ -121,6 +121,7 @@ fn credentials_must_come_from_the_environment() {
         format!("[servers.a]\ncommand = 'x'\nargs = ['--client_secret', '{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--Access-Token={SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--private-key', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--password', '-{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['-secret', '{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--url=https://h/mcp?token={SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nenv = {{ UPSTREAM = 'https://h/?api_key={SECRET}' }}"),

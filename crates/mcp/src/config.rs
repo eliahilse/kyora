@@ -313,9 +313,9 @@ fn flag_credential(args: &[String]) -> bool {
         }
         match value {
             Some(value) => !value.is_empty(),
-            None => args
-                .get(index + 1)
-                .is_some_and(|next| !next.starts_with('-')),
+            // These flags always take a value, so the next argument is it, even one
+            // that starts with a dash.
+            None => args.get(index + 1).is_some(),
         }
     })
 }

@@ -44,11 +44,11 @@ Every value read through `env_vars`, `bearer_token_env` or `env_headers` is trea
 Redaction is best effort, by design. A configured server is trusted with the credentials forwarded to it; it already holds them and could send them anywhere. Redaction exists so that common echoes, such as an error that repeats a token, do not end up in traces or in the model's context. It covers:
 
 - the exact text of each value, also where values overlap or touch;
-- the value's JSON string escapes, including the `\uXXXX` form of non-ASCII characters;
+- JSON string escapes in any spelling: text is also searched with its escapes decoded (`\uXXXX` in either case, surrogate pairs, `\/`, `\"` and the rest), so mixed-case or partly escaped forms are found too;
 - strings, object keys and numbers in decoded JSON (a number whose digits contain a value becomes the placeholder);
 - the names the model sees: a tool whose raw or normalized name contains a value is left out with a warning.
 
-It does not cover other encodings: base64, percent-encoding inside text, values split across separate strings, or any other transformation a server applies. Values shorter than 6 characters are not redacted, since that would shred ordinary output; kyora warns about each one at startup. Values longer than 4096 bytes are refused and stop that server, because they could not be recognized whole inside the capped error bodies and stderr tails.
+It does not cover other encodings: base64, percent-encoding inside text, values split across separate strings, or any other transformation a server applies. Values shorter than 6 characters are not redacted, since that would shred ordinary output; kyora warns about each one at startup. The limit counts characters, not bytes, so a short non-ASCII value such as `密钥值` (3 characters, 9 bytes) is not redacted either. Values longer than 4096 bytes are refused and stop that server, because they could not be recognized whole inside the capped error bodies and stderr tails.
 
 Server names are 1 to 32 ASCII letters, digits, `-` or `_`, without `__` or a trailing `_`, which keeps every tool name unambiguous. Tool name characters outside `[A-Za-z0-9_-]` become `_`, and names are kept within the 64 characters providers accept; a name that had to change gets eight hex digits of a hash of the original, so distinct server tools stay distinct. If two tools still end up with the same name, neither is offered and kyora prints a warning.
 

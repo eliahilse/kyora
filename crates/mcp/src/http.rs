@@ -12,7 +12,7 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue, WWW_AUTHENTICATE},
 };
 use rmcp::{
-    model::{ClientJsonRpcMessage, JsonRpcMessage, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
     transport::streamable_http_client::{
         AuthRequiredError, SseError, StreamableHttpClient, StreamableHttpError,
         StreamableHttpPostResponse,
@@ -140,6 +140,19 @@ impl HttpClient {
         }
     }
 
+    /// Keeps the version an initialize response settles on, so a DELETE sent before
+    /// rmcp's next request still carries it.
+    fn note_initialize(&self, reply: &[u8]) {
+        let Ok(reply) = serde_json::from_slice::<serde_json::Value>(reply) else {
+            return;
+        };
+        if let Some(version) = reply["result"]["protocolVersion"].as_str()
+            && let Ok(version) = HeaderValue::from_str(version)
+        {
+            *self.shared.version.lock().expect("version poisoned") = Some(version);
+        }
+    }
+
     fn remember(&self, session: &str) {
         *self.shared.session.lock().expect("session poisoned") = Some(session.into());
     }
@@ -236,6 +249,11 @@ impl StreamableHttpClient for HttpClient {
         let attached = session_id.is_some();
         let expects_reply = matches!(message, JsonRpcMessage::Request(_));
         self.note_version(&custom_headers);
+        let initialize = matches!(
+            &message,
+            JsonRpcMessage::Request(request)
+                if matches!(request.request, ClientRequest::InitializeRequest(_))
+        );
         let request = self
             .http
             .post(uri.as_ref())
@@ -281,10 +299,21 @@ impl StreamableHttpClient for HttpClient {
             )));
         }
         if kind.starts_with(EVENT_STREAM) {
-            return Ok(StreamableHttpPostResponse::Sse(
-                self.events(response, max_sse_event_size),
-                session,
-            ));
+            let mut events = self.events(response, max_sse_event_size);
+            if initialize {
+                let client = self.clone();
+                events = events
+                    .inspect(move |event| {
+                        if let Ok(Sse {
+                            data: Some(data), ..
+                        }) = event
+                        {
+                            client.note_initialize(data.as_bytes());
+                        }
+                    })
+                    .boxed();
+            }
+            return Ok(StreamableHttpPostResponse::Sse(events, session));
         }
         if kind.starts_with(JSON) {
             let (body, whole) = self.body(response, defaults::MAX_MESSAGE_BYTES).await?;
@@ -296,6 +325,9 @@ impl StreamableHttpClient for HttpClient {
                         defaults::MAX_MESSAGE_BYTES
                     ),
                 )));
+            }
+            if initialize {
+                self.note_initialize(&body);
             }
             return match serde_json::from_slice(&body) {
                 Ok(reply) => Ok(StreamableHttpPostResponse::Json(reply, session)),
@@ -481,7 +513,107 @@ fn content_type(response: &Response) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::EventSize;
+    use super::*;
+    use rmcp::model::{
+        ClientCapabilities, ClientConfig, Implementation, InitializeRequest, RequestId,
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    fn client(uri: &str) -> HttpClient {
+        HttpClient::new(
+            reqwest::Client::new(),
+            Duration::from_secs(5),
+            Arc::default(),
+            Secrets::default(),
+            uri.into(),
+            None,
+            HashMap::new(),
+        )
+    }
+
+    fn initialize() -> ClientJsonRpcMessage {
+        let params = ClientConfig::new(
+            ClientCapabilities::default(),
+            Implementation::new("kyora", "0"),
+        );
+        ClientJsonRpcMessage::request(
+            ClientRequest::InitializeRequest(InitializeRequest::new(params)),
+            RequestId::Number(0),
+        )
+    }
+
+    async fn deletes(server: &MockServer) -> Vec<(Option<String>, Option<String>)> {
+        let header = |request: &wiremock::Request, name: &str| {
+            request
+                .headers
+                .get(name)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .map(|request| {
+                (
+                    header(request, SESSION_ID),
+                    header(request, PROTOCOL_VERSION),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_initialize_reply_alone_settles_the_version_for_cleanup() {
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "s", "version": "1"},
+            },
+        });
+        for sse in [false, true] {
+            let server = MockServer::start().await;
+            let answer = if sse {
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {reply}\n\n"), "text/event-stream")
+            } else {
+                ResponseTemplate::new(200).set_body_json(&reply)
+            };
+            Mock::given(method("POST"))
+                .respond_with(answer.insert_header(SESSION_ID, "s1"))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let client = client(&server.uri());
+            let posted = client
+                .post_message(
+                    server.uri().into(),
+                    initialize(),
+                    None,
+                    None,
+                    HashMap::new(),
+                )
+                .await
+                .unwrap();
+            if let StreamableHttpPostResponse::Sse(mut events, _) = posted {
+                while events.next().await.is_some() {}
+            }
+            // Cancelled before rmcp sent notifications/initialized with the header.
+            client.close().await;
+            assert_eq!(
+                deletes(&server).await,
+                [(Some("s1".to_owned()), Some("2025-06-18".to_owned()))],
+                "sse {sse}"
+            );
+        }
+    }
 
     #[test]
     fn every_line_ending_separates_events() {

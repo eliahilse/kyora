@@ -279,9 +279,25 @@ fn percent_decoded(key: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Whether `args` pass a credential-looking flag a literal value, as in
-/// `--api-key VALUE` or `--password=VALUE`. Flags that name where a credential is
-/// kept, such as `--token-file` or `--api-key-env`, are fine.
+/// Flags that take a credential as their value, compared after dropping leading
+/// dashes, lowercasing and writing `_` as `-`.
+const CREDENTIAL_FLAGS: &[&str] = &[
+    "api-key",
+    "apikey",
+    "token",
+    "access-token",
+    "auth-token",
+    "bearer",
+    "password",
+    "passwd",
+    "secret",
+    "client-secret",
+    "private-key",
+];
+
+/// Whether `args` pass one of [`CREDENTIAL_FLAGS`] a literal value, as in
+/// `--api-key VALUE` or `--password=VALUE`. Other flags, such as `--auth-mode` or
+/// `--token-limit`, and `--no-*` switches never count.
 fn flag_credential(args: &[String]) -> bool {
     args.iter().enumerate().any(|(index, arg)| {
         if !arg.starts_with('-') {
@@ -291,11 +307,8 @@ fn flag_credential(args: &[String]) -> bool {
             Some((flag, value)) => (flag, Some(value)),
             None => (arg.trim_start_matches('-'), None),
         };
-        let upper = flag.to_ascii_uppercase();
-        let reference = ["FILE", "PATH", "DIR", "ENV", "VAR"]
-            .iter()
-            .any(|suffix| upper.ends_with(suffix));
-        if !credential(flag) || reference {
+        let flag = flag.to_ascii_lowercase().replace('_', "-");
+        if flag.starts_with("no-") || !CREDENTIAL_FLAGS.contains(&flag.as_str()) {
             return false;
         }
         match value {

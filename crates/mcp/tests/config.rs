@@ -118,7 +118,9 @@ fn credentials_must_come_from_the_environment() {
         format!("[servers.a]\ncommand = 'x'\nargs = ['--api-key', '{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--password={SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['serve', '--token', '{SECRET}']"),
-        format!("[servers.a]\ncommand = 'x'\nargs = ['--auth', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--client_secret', '{SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--Access-Token={SECRET}']"),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--private-key', '{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['-secret', '{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--url=https://h/mcp?token={SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nenv = {{ UPSTREAM = 'https://h/?api_key={SECRET}' }}"),
@@ -147,12 +149,20 @@ fn credentials_must_come_from_the_environment() {
     parse("[servers.a]\nurl = 'https://h/mcp?team=core'")
         .validate()
         .unwrap();
-    // Flags that point at where a credential lives, and flags without values, are fine.
-    parse(
-        "[servers.a]\ncommand = 'x'\nargs = ['--api-key-env', 'GITHUB_TOKEN', '--token-file', '/run/t', '--no-auth', '--port', '8080', '--url=https://h/?team=core']",
-    )
-    .validate()
-    .unwrap();
+    // Only the listed credential flags count: not flags that point at where a
+    // credential lives, flags that merely mention one, or --no-* switches.
+    for args in [
+        "['--api-key-env', 'GITHUB_TOKEN', '--token-file', '/run/t', '--port', '8080']",
+        "['--auth-mode', 'oauth']",
+        "['--token-limit=4096']",
+        "['--no-auth', '/srv/data']",
+        "['--no-token', 'serve']",
+        "['--url=https://h/?team=core']",
+    ] {
+        parse(&format!("[servers.a]\ncommand = 'x'\nargs = {args}"))
+            .validate()
+            .unwrap_or_else(|error| panic!("{args}: {error}"));
+    }
     assert!(
         error("[servers.a]\nurl = 'https://h/'\nenv_headers = { Mcp-Session-Id = 'X' }")
             .contains("reserved")

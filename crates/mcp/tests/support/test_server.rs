@@ -1,7 +1,7 @@
 //! Scripted MCP server for the kyora-mcp tests: newline-delimited JSON-RPC on stdio.
 //!
 //! KYORA_MCP_TEST_LOG appends every received message (and the pid) as JSON lines.
-//! KYORA_MCP_TEST_MODE selects a startup failure (exit, spill, hang, bad-version,
+//! KYORA_MCP_TEST_MODE selects a startup failure (exit, spill, spill-escaped, hang, bad-version,
 //! no-tools, flood, many, bulky), linger, which keeps running after stdin closes, or stall-list,
 //! which stops answering tools/list once the notify tool has run.
 //! KYORA_MCP_TEST_PAGE sets the tools/list page size (default 2).
@@ -44,6 +44,16 @@ fn main() {
     };
     record(&json!({"pid": std::process::id()}));
     eprintln!("test server starting");
+    if mode == "spill-escaped" {
+        // A JSON string: 25 escaped backslashes, then the secret with its first
+        // character escaped, then filler; no trailing newline.
+        let secret = std::env::var("KYORA_MCP_TEST_SECRET").unwrap_or_default();
+        let mut chars = secret.chars();
+        let first = chars.next().map_or(0, u32::from);
+        let escaped = format!("\\u{first:04x}{}", chars.as_str());
+        eprint!("\"{}{escaped}{}\"", "\\\\".repeat(25), "y".repeat(2033));
+        std::process::exit(2);
+    }
     if mode == "spill" {
         // A secret followed by just enough output to push its start out of a tail.
         let secret = std::env::var("KYORA_MCP_TEST_SECRET").unwrap_or_default();

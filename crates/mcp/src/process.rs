@@ -162,13 +162,13 @@ impl Process {
             false => 0,
         };
         let text = String::from_utf8_lossy(&tail.bytes[start..]);
-        // Redact before cutting: the slack may start inside a value.
-        let from = if tail.cut {
-            self.slack.saturating_sub(start)
-        } else {
-            0
+        // Redact before cutting: the slack may start inside a value, and after a cut
+        // the backslash parity at the start is unknown.
+        let redacted = match tail.cut {
+            true => secrets.redact_cut(&text, self.slack.saturating_sub(start)),
+            false => secrets.redact(&text),
         };
-        secrets.redact_from(&text, from).trim().to_owned()
+        redacted.trim().to_owned()
     }
 }
 

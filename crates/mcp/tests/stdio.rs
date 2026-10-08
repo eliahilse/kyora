@@ -558,6 +558,31 @@ async fn a_credential_cut_by_the_stderr_tail_is_still_redacted() {
 }
 
 #[tokio::test]
+async fn a_tail_cut_inside_backslashes_still_redacts_an_escaped_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig {
+        env_vars: vec!["KYORA_MCP_TEST_SECRET".into()],
+        ..server_config(
+            &dir.path().join("log.jsonl"),
+            &[("KYORA_MCP_TEST_MODE", "spill-escaped")],
+        )
+    };
+    // The credential "password" makes the ring 2048 bytes plus six times 8 of room.
+    // Stderr is the start line and a 2098 byte JSON string, so the ring loses the
+    // string's quote and one backslash, which flips the escape parity after it.
+    let mut env: Vec<(OsString, OsString)> = environment()
+        .into_iter()
+        .filter(|(name, _)| name != "KYORA_MCP_TEST_SECRET")
+        .collect();
+    env.push(("KYORA_MCP_TEST_SECRET".into(), "password".into()));
+    let failed = Server::start("fake", &config, dir.path(), &env).await;
+    let message = format!("{:#}", failed.err().expect("spill mode fails"));
+    assert!(message.contains("yyyy"), "{message}");
+    assert!(!message.contains("assword"), "{message}");
+    assert!(message.contains(kyora_mcp::REDACTED), "{message}");
+}
+
+#[tokio::test]
 async fn a_credential_too_long_to_redact_stops_the_server() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log.jsonl");

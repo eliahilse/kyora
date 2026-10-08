@@ -112,6 +112,18 @@ impl Secrets {
     /// matched in the whole text, so one that straddles `from` is still replaced
     /// instead of leaving its tail behind.
     pub(crate) fn redact_from(&self, text: &str, from: usize) -> String {
+        self.redact_spans(text, from, false)
+    }
+
+    /// Like [`Self::redact_from`], for text cut at an arbitrary point, such as a
+    /// stderr tail. The cut may fall inside a run of backslashes, which leaves the
+    /// escape parity after it unknown, so the text is decoded both as it is and as
+    /// if one backslash came before it.
+    pub(crate) fn redact_cut(&self, text: &str, from: usize) -> String {
+        self.redact_spans(text, from, true)
+    }
+
+    fn redact_spans(&self, text: &str, from: usize, cut: bool) -> String {
         let mut from = from.min(text.len());
         while !text.is_char_boundary(from) {
             from += 1;
@@ -119,76 +131,51 @@ impl Secrets {
         let Some(automaton) = &self.0.automaton else {
             return text[from..].to_owned();
         };
-        let reach = self.reach();
-        let mut out = String::with_capacity(text.len() - from);
-        let mut copied = from;
-        let emit = |(start, end): (usize, usize), out: &mut String, copied: &mut usize| {
-            // Values are valid UTF-8 and escapes map back whole, so spans start and
-            // end on char boundaries.
-            if end > *copied {
-                out.push_str(&text[*copied..start.max(*copied)]);
-                out.push_str(REDACTED);
-                *copied = end;
-            }
-        };
+        let mut spans = Spans::new(text, from, self.reach());
         // Matches in the text itself, and in the text with its JSON escapes decoded,
         // mapped back to the escapes they came from. Overlapping search reports every
-        // match, also inside another, in order of their ends; both streams stay in
-        // that order and are merged, all in time linear in the text plus the matches.
-        let decoded = Decoded::new(text);
-        let mut raw = automaton
+        // match, also inside another, in order of their ends; every stream stays in
+        // that order and they are merged, all in time linear in the text plus the
+        // matches.
+        let raw = automaton
             .find_overlapping_iter(text)
-            .map(|found| (found.start(), found.end()))
-            .peekable();
-        let mut escaped = decoded
-            .iter()
-            .flat_map(|view| {
-                automaton
-                    .find_overlapping_iter(&view.text)
-                    .map(|found| view.original(found.start(), found.end()))
-            })
-            .peekable();
-        // Overlapping and adjacent matches, as "abcdef" and "defghi" within
-        // "abcdefghi", merge into one span instead of the second being left half
-        // visible.
-        let mut pending: Vec<(usize, usize)> = Vec::new();
-        loop {
-            let next = match (raw.peek(), escaped.peek()) {
-                (Some(a), Some(b)) if a.1 <= b.1 => raw.next(),
-                (_, Some(_)) => escaped.next(),
-                (Some(_), None) => raw.next(),
-                (None, None) => break,
-            };
-            let (mut start, end) = next.expect("peeked match");
-            while let Some(&(earlier, last)) = pending.last()
-                && last >= start
-            {
-                start = start.min(earlier);
-                pending.pop();
-            }
-            pending.push((start, end));
-            // A later match ends at or after `end`, so it starts at or after
-            // `end - reach`; spans ending before that are final.
-            let settled = pending
-                .iter()
-                .take_while(|(_, last)| *last < end.saturating_sub(reach))
-                .count();
-            for span in pending.drain(..settled) {
-                emit(span, &mut out, &mut copied);
-            }
+            .map(|found| (found.start(), found.end()));
+        let views: Vec<Decoded> = [Decoded::new(text, false)]
+            .into_iter()
+            .chain(cut.then(|| Decoded::new(text, true)))
+            .flatten()
+            .collect();
+        if views.is_empty() {
+            // Nothing to decode: one stream, no merging.
+            raw.for_each(|span| spans.push(span));
+            return spans.finish();
         }
-        for span in pending {
-            emit(span, &mut out, &mut copied);
+        type Stream<'a> = std::iter::Peekable<Box<dyn Iterator<Item = (usize, usize)> + 'a>>;
+        let mut streams: Vec<Stream<'_>> =
+            vec![(Box::new(raw) as Box<dyn Iterator<Item = (usize, usize)>>).peekable()];
+        for view in &views {
+            let decoded = automaton
+                .find_overlapping_iter(&view.text)
+                .map(|found| view.original(found.start(), found.end()));
+            streams
+                .push((Box::new(decoded) as Box<dyn Iterator<Item = (usize, usize)>>).peekable());
         }
-        out.push_str(&text[copied..]);
-        out
+        while let Some((_, index)) = streams
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, stream)| stream.peek().map(|&(_, end)| (end, index)))
+            .min()
+        {
+            spans.push(streams[index].next().expect("peeked match"));
+        }
+        spans.finish()
     }
 
     /// Whether `text` contains a value.
     pub(crate) fn found_in(&self, text: &str) -> bool {
         self.0.automaton.as_ref().is_some_and(|automaton| {
             automaton.is_match(text)
-                || Decoded::new(text).is_some_and(|view| automaton.is_match(&view.text))
+                || Decoded::new(text, false).is_some_and(|view| automaton.is_match(&view.text))
         })
     }
 
@@ -229,6 +216,73 @@ impl Secrets {
     }
 }
 
+/// Builds the redacted text from match spans that arrive in order of their ends.
+/// Overlapping and adjacent matches, as "abcdef" and "defghi" within "abcdefghi",
+/// merge into one span instead of the second being left half visible.
+struct Spans<'t> {
+    text: &'t str,
+    reach: usize,
+    out: String,
+    copied: usize,
+    pending: Vec<(usize, usize)>,
+}
+
+impl<'t> Spans<'t> {
+    fn new(text: &'t str, from: usize, reach: usize) -> Self {
+        Self {
+            text,
+            reach,
+            out: String::with_capacity(text.len() - from),
+            copied: from,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, (mut start, end): (usize, usize)) {
+        while let Some(&(earlier, last)) = self.pending.last()
+            && last >= start
+        {
+            start = start.min(earlier);
+            self.pending.pop();
+        }
+        self.pending.push((start, end));
+        // A later match ends at or after `end`, so it starts at or after
+        // `end - reach`; spans ending before that are final.
+        let settled = self
+            .pending
+            .iter()
+            .take_while(|(_, last)| *last < end.saturating_sub(self.reach))
+            .count();
+        if settled > 0 {
+            let mut pending = std::mem::take(&mut self.pending);
+            for &span in &pending[..settled] {
+                self.emit(span);
+            }
+            pending.drain(..settled);
+            self.pending = pending;
+        }
+    }
+
+    fn emit(&mut self, (start, end): (usize, usize)) {
+        // Values are valid UTF-8 and escapes map back whole, so spans start and end
+        // on char boundaries.
+        if end > self.copied {
+            self.out
+                .push_str(&self.text[self.copied..start.max(self.copied)]);
+            self.out.push_str(REDACTED);
+            self.copied = end;
+        }
+    }
+
+    fn finish(mut self) -> String {
+        for span in std::mem::take(&mut self.pending) {
+            self.emit(span);
+        }
+        self.out.push_str(&self.text[self.copied..]);
+        self.out
+    }
+}
+
 /// Most text bytes per decoded byte: an ASCII character written as `\uXXXX`.
 const ESCAPE_GROWTH: usize = 6;
 
@@ -243,9 +297,21 @@ struct Decoded {
 }
 
 impl Decoded {
-    /// None when there is nothing to decode, or the text is too large to map.
-    fn new(text: &str) -> Option<Self> {
-        if !text.contains('\\') || u32::try_from(text.len()).is_err() {
+    /// None when there is nothing to decode, or the text is too large to map. With
+    /// `leading_backslash`, decodes as if one backslash came before `text`; that
+    /// backslash maps to the start of `text`.
+    fn new(text: &str, leading_backslash: bool) -> Option<Self> {
+        if u32::try_from(text.len() + 1).is_err() {
+            return None;
+        }
+        if leading_backslash {
+            let mut view = Self::new(&format!("\\{text}"), false)?;
+            for origin in &mut view.origin {
+                *origin = origin.saturating_sub(1);
+            }
+            return Some(view);
+        }
+        if !text.contains('\\') {
             return None;
         }
         let bytes = text.as_bytes();
@@ -438,6 +504,30 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_inside_a_run_of_backslashes_does_not_hide_an_escaped_value() {
+        // A JSON string holding 25 backslashes, then "password" with its "p"
+        // escaped: 2098 bytes. A ring of 2096 drops the quote and one backslash,
+        // which flips the backslash parity for everything after the cut.
+        let secrets = secrets(&["password"]);
+        let json = format!(
+            "\"{}\\u0070assword{}\"",
+            "\\\\".repeat(25),
+            "y".repeat(2033)
+        );
+        assert_eq!(json.len(), 2098);
+        let tail = &json[2..];
+        let from = secrets.reach();
+        // Decoded as it stands, the credential's backslash pairs with the last one.
+        assert!(secrets.redact_from(tail, from).contains("u0070assword"));
+        let redacted = secrets.redact_cut(tail, from);
+        assert!(!redacted.contains("assword"), "{redacted}");
+        assert!(redacted.contains(REDACTED), "{redacted}");
+        // Text that is not cut keeps its own parity; cut text is read both ways.
+        assert_eq!(secrets.redact("\\\\u0070assword"), "\\\\u0070assword");
+        assert_eq!(secrets.redact_cut("\\\\u0070assword", 0), "\\[redacted]");
+    }
+
+    #[test]
     fn invalid_and_partial_escapes_are_left_alone() {
         let secrets = secrets(&["password"]);
         for text in [
@@ -499,12 +589,13 @@ mod tests {
         let text = "a".repeat(16 * 1024 * 1024);
         let started = std::time::Instant::now();
         assert_eq!(secrets.redact(&text), REDACTED);
-        assert_eq!(secrets.redact_from(&format!("x{text}y"), 1), "[redacted]y");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(60),
             "{:?}",
             started.elapsed()
         );
+        let short = "a".repeat(2 * defaults::MAX_SECRET_BYTES);
+        assert_eq!(secrets.redact_from(&format!("x{short}y"), 1), "[redacted]y");
     }
 
     #[test]

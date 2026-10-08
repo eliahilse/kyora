@@ -117,22 +117,22 @@ What the host enforces regardless of executor: the connection acts only as its n
 none --first python call--> starting --hello/welcome--> ready <--> running(cell)
   ^                            |                          |             |
   |                            +------ start failure -----+-- ends -----+--> stopping
-  +--- next python call, after the old instance is confirmed stopped --+     (destroy)
-ready/running --node ends--> stopping --destroy result--> stopped
+  +--- next python call, after the old instance is fenced -------------+     (destroy)
+ready/running --node ends--> stopping --teardown report--> stopped
 ```
 
-**Start.** On the node's first `python` call (or eagerly at admission on machine executors, section 6.2):
+**Start.** On the node's first `python` call, or, on machine executors, right after admission through the tool start hook of change C1 (section 6.2):
 
 1. The executor starts `python3 -I -X utf8 <runtime>/kyora_boot.py` in the node's cwd. `<runtime>` is a private 0700 directory per kyora process into which the embedded Python files are written (D9.1). `-I` ignores `PYTHONPATH` and user site packages, so the boot script inserts its own directory first in `sys.path`, imports `kyora`, then appends the workspace so user modules stay importable.
 2. The host writes a fresh 256-bit token as one line to the kernel's stdin and closes it. The boot script reads that line, then points fd 0 at `/dev/null`, so the token is in no environment variable, argument or stdin that user code or subprocesses see.
 3. The boot script moves the control socket from fd 3 to a high descriptor, marks it close-on-exec, registers an `os.register_at_fork` hook that closes it in children forked through `os.fork`, applies the rlimits, and sends `hello` (section 4.2). These steps keep the descriptor away from ordinary subprocesses; code that passes it on deliberately (`subprocess.Popen(pass_fds=...)`) or forks from C bypasses them, which section 4.5 accounts for.
 4. The supervisor answers `welcome`, then sets the node's preloaded variables with `vars.set` (section 3.9).
 
-Startup is bounded: 10 s to `hello` locally, the executor's start bound remotely (section 6.6). On timeout, on a start error, or when the cell or node is cancelled during startup, the supervisor destroys whatever the executor started (section 6.5) before it reports; the executor must make `start` itself cancel-safe, so a machine created before the cancellation is destroyed too.
+Startup is bounded: 10 s to `hello` locally, the executor's start bound remotely (section 6.6). A start runs as a task owned by the `python` tool: the first `python` call awaits a start already in flight, and the tool's shutdown hook cancels and joins it before destroying anything. On timeout, on a start error, or when the cell or node is cancelled during startup, the supervisor destroys whatever the executor started (section 6.5) before it reports; the executor must make `start` itself cancel-safe, so a machine created before the cancellation is destroyed too.
 
 **Reuse.** The namespace persists across cells. Between cells nothing of kyora's runs in the kernel, and the host rejects every request then as stale (section 4.5). User threads that outlive a cell keep running but cannot act through kyora.
 
-**End of a generation.** A generation ends when the process exits, the control channel reaches end of file, the kernel violates the protocol (section 4.8), the host kills it after an interrupt grace, or the executor reports the machine lost. In every case the supervisor first destroys the instance (locally: SIGKILL to the process group, then reaps the process, so no zombie and no straggler in the group remains), then drains and closes the stdout and stderr pumps (bounded by 1 s), then runs the cell exit of section 5.4 if a cell was running, and writes `kernel_end` with the reason and the destroy result.
+**End of a generation.** A generation ends when the process exits, the control channel reaches end of file, the kernel violates the protocol (section 4.8), the host kills it after an interrupt grace, or the executor reports the machine lost. In every case the supervisor first makes one destroy attempt, bounded by the destroy call timeout of section 6.5 (locally: SIGKILL to the process group, then reaping the process, so no zombie and no straggler in the group remains; this always confirms), then drains and closes the stdout and stderr pumps (bounded by 1 s), then runs the cell exit of section 5.4 if a cell was running, and writes `kernel_end` with the reason and the destroy result, `confirmed` or `pending`. A pending destroy is retried in the background (section 6.5); nothing on the cell's or node's path waits for those retries.
 
 The running cell's status follows the first recorded cause, so a kill that a timeout caused never reads as a crash:
 
@@ -147,9 +147,9 @@ The running cell's status follows the first recorded cause, so a kill that a tim
 [kyora] new kernel (generation 2): the previous one crashed. Lost variables: chunks, notes, h. Reloaded: context.
 ```
 
-A new generation starts only once the previous instance is confirmed stopped: always true locally (killed and reaped), and on machine executors decided by section 6.5. Persistent children survive a restart (they belong to the node); code in the new generation gets their handles back with `kyora.agents()` or `kyora.agent(id)`. After 5 restarts in one node (configurable) the tool refuses with an error instead of starting another kernel.
+A new generation starts only once the previous instance is fenced, that is known to be unable to run: always true locally (killed and reaped), and on machine executors decided by section 6.5, which bounds how long a `python` call waits for it. Persistent children survive a restart (they belong to the node); code in the new generation gets their handles back with `kyora.agents()` or `kyora.agent(id)`. After 5 restarts in one node (configurable) the tool refuses with an error instead of starting another kernel.
 
-**Shutdown.** The kernel belongs to its agent node. When the node's loop ends, whatever the status, the supervisor closes its gate (new requests get `cancelled`) and destroys the instance: a `shutdown` request, 2 s of grace, then the executor's destroy. This runs concurrently with the runtime cancelling and joining the node's descendants, through the tool shutdown hook of change C1 (section 5.6), and `node_end` waits for it, bounded by 10 s for an unconfirmed remote destroy (section 6.5). A second Ctrl-C kills every local kernel group immediately, like shell and MCP groups today: `watch_interrupts` in `crates/cli/src/main.rs` calls `kyora_tools::cancel_processes` and `kyora_mcp::kill_servers`, and gains `kyora_repl::kill_kernels`.
+**Shutdown.** The kernel belongs to its agent node. When the node's loop ends, whatever the status, the supervisor closes its gate (new requests get `cancelled`), cancels and joins a start in flight, and tears the kernel down: a `shutdown` request, 2 s of grace, then destroy attempts under the call timeout and retry policy of section 6.5. This runs concurrently with the runtime cancelling and joining the node's descendants, through the tool shutdown hook of change C1 (section 5.6). The hook returns within 12 s whatever destroy reports, with a **teardown report**: complete, or incomplete with the time by which the instance is fenced anyway. Core records it on `node_end` and in the node's outcome (section 5.4), so whoever waits for the node can tell whether its code is known to have stopped. A second Ctrl-C kills every local kernel group immediately, like shell and MCP groups today: `watch_interrupts` in `crates/cli/src/main.rs` calls `kyora_tools::cancel_processes` and `kyora_mcp::kill_servers`, and gains `kyora_repl::kill_kernels`.
 
 Resume (D11.3) never restores a kernel: the first cell after a resume starts a new generation with the notice above.
 
@@ -166,11 +166,11 @@ A cell is one call of the `python` tool. Its spec is static and identical in eve
    "required": ["code"], "additionalProperties": false}}
 ```
 
-The tool sets `ToolSpec::large_input`, so providers stream the code eagerly (`crates/protocol/src/lib.rs`), declares `Effect::Mutating` (code can change the workspace, so the runtime awaits a cancelled cell until it has really stopped, `Runtime::agent`), and keeps the default `Tool::truncated() == true`.
+The tool sets `ToolSpec::large_input`, so providers stream the code eagerly (`crates/protocol/src/lib.rs`), declares `Effect::Mutating` (code can change the workspace, so the runtime awaits a cancelled cell until the tool returns, `Runtime::agent`; the tool bounds that wait by the 2 s grace and one destroy attempt under its call timeout, section 5.4), and keeps the default `Tool::truncated() == true`.
 
 **Execution.** The kernel parses the code with `ast` and compiles it with `PyCF_ALLOW_TOP_LEVEL_AWAIT`, so cells may `await`. If the last statement is an expression, it is evaluated separately and its value is the cell's result, also bound to `_`. A coroutine code object runs on the kernel's event loop, which persists across cells.
 
-**Deadline.** `min(now + timeout, NodeCtx::deadline)`, where `timeout` defaults to `Limits::cell_timeout` (1,800 s) and is capped at `Limits::max_cell_timeout` (7,200 s) (`crates/core/src/defaults.rs`). On the deadline, or when the node is cancelled, the supervisor runs the cell exit (section 5.4), which records the cause, cancels the cell token and then sends `interrupt`; the kernel raises `kyora.Cancelled` in the main thread. If the kernel has not returned the cell 2 s later, the watchdog destroys it and the generation ends; the cell keeps the status of its first cause.
+**Deadline.** `min(now + timeout, NodeCtx::deadline)`, where `timeout` defaults to `Limits::cell_timeout` (1,800 s) and is capped at `Limits::max_cell_timeout` (7,200 s) (`crates/core/src/defaults.rs`). On the deadline, or when the node is cancelled, the supervisor runs the cell exit (section 5.4), which records the cause, cancels the cell token and then sends `interrupt`; the kernel raises `kyora.Cancelled` in the main thread. If the kernel has not returned the cell 2 s later, the watchdog makes one bounded destroy attempt and the generation ends; the cell keeps the status of its first cause, and the tool result does not wait for destroy retries.
 
 **Output capture.** The host captures the kernel's stdout and stderr pipes itself, so output from prints, C extensions and subprocesses is bounded outside user code. Per cell and stream the host keeps the first 64 KiB and the last 64 KiB and counts what it drops. At the end of a cell the kernel flushes `sys.stdout` and `sys.stderr` and writes the cell's random marker (sent in `exec`) to fds 1 and 2; the host strips it and closes the cell's capture when it has seen it on both streams, or 1 s after the cell result if user code closed or redirected a descriptor. Output arriving after the marker belongs to the next cell as `[background output]`, bounded the same way. Display data and logs travel on the control channel (section 4.4).
 
@@ -204,7 +204,7 @@ kyora.AgentFailed: agent 9 (chunk-17) ended with status max_turns
 - per cell, `Limits::tool_output_chars` (default 20,000), as for any tool;
 - per model request, `python_turn_chars` (default 40,000; a new repl setting): every `python` result of one assistant message shares it, since one message can hold several `python` calls whose results travel together in one user message (`Runtime::agent` collects them into one tool-results message). **(pending owner confirmation)**
 
-A cell's text is fitted into `min(tool_output_chars, remaining python_turn_chars)`, but never below its `[kyora]` line (at most 500 characters), so a request carries at most `python_turn_chars` plus 500 characters per further cell. The formatter fills the cap in priority order: the `[kyora]` line, `[error]` up to a quarter of the cap, `[result]` up to an eighth, and the remainder shared by stdout, stderr and display, each cut with `kyora_core::tool::truncate` (head and tail around `[... N characters omitted ...]`). The runtime's own cut in `Runtime::agent` is then a no-op backstop. The supervisor keys the shared budget by the node's admitted turn (`ToolCx::turn`, change C8).
+A cell's text is fitted into `min(tool_output_chars, remaining python_turn_chars)`. Two limits are distinct here: `python_turn_chars` is a hard cap on everything except footers, and the `[kyora]` footer (itself cut to at most 500 characters) is always kept. A cell that starts after the budget is spent therefore returns only its footer, and one model request carries at most `python_turn_chars` characters of cell output plus 500 characters for each such further cell. So that a footer always fits, the repl configuration is refused unless `tool_output_chars` is at least 2,000 for nodes that hold `python` (core accepts any positive value, `Limits::validate`) and `python_turn_chars` is at least `tool_output_chars`. The formatter fills the cap in priority order: the `[kyora]` line, `[error]` up to a quarter of the cap, `[result]` up to an eighth, and the remainder shared by stdout, stderr and display, each cut with `kyora_core::tool::truncate` (head and tail around `[... N characters omitted ...]`). The runtime's own cut in `Runtime::agent` is then a no-op backstop. The supervisor keys the shared budget by the node's admitted turn (`ToolCx::turn`, change C8).
 
 **Status.** `ok`, `error` (an exception escaped), `timeout`, `interrupted` (the node was cancelled), `crashed`, `lost` (the executor lost the machine, section 6.6), decided as in section 2.5. Every status except `ok` sets `is_error`.
 
@@ -216,7 +216,7 @@ A cell's text is fitted into `min(tool_output_chars, remaining python_turn_chars
 
 - The module is `kyora`, pre-imported in every cell; its async mirror is `kyora.aio`. **(pending owner confirmation)** The name avoids `rlm`, which the paper authors' `rlms` package uses as its import name (R§1), so that package stays usable inside the kernel.
 - Stdlib only, Python 3.11 or newer **(pending owner confirmation)**: 3.11 brings `asyncio.TaskGroup` and `asyncio.timeout`, which the async API uses, and the integer digit limit that bounds number parsing. The README's "Python 3.9+ for the REPL tests" changes when R0 lands. `pydantic` is used when installed, never required.
-- **Values crossing the boundary are JSON, with fidelity.** The client encodes with `json.dumps(..., allow_nan=False, ensure_ascii=False)`: tuples become lists, other objects raise `TypeError` in the caller, integers longer than the interpreter's digit limit (4,300 digits by default) raise `ValueError`. The host checks syntax with `serde_json::value::RawValue` and passes the text through unchanged; it never converts numbers, since the workspace's `serde_json` has `raw_value` but not `arbitrary_precision` (`Cargo.toml`). Where the host must store a value inside a `serde_json::Value` (`ChildSpec::init`), it stores the JSON text as a string. Nesting deeper than 128 levels (the `serde_json` parser limit) is rejected with `InvalidRequest`. Where the host validates a value against a schema it parses a copy for that check only; integers outside the 64-bit range then fail an `integer` type.
+- **Values crossing the boundary are JSON, with fidelity.** The client encodes with `json.dumps(..., allow_nan=False, ensure_ascii=False)`: tuples become lists, other objects raise `TypeError` in the caller, integers longer than the interpreter's digit limit (4,300 digits by default) raise `ValueError`. The host checks syntax with `serde_json::value::RawValue` and passes the text through unchanged; it never converts numbers, since the workspace's `serde_json` has `raw_value` but not `arbitrary_precision` (`Cargo.toml`). Where the host must store a value inside a `serde_json::Value` (`ChildSpec::init`), it stores the JSON text as a string. The raw path skips values iteratively and does not apply the parser's recursion limit, so the host runs its own depth check: a single pass over the text that tracks string state and bracket depth, converts nothing, and rejects nesting deeper than 128 levels with `InvalidRequest`. The client applies the same limit before sending. Where the host validates a value against a schema it parses a copy for that check only; integers outside the 64-bit range then fail an `integer` type.
 - Every call is bounded: by its own timeout argument where it has one, and always by the cell deadline.
 - Sync calls block the calling thread. Inside a coroutine use `kyora.aio`; a sync call there works but stalls the event loop.
 
@@ -293,11 +293,12 @@ class AgentResult:
     ok: bool               # status == "completed"
     text: str              # the answer as text (JSON text for a structured answer)
     value: Any             # structured answer: parsed JSON, or the pydantic instance; else None
-    truncated: bool        # the answer exceeded 1 MiB and was cut (section 4.8)
     turns: int
     usage_self: Usage; usage_subtree: Usage
     messages: list[Message]  # the child's unread messages consumed together with its result
     already_finished: bool   # set by cancel(): the child had ended before the cancellation
+    teardown_complete: bool  # its kernel and tools are known stopped (False: see fenced_at)
+    fenced_at: datetime.datetime | None   # when an incomplete teardown is fenced anyway
 
 class AgentStatus:         # ChildStatus in recursion.rs
     status: str | None     # None while running or shutting down
@@ -313,11 +314,13 @@ class AgentInfo:
 
 **Arguments.** `task` is the child's first user message. `tools` selects a subset of this agent's tools; omitted, the child gets `defaults::SUBAGENT_TOOLS` intersected with this agent's (`crates/core/src/defaults.rs`), minus the tools its executor cannot host (section 6.2). `model` defaults to this agent's model. `budget` is a subtree token budget, bounded by every ancestor. `timeout` (seconds) is the child's own deadline, capped by this agent's. `max_turns` defaults to `Limits::subagent_max_turns` (50). `context` preloads the variable `context` in the child's kernel; `vars` preloads several (section 3.9). `executor` names where the child's kernel runs, defaulting to this kernel's executor (section 6.2). `output` makes it a structured task (section 3.5).
 
-**`result(yield_after=None)`** waits for the child and returns its `AgentResult` if it completed; non-completed endings raise `AgentFailed` (`AgentCancelled` for `cancelled`), with the result on `.result`. It **consumes** the child's result: its terminal notice and any unread messages it sent, which arrive on `.messages`, so the model is not pinged again **(pending owner confirmation)**. Consumption takes effect only when the reply is committed to the kernel (section 4.7); if the reply cannot be delivered, nothing is consumed and the notice still reaches the model. `yield_after` bounds how long the child may keep running: if it has not ended by then, `StillRunning` is raised and the child keeps going. Once the child has ended, `result()` waits for its result to become deliverable however long that takes (it is one trace record for a cell-owned child, section 5.3), bounded only by the cell deadline. `yield_after=0` polls. Calling `result()` again later returns the same outcome without messages. Works on direct children only.
+**`result(yield_after=None)`** waits for the child and returns its `AgentResult` if it completed; non-completed endings raise `AgentFailed` (`AgentCancelled` for `cancelled`), with the result on `.result`. It **consumes** the child's result: its terminal notice and every unread message it sent before it, which arrive on `.messages`, so the model is not pinged again **(pending owner confirmation)**. `result()` returns only after the terminal notice itself has been committed to the kernel (section 4.7): when the child's queued messages do not fit one reply, the client keeps requesting further replies, each taking the next messages in order, until the reply that carries the notice; only that reply carries the outcome. If a reply cannot be delivered, nothing in it is consumed and the call fails or retries; whatever remains queued, including the notice, still reaches the model. `yield_after` bounds how long the child may keep running: if it has not ended by then, `StillRunning` is raised and the child keeps going. Once the child has ended, `result()` waits for its result to become deliverable however long that takes (it is one trace record for a cell-owned child, section 5.3), bounded only by the cell deadline. `yield_after=0` polls. Calling `result()` again later returns the same outcome without messages. Works on direct children only.
+
+**Large answers.** An answer of more than 1 MiB never travels cut: the host puts it in the session artifact store and the reply carries a reference (Appendix B, `Answer`), which the client fetches whole before `result()` or `outcome` returns.
 
 **`status()`** never blocks and consumes nothing. **`done()`** is `status().status is not None`. Direct children only.
 
-**`cancel()`** cancels the child together with its subtree and returns once it has stopped, with its outcome; cancelling a child that already ended only reports it (`already_finished`). For a direct child it consumes the result like `result()`. It does not raise for the `cancelled` status, since the caller asked for it. It also works on deeper descendants obtained with `kyora.agent(id)`.
+**`cancel()`** cancels the child together with its subtree and returns once the child's node has shut down (its loop ended, its descendants joined, its `node_end` written), with its outcome; cancelling a child that already ended only reports it (`already_finished`). Shut down does not always mean stopped: if a kernel on a machine could not be confirmed destroyed, `teardown_complete` is false and `fenced_at` says when it is fenced by its lease (section 6.5). For a direct child it consumes the result like `result()`, draining through the notice. It does not raise for the `cancelled` status, since the caller asked for it. It also works on deeper descendants obtained with `kyora.agent(id)`.
 
 **Handles across cells.** A handle is a node id plus local state; it stays usable in later cells. A cell-owned child has ended by then (its cell cancelled and joined it), so `result()` returns its final outcome. `kyora.agent(ref)` builds a handle only for a node the host has confirmed is a child (by id or name) or a deeper descendant (by id), including children the model started with the `spawn_agent` tool; anything else raises `InvalidRequest` (section 4.5).
 
@@ -371,16 +374,16 @@ class Message:              # Envelope in crates/core/src/messages.rs
     spawn: int | None; status: str | None
 
 class Waited:
-    finished: list[AgentResult]   # in node id order; answers fetched read-only after the wait
+    finished: list[AgentResult]   # in node id order; each child's notice consumed, answers read after
     running: list[int]
     messages: list[Message]       # what the finished children had queued, in arrival order
 ```
 
 These map onto `NodeCtx::send`, `receive`, `wait` and `pending_messages`, with the same addressing (parent, children, siblings), the same mailbox capacity and body cap, and the same errors (`MailboxFull`, `AgentFinished`, `InvalidRequest`).
 
-`wait()` with no agents waits for every child whose result nobody has consumed yet: the node-owned children the runtime counts as outstanding (`Mailbox::outstanding`, which lists children still awaited and notices still queued) together with this cell's cell-owned children, which the runtime does not count there because they post no notice until a wait stages one (`NodeCtx::wait_via`). The supervisor passes that set explicitly. `timeout` covers running children as `yield_after` does for `result()`.
+`wait()` with no agents waits for every child whose result nobody has consumed yet: the node-owned children the runtime counts as outstanding (`Mailbox::outstanding`, which lists children still awaited and notices still queued) together with this cell's cell-owned children, which the runtime does not count there because they post no notice until a wait stages one (`NodeCtx::wait_via`). The supervisor passes that set explicitly. `timeout` covers running children as `yield_after` does for `result()`. Like `result()`, `wait()` drains: a finished child whose queued messages did not all fit one reply (`Waited::deferred` in `crates/core/src/messages.rs`) is followed up with further replies until its notice is committed, so `finished` lists only children whose results were consumed.
 
-**Delivery budget.** The per-turn `Limits::delivery_chars` bounds what the runtime puts into the model's context as messages. Messages taken by code go into Python variables instead; what code prints is bounded by the output budgets of section 2.6. So code deliveries are not charged against the turn's delivery budget **(pending owner confirmation)**: `receive`, `wait`, `result()` and `cancel()` take whole messages in arrival order up to `max_bytes` of encoded messages (default 4 MiB, at most what fits one reply, section 4.8). They are recorded as delivered `via: code`. Messages code does not take stay queued and reach the model at the next turn boundary under the turn budget, exactly as today. `pending()` reports how many wait.
+**Delivery budget.** The per-turn `Limits::delivery_chars` bounds what the runtime puts into the model's context as messages. Messages taken by code go into Python variables instead; what code prints is bounded by the output budgets of section 2.6. So code deliveries are not charged against the turn's delivery budget **(pending owner confirmation)**: `receive`, `wait`, `result()` and `cancel()` take whole messages in arrival order up to `max_bytes` of encoded messages per reply (default 4 MiB, at least 1 MiB, at most what fits one reply, section 4.8). They are recorded as delivered `via: code`. Messages code does not take stay queued and reach the model at the next turn boundary under the turn budget, exactly as today. `pending()` reports how many wait.
 
 ### 3.8 Budgets and limits
 
@@ -417,7 +420,7 @@ def file(path: str, *, format: str = "text") -> FileRef             # "text", "b
 ```
 
 - **Inline values** must fit the request frame (1 MiB encoded, section 4.8); larger ones raise `ValueTooLarge` locally, with a hint to use a file or an artifact.
-- **File references** carry provenance: the executor, instance and generation of the kernel that made them, the path, its SHA-256 and size. A reference is valid only where the host can check it. On a shared-workspace executor (local) the supervisor opens the path relative to this node's workspace with the file tools' confinement rules and hashes it. On a snapshot executor it accepts only a path whose content still matches the snapshot this kernel started from (the snapshot manifest maps paths to hashes); a file created or changed on the machine raises `InvalidRequest` naming `kyora.artifact`. The child's kernel receives the file by hash (from the shared workspace, or in its own snapshot) and verifies it; a mismatch fails the load, which the child's first cell reports.
+- **File references** carry provenance stamped by the host, not by the kernel: the client sends only the path and format, and the supervisor, which knows this kernel's executor, instance and generation, resolves the path, hashes the file and records the stamped reference (Appendix B, `StampedFile`). A reference is valid only where the host can check it. On a shared-workspace executor (local) the supervisor opens the path relative to this node's workspace with the file tools' confinement rules and hashes it. On a snapshot executor it accepts only a path whose content still matches the snapshot this kernel started from (the snapshot manifest maps paths to hashes); a file created or changed on the machine raises `InvalidRequest` naming `kyora.artifact`. The child's kernel receives the file by hash (from the shared workspace, or in its own snapshot) and verifies it; a mismatch fails the load, which the child's first cell reports.
 - **Artifacts** move bytes explicitly:
 
   ```python
@@ -441,7 +444,7 @@ class ToolResult(str):      # the result text; also:
     final_staged: bool      # the tool committed a final answer, which is now staged on this cell
 ```
 
-`call_tool` runs one of this agent's frozen tools, including MCP tools (`mcp__<server>__<tool>`, mcp.md), with the same input validation and cancellation as a model call, through `NodeCtx::call_tool` (change C4). The result text is not cut to `tool_output_chars`, since it goes to a variable; it is bounded at 4 MiB (section 4.8). Excluded: `python` (a cell cannot run a cell), `submit_result` (use `kyora.final`) and the agent tools (`spawn_agent`, `send_message`, `receive`, `wait`, `cancel_agent`), which the native API covers. At most 8 tool calls per kernel run at once.
+`call_tool` runs one of this agent's frozen tools, including MCP tools (`mcp__<server>__<tool>`, mcp.md), with the same input validation and cancellation as a model call, through `NodeCtx::call_tool` (change C4). The result text is not cut to `tool_output_chars`, since it goes to a variable; it is bounded by the tool's declared maximum and at most 15 MiB, so it fits one reply (section 4.8). Excluded: `python` (a cell cannot run a cell), `submit_result` (use `kyora.final`) and the agent tools (`spawn_agent`, `send_message`, `receive`, `wait`, `cancel_agent`), which the native API covers. At most 8 tool calls per kernel run at once.
 
 A tool that returns `ToolOutput::final_answer` (`crates/core/src/tool.rs`) does not finish the agent from code: its answer is staged on the cell exactly as if passed to `kyora.final`, with the same checks (section 3.11), and `final_staged` is set.
 
@@ -495,7 +498,7 @@ Cancelled(asyncio.CancelledError)            # a BaseException
 | `BudgetExceeded` | `budget_exceeded` | No headroom on this node's scope or an ancestor at admission, or a leaf call's reservation failed. | `RecursionError::BudgetExceeded` |
 | `InvalidRequest` | `invalid_request` | Bad arguments, an unknown or unrelated node, a tool not held or not placeable, an unknown model, a stale file reference. | `RecursionError::InvalidRequest`, section 4.5 checks |
 | `SchemaError` | `schema_error` | An output schema refused at spawn, a result failing pydantic validation, or a staged final value failing this node's schema. | `tool::check_schema`, `tool::validate` |
-| `ValueTooLarge` | `value_too_large`, `data.limit` | An encoded request over 1 MiB (raised locally, nothing sent), a reply over 16 MiB (nothing consumed), a tool result over 4 MiB, or a final value over `message_chars`. | supervisor |
+| `ValueTooLarge` | `value_too_large`, `data.limit` | An encoded request over 1 MiB (raised locally, nothing sent), a reply over 16 MiB (nothing consumed), a tool result over 15 MiB, or a final value over `message_chars`. | supervisor |
 | `ModelError` | `model_error` | A leaf call failed after retries, was refused, or ended without completing. | `RecursionError::ModelError` |
 | `AgentFailed` | none (from the outcome) | `result()` on a child that ended `max_turns`, `budget_exhausted`, `timeout`, `context_exhausted`, `refused`, `failed` or `interrupted`. | `Status` |
 | `AgentCancelled` | none | `result()` on a child that ended `cancelled` while this cell lives. | `Status::Cancelled` |
@@ -631,7 +634,7 @@ The supervisor compares the token in constant time with the one it generated for
 
 ```json
 {"kind": "welcome", "protocol": 1, "node": 4, "parent": 0, "depth": 1,
- "generation": 1, "cwd": "/work", "executor": "local", "scratch": "/tmp/kyora-4-1",
+ "generation": 1, "cwd": "/work", "executor": "local", "instance": "local-4242", "scratch": "/tmp/kyora-4-1",
  "limits": {"max_depth": 2, "max_agents_live": 16, "max_agents_total": 100, "max_llm_calls": 2000,
             "budget_limit": 20000000, "message_chars": 20000, "mailbox_capacity": 64,
             "tool_output_chars": 20000, "python_turn_chars": 40000,
@@ -704,23 +707,23 @@ Kernel to host (all carry `cell` and `scope`):
 | `log` (event) | | `TraceEvent::Log` |
 | `display` (event) | | the cell's display buffer |
 
-`msg.wait` returns summaries of the finished children (status, turns, usage, answer size); the client then fetches each answer with `agent.outcome`, so no single reply has to hold every answer. A still-running child answers `agent.result` with error `still_running`.
+`msg.wait` returns summaries of the finished children whose notices it consumed (status, turns, usage, answer size) and the ids of those it could not finish draining; the client drains those with `agent.result` and then fetches each answer with `agent.outcome`, so no single reply has to hold every answer. `agent.result` and `agent.cancel` return `outcome: null, more: true` until the reply that carries the child's notice (section 4.7). A still-running child answers `agent.result` with error `still_running`.
 
 ### 4.5 Authority and cell scope
 
 What the host enforces:
 
 - **The connection is the node.** It is bound at `welcome` to one node, chosen by the host. No operation names a node to act as; every request is served through that node's `NodeCtx`, so a kernel can do exactly what its node may do, and anything that obtains its control descriptor can do the same and no more.
-- **Every node id is checked before use.** `NodeCtx::resolve` parses a numeric address without checking that the node exists or is related (`crates/core/src/runtime.rs`), so the supervisor never treats a resolved id as authorization. Each operation that takes a node first checks the relation through the runtime's agent directory (`NodeCtx::relation`, change C5):
+- **Every node id is checked before use.** `NodeCtx::resolve` parses a numeric address without checking that the node exists or is related (`crates/core/src/runtime.rs`), so the supervisor never treats a resolved id as authorization. Two checks cover every node argument, and each operation uses exactly one of them:
 
-  | Operation | Allowed targets |
-  |---|---|
-  | `agent.resolve` | a child (by id or name) or a deeper descendant (by id) |
-  | `agent.result`, `agent.outcome`, `agent.status`, `msg.wait` | direct children |
-  | `agent.cancel` | any descendant (`NodeCtx::cancel_agent` checks this too) |
-  | `agent.watch` | any descendant |
-  | `msg.send` | the parent, children and siblings (`NodeCtx::kin`) |
-  | `agent.spawn` tools | tools the node holds, placeable on the child's executor (section 6.2) |
+  | Operation | Allowed targets | Check |
+  |---|---|---|
+  | `agent.resolve` | a child (by id or name) or a deeper descendant (by id) | `NodeCtx::relation` (change C5) |
+  | `agent.result`, `agent.outcome`, `agent.status`, `msg.wait` | direct children | `NodeCtx::relation` |
+  | `agent.cancel` | any descendant | `NodeCtx::relation`, and `NodeCtx::cancel_agent` checks again |
+  | `agent.watch` | any descendant | `NodeCtx::relation` |
+  | `msg.send` | the parent, children and siblings | `NodeCtx::kin`, the existing check inside `NodeCtx::send`; `relation` is never used for messages |
+  | `agent.spawn` tools | tools the node holds, placeable on the child's executor (section 6.2) | the explicit selection, then `NodeCtx::spawn_agent` |
 
   An unknown or unrelated id gets `invalid_request` without revealing whether the node exists.
 - **Event watching is scoped.** `TraceSink::subscribe` delivers the whole session's trace (`crates/core/src/trace.rs`). The supervisor filters it by the watched subtree (section 4.6) before anything else touches a record, and nothing from outside that subtree is ever encoded for the kernel.
@@ -760,15 +763,18 @@ In Python, `Agent.events()` is a generator over these that ends after `ended`.
 
 ### 4.7 Delivery to code
 
-A request that consumes messages (`agent.result`, `agent.cancel`, `msg.receive`, `msg.wait`) must not lose them between the mailbox and the kernel, and must not deliver them twice. The runtime takes them as a **lease** (change C3), and the supervisor commits the lease only once the reply has left the process:
+A request that consumes messages (`agent.result`, `agent.cancel`, `msg.receive`, `msg.wait`) must not lose them between the mailbox and the kernel, must not deliver them twice, and must keep each sender's order. The runtime takes them as a **lease** (change C3), and the supervisor commits the lease only once the reply has left the process. The steps, in order:
 
-1. **Lease.** The `_with` method takes the messages with `Take::Code { max_bytes, owner }`, where `owner` is the cell token. Leased envelopes leave the queue but are not delivered: no other taker sees them, they still count against the mailbox capacity, and their notices' senders are not yet consumed. The take is refused, leasing nothing, if `owner` is already cancelled; the check is in the same critical section as the take.
-2. **Validate.** The supervisor builds the complete reply and measures its encoded size. `max_bytes` was chosen as the response cap minus the size of everything else in the reply, so the reply fits by construction; if it does not anyway, the lease is aborted and the request fails with `value_too_large`, consuming nothing.
-3. **Reserve.** It acquires response memory for the exact size (section 4.8). If none is free within 10 s, the lease is aborted and the request fails with `overloaded`, consuming nothing.
-4. **Admit.** Under the connection gate it checks that the cell is still open and the connection alive, and queues the frame for the writer. Otherwise it aborts the lease and answers `cancelled`.
-5. **Commit or abort.** When the writer has written the whole frame to the socket, the lease commits: `message_delivered` is recorded with `via: code`, and each notice's sender is marked consumed by this cell. If the write fails because the connection ended, the lease aborts.
+1. **Barrier.** The supervisor acquires the mailbox's code-delivery barrier: at most one code lease per mailbox is in flight, from lease to commit or abort. Without it, request A could lease a child's progress messages and wait for reply memory while request B leased the same child's later notice and committed first; aborting A could not undo B, and the result would reach code before the progress, breaking the FIFO order the mailbox keeps today (`take` in `crates/core/src/messages.rs`). The barrier is held for a bounded time (the 10 s permit wait plus the 30 s write progress rule of section 4.8), and waiting for it ends when the cell token is cancelled. Turn deliveries and model-facing tools never contend for it, since none of them runs during a cell (section 2.2).
+2. **Reserve.** Before creating any reply material, it computes the reply's maximum encoded size: `max_bytes` for messages, plus the encoded size of everything else (an outcome is measured by borrowing it, without a copy, change C5), plus a fixed envelope allowance. It acquires response memory for that size (section 4.8). If none is free within 10 s it answers `overloaded`, having leased nothing.
+3. **Lease.** The `_with` method takes the messages with `Take::Code { max_bytes, owner }`, where `owner` is the cell token. Leased envelopes leave the queue but are not delivered: no other taker sees them, they still count against the mailbox capacity, and their notices' senders are not yet consumed. The take is refused, leasing nothing, if `owner` is already cancelled; the check is in the same critical section as the take. A code take always includes at least one whole envelope: `max_bytes` is at least 1 MiB, and the repl configuration is refused unless an envelope of `message_chars` characters fits in it.
+4. **Validate.** It encodes the reply. It fits the reservation by construction; if it does not anyway, the lease is aborted and the request fails with `value_too_large`, consuming nothing.
+5. **Admit.** Under the connection gate it checks that the cell is still open and the connection alive, and queues the frame for the writer. Otherwise it aborts the lease and answers `cancelled`.
+6. **Commit or abort.** When the writer has written the whole frame to the socket, the lease commits: `message_delivered` is recorded with `via: code`, and each notice's sender is marked consumed by this cell. If the write fails because the connection ended, the lease aborts. Either way the barrier and the unused part of the reservation are released.
 
 Aborting returns every leased envelope to its place in the queue (each queued envelope keeps an arrival sequence), wakes waiters, and records nothing; those messages reach the model at the next turn boundary as if code had never asked.
+
+**Draining a child's result.** `agent.result` and `agent.cancel` take only that child's envelopes, in arrival order. When the child's terminal notice is among them, the reply carries the outcome. When it is not, because the messages queued ahead of it did not fit (the runtime reports this as `Waited::deferred`), the reply carries those messages with `outcome: null, more: true`, and the client immediately asks again for the same child, each time under the barrier, until the reply that carries the notice. Each round takes at least one envelope, so the drain ends. `result()` returns only then, with every message on `.messages`, so its contract holds: once it has returned, the notice is consumed and the model is not pinged. A failed round (overload, cancellation) leaves the rest queued; what earlier rounds committed stays delivered, in order.
 
 **The ordering point** is the gate. Cell exit (section 5.4) takes the gate to close the cell before it sends `interrupt`, so every reply was either queued ahead of everything cell exit sends, and is delivered before the kernel sees the interrupt, or is aborted. A lease never outlives its cell: cell exit awaits every request of the cell, and each finishes with a commit or an abort.
 
@@ -785,9 +791,10 @@ Aborting returns every leased envelope to its place in the queue (each queued en
 | outstanding kernel requests | 256 | the client raises `LimitExceeded("outstanding")` locally; an excess request is a violation and destroys the kernel |
 | bytes of outstanding kernel requests | 64 MiB | as above |
 | concurrent `tool.call` | 8 | `limit_exceeded` (`tool_calls`) |
-| tool result returned to code | 4 MiB | `value_too_large` |
-| answer inside an outcome | 1 MiB | cut, `truncated: true`; the full answer stays on the handle and in `node_end` |
-| code delivery per reply | `max_bytes`, default 4 MiB, at most 14 MiB | whole messages only; the rest stays queued |
+| tool result returned to code | 15 MiB, and the tool's declared maximum (below) | `value_too_large` |
+| answer inside a reply | 1 MiB | larger answers travel as an artifact reference (`{artifact}` in `Outcome.answer`), never cut |
+| code delivery per reply | `max_bytes`, default 4 MiB, at least 1 MiB, at most 14 MiB | whole messages only; the rest stays queued or follows in the next drain round |
+| concurrent `llm` handlers | 32 per kernel | further requests wait for a slot, holding only their request |
 | subscriptions per kernel | 16 | `limit_exceeded` (`subscriptions`) |
 | events queued per subscription | 256, at most 2 KiB each | dropped, `lagged` |
 | response memory per kernel | 64 MiB | reply waits up to 10 s, then `overloaded`; events dropped |
@@ -799,9 +806,21 @@ Aborting returns every leased envelope to its place in the queue (each queued en
 | graceful shutdown | 2 s | destroy |
 | kernel restarts per node | 5 | the tool refuses |
 
-**Response memory.** Every encoded reply and event frame holds permits for its exact byte size, from encoding until the writer has written it; the writer queue is therefore part of the 64 MiB per kernel, not extra. A handler computes the encoded size with a counting serializer, which allocates nothing, before it encodes. Values that exist before encoding are bounded separately: at most 8 tool results of 4 MiB, leaf texts bounded by `llm_max_output_tokens`, and leased messages, which already live in mailbox memory bounded by the capacity and `message_chars`. Without these permits, 256 handlers holding replies near the 16 MiB cap could hold about 4 GiB outside the writer queue.
+**Reply material.** Any bytes the supervisor creates or copies for a reply count: encoded frames, copies of outcomes, rendered tool results, artifact chunks and their encodings. The rule is that a handler reserves response memory for the most material it can create before it creates or copies any of it; where the material is produced by the runtime rather than the supervisor, a separate aggregate limit covers it. The per-kernel budget (64 MiB) and the process budget (512 MiB) apply to every reservation, and the writer queue is inside them, not extra.
 
-**Overload path.** A handler that cannot get its permits within 10 s drops its result (aborting any lease, section 4.7) and answers `overloaded`. That error, like every error reply, is a small fixed-size frame (at most 1 KiB) drawn from one slot reserved for each outstanding request when the request was accepted, so an error can always be queued. The reader never awaits a permit or a handler; it only decodes, checks and dispatches, so it keeps draining the channel however full the reply side is. A kernel that stops reading is destroyed by the writer progress rule.
+| Operation | Material | Control |
+|---|---|---|
+| any reply or event | the encoded frame | reserved for its exact size, measured with a counting serializer that allocates nothing, before encoding; events that cannot reserve are dropped (`lagged`) |
+| `agent.result`, `agent.cancel`, `agent.outcome`, `msg.wait`, `msg.receive` | outcome copies, leased envelopes | reserved before the lease and before any copy (section 4.7); outcomes are measured by borrowing (change C5); leased envelopes are moved out of mailbox memory, which the capacity and `message_chars` already bound |
+| `tool.call` | the tool's rendered result | reserved for the tool's declared maximum (`Tool::max_output_bytes`, change C4) before the call: MCP tools declare 16 MiB, the per-message limit of mcp.md, covering their rendering (`crates/mcp/src/tool.rs`); `shell` and the file tools declare their capture and read caps. A tool without a declared maximum cannot be called from code. |
+| `artifact.get` | a 2 MiB chunk and its base64 | reserved before the file is read |
+| `artifact.put` | incoming chunks | request-side limits (outstanding request bytes); each chunk is written to disk before the next is accepted |
+| `llm` | the leaf's response, produced by the runtime | at most 32 `llm` handlers per kernel, each response bounded by `llm_max_output_tokens`, and process-wide by `max_inflight_requests`; the reply is then reserved like any other |
+| cell exit joining children | outcomes | not copied: cell exit awaits `AgentHandle::finished` (change C5) instead of `AgentHandle::result`, which clones (`crates/core/src/recursion.rs`) |
+
+Without this rule, 256 concurrent handlers could each build a near-cap reply before reserving, about 4 GiB per kernel.
+
+**Overload path.** A handler that cannot get its reservation within 10 s gives up before creating material, or, for runtime-produced material such as a finished leaf, drops it, and answers `overloaded`; a lease is never taken without a reservation, so nothing is consumed. That error, like every error reply, is a small fixed-size frame (at most 1 KiB) drawn from one slot reserved for each outstanding request when the request was accepted, so an error can always be queued. The reader never awaits a reservation or a handler; it only decodes, checks and dispatches, so it keeps draining the channel however full the reply side is. A kernel that stops reading is destroyed by the writer progress rule.
 
 **Violations.** A malformed envelope kills the kernel: a bad frame, a body that is not JSON, an unknown `kind`, a missing or non-increasing `id`, a response to an id never sent or already answered, a request before `welcome`, or a request beyond the outstanding limits. The cell ends `crashed` with `protocol violation: <reason>`, and the run goes on. A well-formed request with bad arguments gets `invalid_request` and the kernel keeps running (D9.5).
 
@@ -881,19 +900,19 @@ Code consumption breaks that inference: after code takes a notice, the child sta
 Cell exit runs on every ending (ok, error, timeout, interrupted, crashed, lost), before the tool result is returned:
 
 1. **Close.** Under the gate, the supervisor records the cause (which fixes the cell's status, section 2.5), marks the cell closed, and cancels the cell token. From here no reply for this cell is admitted (section 4.7); leaf calls of the cell stop and settle (m1-runtime.md, "Accounting and ownership"); cell-owned children are cancelled with their subtrees; code takes are refused.
-2. **Stop the code.** If the kernel is still running the cell, it sends `interrupt`, waits up to 2 s for the cell's result, and otherwise destroys the instance (section 2.5).
+2. **Stop the code.** If the kernel is still running the cell, it sends `interrupt`, waits up to 2 s for the cell's result, and otherwise makes one destroy attempt under its call timeout (section 6.5) and ends the generation. It does not wait for destroy retries: host-side work for the cell was cancelled in step 1, and the kernel cannot act through kyora once the gate is closed.
 3. **Drain requests.** It awaits every request task of the cell; each ends with a reply written, a lease aborted, or `cancelled`. Leaf calls, waits and receives end promptly once the token is cancelled. Tool calls end as section 3.10 describes: a shell call when its group is killed, a started file write or edit when it completes (no deadline), an MCP call once kyora has sent its cancellation, which does not mean the server stopped.
-4. **Join children.** It awaits `AgentHandle::result()` for every cell-owned child of the cell. Each resolves only after that child's ordered shutdown: its mailbox closed, its descendants cancelled and joined, its `node_end` written (agent-messages.md, "Termination and cancellation").
+4. **Join children.** It awaits `AgentHandle::finished()` (change C5; it waits without copying the outcome) for every cell-owned child of the cell. Each resolves only after that child's ordered shutdown: its mailbox closed, its descendants cancelled and joined, its `node_end` written (agent-messages.md, "Termination and cancellation").
 5. **Report.** It ends the cell's event subscriptions, writes `cell_end`, and returns the tool result, listing the children cancelled at cell end.
 
-Persistent children are not touched. Every step is bounded by the cell's deadline machinery except started file mutations and MCP calls, which end on their own terms as described; cancellation reaches a provider within `PROVIDER_CANCEL_GRACE` (250 ms).
+Persistent children are not touched. Every step is bounded by the cell's deadline machinery, the 2 s grace and the destroy call timeout, except started file mutations and MCP calls, which end on their own terms as described; cancellation reaches a provider within `PROVIDER_CANCEL_GRACE` (250 ms). A child joined in step 4 may report an incomplete teardown (below); its node has ended, but code on its machine is only known stopped by its `fenced_at`.
 
 Node shutdown, with the Python layer, runs in this order (the existing order of `Runtime::run_node` plus C1):
 
 1. The agent loop ends; no cell is running, since cells run inside the loop.
 2. The mailbox closes; queued messages are recorded as undelivered.
-3. Admission closes, descendants (persistent children, and cell-owned ones of a cell that was cut short) are cancelled and joined; concurrently, each tool's shutdown hook runs, for `python` closing the gate and destroying the kernel (section 2.5).
-4. `node_end` is written and the live-agent slot is released.
+3. Admission closes, descendants (persistent children, and cell-owned ones of a cell that was cut short) are cancelled and joined; concurrently, each tool's start task is cancelled and joined, then its shutdown hook runs, for `python` closing the gate and tearing the kernel down within 12 s (section 2.5). Each hook returns a teardown report.
+4. `node_end` is written with the combined teardown report (complete only if every tool's is; `fenced_at` the latest), the same report goes into the node's `AgentOutcome`, and the live-agent slot is released.
 5. The node's handle resolves and its notice goes to its parent.
 
 ### 5.5 Ledger and trace
@@ -915,6 +934,7 @@ What each call records:
 | `receive`, `wait`, `result`, `cancel` | `message_delivered` with `via: code`, written at lease commit; `message_sent` for a staged notice of a cell-owned child |
 | `call_tool` | `tool_call` and `tool_result` with `origin_cell` and call id `py:<generation>.<cell>.<n>` |
 | `final` | `cell_end` notes it; `node_end` carries the answer |
+| node shutdown | `node_end` gains `teardown {complete, fenced_at?, note?}` (C1) |
 | `log` | `log {node, cell, level, message}` (new) |
 | `budget`, `limits`, `status`, `tools`, `pending` | nothing |
 
@@ -922,14 +942,20 @@ What each call records:
 
 ### 5.6 Required core changes
 
-Additive changes to `kyora-core`, each with its own tests. C1, C2, C8 and the kernel, cell and log events of C7 block R0; C3, C5 and C6 block R1; C4 lands with R2, and the artifact events of C7 with R3.
+Additive changes to `kyora-core`, each with its own tests. C1 (with its read accessors), C2, C6, C8 and the kernel, cell and log events of C7 block R0; C3 and C5 block R1; C4 lands with R2, and the artifact events of C7 with R3.
 
-- **C1. Toolset retention and shutdown.** Today the frozen toolset is a local of `Runtime::agent` (`let tools = tools?;`) and only its names reach `NodeState::tools`. Keep the `Toolset` itself in `NodeState` from the moment the factory returns (C4 needs it too). Add `Tool::shutdown(&self)` (async, default no-op). After the agent loop ends, and also when the loop never started because `node_start` or a later step failed after the factory returned, `Runtime::run_node` calls `shutdown` once on each tool, concurrently with `join_descendants`, each under `catch_unwind` (a panic marks the run failed, like other panics there), and awaits them before `node_end`. A factory that fails or panics returns no toolset, so there is nothing to shut down; factories must therefore not start processes or hold external resources, which the `python` tool satisfies by starting its kernel lazily. Tools shared across nodes (MCP) keep the no-op.
+- **C1. Toolset retention, lifecycle hooks and accessors.** Today the frozen toolset is a local of `Runtime::agent` (`let tools = tools?;`) and only its names reach `NodeState::tools`; `submit_result` is added after the factory returns (`with_own_validation` in `Runtime::agent`), and neither `NodeInfo` nor `ToolCx` exposes the output contract. C1:
+  - keeps the final `Toolset` (after selection and `submit_result`) in `NodeState` from the moment it is built, and adds read accessors `NodeCtx::tools()` (frozen specs) and `NodeCtx::output_schema()` (the contract, if any), which R0 needs for early `final` checks;
+  - adds `Tool::start(&self, node: &NodeCtx)` (async, default no-op). Once the toolset is retained and `node_start` is written, `Runtime::run_node` runs each tool's `start` as a task owned by the node, concurrently with the first model request; the node token cancels it. This is the entry point for eager remote kernels (section 6.2), since factories are synchronous (`ToolsetFactory::toolset`, `crates/core/src/tool.rs`) and must not start processes;
+  - adds `Tool::shutdown(&self) -> Teardown` (async, default `Teardown { complete: true, fenced_at: None, note: None }`). After the agent loop ends, and also when the loop never started because `node_start` or a later step failed after the toolset was built, `Runtime::run_node` cancels and joins the start tasks, then calls `shutdown` once on each tool, concurrently with `join_descendants`, each under `catch_unwind` (a panic marks the run failed, like other panics there, and counts as an incomplete teardown), and awaits them before `node_end`. Hooks bound their own duration; the runtime adds no timeout;
+  - adds `AgentOutcome::teardown` (serde default complete) and the same field on `node_end`, combining the tools' reports.
+
+  A factory that fails or panics returns no toolset, so there is nothing to start or shut down; factories must therefore not start processes or hold external resources, which the `python` tool satisfies by starting its kernel lazily or in `start`. Tools shared across nodes (MCP) keep the no-op hooks.
 - **C2. Leaf origin and usage.** `LlmCall::origin_cell: Option<u32>`, recorded on the leaf's `node_start` (`NodeCtx::llm_owned` writes `origin_cell: None` today). `LlmOutcome` gains the leaf's ledger usage (`Ledger::usage`, which includes reservations charged for failed attempts), and a failed call reports the leaf id and that usage alongside its `RecursionError` when a leaf was admitted, so the cell's accounting is exact.
 - **C3. Code delivery.** `Take::Turn` (today's behaviour) and `Take::Code { max_bytes, owner }` arguments for `NodeCtx::receive_with`, `wait_with` and `cancel_agent_with`; the existing methods call them with `Take::Turn`. `Take::Code` returns a lease with `commit(cell)` and `abort()` (also on drop); queued envelopes keep an arrival sequence so an abort restores their order; leased plain messages keep counting against the capacity. `Delivery::Code` for the trace, the mailbox's `consumed` map, and the revised `NodeCtx::report` of section 5.3.
-- **C4. Tools from code.** `NodeCtx::tools()` and `NodeCtx::call_tool(name, input, cancel, origin_cell)`, over the toolset C1 retains, validating and executing like `Runtime::agent` and recording `tool_call` and `tool_result` (both gain an optional `origin_cell`). `ToolOutput::final_answer` is returned to the caller, never committed by `call_tool`.
-- **C5. Agent directory.** `AgentEntry` (`crates/core/src/runtime.rs`) gains the owner kind and the origin cell. New: `NodeCtx::relation(id) -> Result<Relation, RecursionError>` (child or deeper descendant, checking that the node exists), `NodeCtx::children()`, `NodeCtx::subtree(id)` (the snapshot of section 4.6), `NodeCtx::child_status(id)` and `NodeCtx::child_outcome(id)` (a read of an ended child's outcome that consumes nothing), all from the runtime's agent directory, so they also cover children the model started with `spawn_agent`.
-- **C6. Counters.** `Ledger::counters(node)` returning the session-wide live, total and leaf counts that admission checks, and the node's subtree counts, kept on each scope under the ledger's mutex.
+- **C4. Tools from code.** `NodeCtx::call_tool(name, input, cancel, origin_cell)`, over the toolset C1 retains, validating and executing like `Runtime::agent` and recording `tool_call` and `tool_result` (both gain an optional `origin_cell`). `ToolOutput::final_answer` is returned to the caller, never committed by `call_tool`. `Tool::max_output_bytes() -> Option<usize>` (default `None`) declares the largest result a tool renders, for the reservation of section 4.8; the built-in and MCP tools declare theirs.
+- **C5. Agent directory.** `AgentEntry` (`crates/core/src/runtime.rs`) gains the owner kind and the origin cell. New: `NodeCtx::relation(id) -> Result<Relation, RecursionError>` (child or deeper descendant, checking that the node exists), `NodeCtx::children()`, `NodeCtx::subtree(id)` (the snapshot of section 4.6), `NodeCtx::child_status(id)`, `NodeCtx::child_outcome(id)` (a read of an ended child's outcome that consumes nothing) and `NodeCtx::with_child_outcome(id, f)` (borrows the outcome, so its encoded size can be measured before anything is copied), all from the runtime's agent directory, so they also cover children the model started with `spawn_agent`. `AgentHandle::finished()` waits for the outcome without cloning it, unlike `AgentHandle::result()` (`crates/core/src/recursion.rs`).
+- **C6. Counters.** `Ledger::counters(node)` returning the session-wide live, total and leaf counts that admission checks, and the node's subtree counts, kept on each scope under the ledger's mutex. The R0 `budget` reply carries them.
 - **C7. Trace events.** `KernelStart`, `KernelEnd`, `CellStart`, `CellEnd`, `VarLoaded`, `ArtifactPut`, `ArtifactGet` and `Log` (persisted) and `CellOutput` (ephemeral) in `TraceEvent`.
 - **C8. Turn identity.** `ToolCx::turn`, the node's admitted turn number, so tools can share a budget across the calls of one assistant message (section 2.6).
 
@@ -952,7 +978,7 @@ pub trait Executor: Send + Sync {
 pub struct ExecutorTraits {
     pub workspace: Workspace,   // Shared | Snapshot
     pub isolation: Isolation,   // Process | Machine
-    pub fencing: Fencing,       // Confirmed | Lease | None (section 6.5)
+    pub fencing: Fencing,       // Confirmed | Lease { max_skew: Duration } | None (section 6.5)
 }
 pub struct KernelSpec {
     pub node: NodeId, pub generation: u32,
@@ -974,14 +1000,17 @@ pub struct KernelLink {
 #[async_trait]
 pub trait Instance: Send + Sync {
     fn id(&self) -> &str;
-    async fn renew(&self, ttl: Duration) -> Result<(), ExecError>;
+    /// Extends the lease to an absolute UTC time; never shortens it.
+    async fn renew(&self, expires_at: DateTime<Utc>) -> Result<(), ExecError>;
     async fn destroy(&self) -> Destroyed;
 }
 pub enum Destroyed { Confirmed, Failed(String), Unknown }
 ```
 
+The supervisor makes every `renew` and `destroy` call under a call timeout (10 s each); a call that times out counts as `Unknown` for `destroy` and as a failed renewal for `renew`, and its future is dropped, so no caller ever waits on an executor without bound.
+
 - **`LocalExecutor`**: socketpair, pipes and a process group, as in sections 2.5 and 4.1. `destroy` sends SIGKILL to the group and reaps the process, then returns `Confirmed`. Traits: `Shared`, `Process`, `Confirmed`.
-- **Machine executors**: any provider of these primitives can back one: create a machine from an image that has `python3`, open an authenticated byte stream to a process on it, transfer files, destroy it and report the result, and, for `Lease` fencing, stop it on its own when its lease lapses. kyora vms is the first adapter; containers, other microVM services or SSH hosts fit the same interface. Traits: `Snapshot`, `Machine`, and the fencing the provider can guarantee.
+- **Machine executors**: any provider of these primitives can back one: create a machine from an image that has `python3`, open an authenticated byte stream to a process on it, transfer files, destroy it and report the result, and, for `Lease` fencing, stop it on its own at the absolute expiry it was last given, by a clock within `max_skew` of the host's. kyora vms is the first adapter; containers, other microVM services or SSH hosts fit the same interface. Traits: `Snapshot`, `Machine`, and the fencing the provider can guarantee.
 
 This replaces D13.3's `ExecBackend::spawn_repl`: instead of one byte stream and a kill switch, an executor returns separate control and output channels and an instance with an asynchronous destroy result, which gives slow output, loss and fencing a defined place.
 
@@ -998,7 +1027,7 @@ The selection is fixed before admission, because core freezes it: `NodeCtx::spaw
 
 The same filter applies to the root when `--executor` names a snapshot executor. A child of a node that lacks these tools never regains them, by the existing attenuation rule.
 
-On machine executors the kernel starts eagerly when the child is admitted, so the machine boots while the child's first model request is in flight. A start failure then surfaces as an error on the child's first `python` call, which the child's model sees; the node itself goes on.
+On machine executors the kernel starts eagerly, from the `python` tool's start hook (change C1), which the runtime runs as node-owned work once the child's toolset is retained, so the machine boots while the child's first model request is in flight. The first `python` call awaits that start if it is still in flight. Cancelling the node cancels the start, which is cancel-safe (section 6.1), and the shutdown sequence joins it before the tool's shutdown hook runs (section 5.4), so a machine is never started after its node began shutting down and never left without an owner. A start failure surfaces as an error on the child's first `python` call, which the child's model sees; the node itself goes on.
 
 ### 6.3 The mux
 
@@ -1014,9 +1043,9 @@ flags      bit 0 MORE: this control frame continues in the next channel 0 mux fr
 ```
 
 - **Fragmentation.** A protocol frame (up to 16 MiB toward the kernel, 1 MiB from it) is split into consecutive channel 0 chunks of at most 64 KiB; the last has `MORE` clear. Chunks of two control frames never interleave; bulk chunks may appear between them. A mux frame longer than 64 KiB plus its header, an unknown channel, or a fragment sequence that exceeds the protocol cap is a violation.
-- **Scheduling.** Each direction's sender picks the next chunk by strict priority: channel 3, then channel 0, then channels 1 and 2 in turn. A control chunk therefore waits behind at most one bulk chunk already being written, and control overtakes any amount of queued output.
+- **Scheduling.** Each direction's sender takes whole chunks in a weighted round: channel 3 first whenever it has a chunk, then up to four channel 0 chunks, then one bulk chunk (channels 1 and 2 alternating) if any bulk is waiting with credit, and again. Control therefore overtakes queued output and waits behind at most one bulk chunk at a time, while output keeps a guaranteed share: at least one chunk in every six, about a sixth of the link when both are backlogged. Strict priority would let a busy control channel starve output indefinitely, so it is not used.
 - **Credits.** Channels 1 and 2 (machine to host) flow under credit windows of 1 MiB each: the host grants credit on channel 3 as it consumes, the relay never sends beyond its credit, and when credit runs out the relay stops reading the kernel's pipes, so the kernel blocks on writes as it would on a full local pipe. A grant that would raise a window above 1 MiB, or bulk bytes beyond the granted credit, is a violation. Channel 0 has no window; it is bounded by the protocol's own limits (outstanding requests, response memory), and both ends always drain it.
-- **Watchdogs.** Two separate checks. Progress: a side with bytes waiting to be written that cannot write any for 30 s declares the stream stalled. Liveness: the host pings on channel 3 every 10 s; no mux frame of any kind for 30 s declares the kernel lost. Either ends the generation as `lost` (section 6.6).
+- **Watchdogs.** Three separate checks. Stream progress: a side with bytes waiting to be written that cannot write any for 30 s declares the stream stalled. Output progress: a bulk channel with data waiting and credit available that sends nothing for 30 s declares the scheduler stalled, which the weighted round rules out unless an end misbehaves. Liveness: the host pings on channel 3 every 10 s; no mux frame of any kind for 30 s declares the kernel lost. Any of them ends the generation as `lost` (section 6.6).
 
 The relay is a stdlib script shipped with the kernel files (`kyora_relay.py`). On the machine it starts the kernel exactly as the local executor does (socketpair on fd 3, pipes, process group, the token on stdin), forwards channels, and reports the exit status.
 
@@ -1029,7 +1058,7 @@ The relay is a stdlib script shipped with the kernel files (`kyora_relay.py`). O
 | Kernel files | host to machine | The embedded boot, package and relay files, by content hash. |
 | Workspace snapshot | host to machine | At kernel start, content-addressed so siblings reuse it; its manifest (path to hash) stays with the supervisor for checking file references (section 3.9). |
 | File variables | host to machine | By hash, from the snapshot or uploaded separately. |
-| Artifacts | both, explicitly | `kyora.artifact` uploads from the machine to the host's session store; `kyora.fetch` and artifact variables download to a machine. Chunks travel over channel 0 (`artifact.put` 512 KiB, `artifact.get` 4 MiB of data per frame); an executor may move the bytes through its own file transfer instead. |
+| Artifacts | both, explicitly | `kyora.artifact` uploads from the machine to the host's session store; `kyora.fetch` and artifact variables download to a machine. Chunks travel over channel 0 (`artifact.put` 512 KiB, `artifact.get` 2 MiB of data per frame); an executor may move the bytes through its own file transfer instead. |
 | Never | | Model credentials, provider traffic, the ledger, other nodes' frames. Machines never talk to each other; the host is the hub. |
 
 Nothing flows back implicitly. Changes made on a machine stay there until code publishes them as artifacts or returns them as values; there is no workspace merge **(pending owner confirmation)**.
@@ -1038,11 +1067,14 @@ The host runs every agent loop (cheap async tasks) and every model call; machine
 
 ### 6.5 Leases, destruction and fencing
 
-- **Leases.** While a generation is live, the host renews its instance every 30 s with a TTL of 120 s. An executor with `Lease` fencing guarantees that a machine whose lease lapses stops by itself within the TTL. Renewal failing for longer than the TTL ends the generation as `lost`.
-- **Destroy.** `destroy` returns `Confirmed` (the kernel can no longer run), `Failed` or `Unknown`. On `Failed` or `Unknown` the host retries with backoff for as long as the run lasts and records each result in `kernel_end`. Node shutdown waits at most 10 s for confirmation and then writes `node_end` with `destroy: unconfirmed`; the lease is the backstop.
-- **Startup cancellation.** `start` is cancel-safe (section 6.1). When the supervisor abandons a kernel after `start` returned but before `welcome`, it calls `destroy` like any other end.
-- **Restart waits for termination.** A partitioned old kernel may still be running and causing side effects of its own, so on a machine executor a new generation starts only when the previous instance is known stopped: `destroy` returned `Confirmed`, or, with `Lease` fencing, the lease's TTL has passed since the last successful renewal plus 30 s of margin. With `None` fencing and no confirmation, the `python` tool refuses to start a kernel for that node and says why (`previous kernel on instance i-7 not confirmed stopped`); the node's model can go on without Python. Locally the old process is always killed and reaped first.
-- **Host crash.** Renewals stop; `Lease` machines stop within the TTL; `None` machines may run until someone removes them, which the executor's documentation must state. On resume, nodes that were running are recorded as interrupted (D11.3).
+A partitioned old kernel may still be running and causing side effects of its own, so the host must know when an instance can no longer run before it starts a replacement or reports a teardown as complete. That moment is its **fence time**.
+
+- **Leases with absolute expiry.** While a generation is live, the host renews its instance every 30 s, each time to an absolute expiry `expires_at = now + 120 s` on the host's clock, and records the largest `expires_at` it has ever **sent**, whether or not the call was acknowledged. An executor with `Lease { max_skew }` fencing must stop the machine at the latest expiry it has received, by a clock within `max_skew` of the host's, and never extends a lease on its own. A renewal whose acknowledgement is lost may still have taken effect, so the fence time is the largest expiry sent plus `max_skew` plus 30 s of margin, never the last acknowledged renewal plus the TTL. Renewals stop when teardown begins. Renewals failing for longer than 120 s end the generation as `lost`.
+- **Destroy, bounded.** Every `destroy` call has the 10 s call timeout of section 6.1. `Confirmed` makes the fence time now. On `Failed` or `Unknown` the host retries in the background with backoff (1 s, doubling to at most 60 s) until a call confirms or the run ends, and records each result in `kernel_end`. Neither cell exit nor node shutdown waits for these retries: cell exit makes one attempt (section 5.4), and the shutdown hook makes attempts for at most 10 s after the 2 s grace, then returns its teardown report (section 5.6, C1): complete if destroy was confirmed; otherwise incomplete, with `fenced_at` set to the fence time under `Lease` fencing, or absent under `None`.
+- **What "stopped" means to callers.** A child's node can end while its machine is unconfirmed. Its outcome then carries `teardown_complete: false` and `fenced_at` (Appendix B, `Outcome.teardown`), and `cancel()` and `result()` say so (section 3.4), instead of promising stopped execution.
+- **Startup cancellation.** `start` is cancel-safe (section 6.1). When the supervisor abandons a kernel after `start` returned but before `welcome`, it destroys it like any other end.
+- **Restart waits for the fence.** On a machine executor a new generation starts only after the previous instance's fence time: at once after a confirmed destroy, or once the lease bound has passed. A `python` call waits up to 30 s for that; if the fence is further away it returns a tool error naming the instance and the time a kernel can start again. With `None` fencing and no confirmation there is no fence time, so the tool refuses new kernels for that node and says why (`previous kernel on instance i-7 not confirmed stopped`); the node's model can go on without Python. Locally the old process is always killed and reaped first.
+- **Host crash.** Renewals stop; `Lease` machines stop at their last expiry; `None` machines may run until someone removes them, which the executor's documentation must state. On resume, nodes that were running are recorded as interrupted (D11.3).
 
 ### 6.6 Failure modes
 
@@ -1053,8 +1085,8 @@ The host runs every agent loop (cheap async tasks) and every model call; machine
 | Machine lost | the stream ends without an exit report, or the executor reports loss | The cell ends `lost`; cell exit runs (cell-owned children are host nodes and are cancelled); destroy is attempted; the next call starts a new machine once section 6.5 allows. |
 | Network partition | liveness or progress watchdog (section 6.3) | Treated as lost, with destroy as the fencing step. A new generation has a new stream and token, so nothing from the old one is accepted. |
 | Slow link | credits exhausted | Output backpressure only; control frames go through. |
-| Destroy fails | `Failed` or `Unknown` | Retries; a restart waits as section 6.5 says. |
-| Host crash | renewals stop | Section 6.5. |
+| Destroy fails or times out | `Failed` or `Unknown`, or the 10 s call timeout | Background retries; teardown reported incomplete with its fence time; a restart waits for the fence as section 6.5 says. |
+| Host crash | renewals stop | Machines stop at their last expiry under `Lease` fencing (section 6.5). |
 
 A partitioned kernel cannot spawn, call a model or message anyone, since all of that goes through the host. It can still have side effects of its own (writing to external systems), so the host never replays a cell: a cell that ends `lost` is reported to the model, which decides what to do.
 
@@ -1063,15 +1095,15 @@ A partitioned kernel cannot spawn, call a model or message anyone, since all of 
 All tests run without network or keys, as today (`cargo test --workspace --locked`, CLAUDE.md). The REPL tests need a real `python3`; CI runs them on the oldest supported version (3.11, pending confirmation) and the newest, on Linux and macOS (D19).
 
 - **Codec and handshake (Rust units).** Frames split at every byte, zero and oversized lengths, invalid UTF-8, non-object bodies, a stalled body (30 s rule under paused time), bad and missing tokens, version negotiation, unknown operations, non-increasing and duplicate request ids (rejected before dispatch, so no side effect happens), duplicate and unsolicited responses.
-- **Mux.** Random interleavings, fragmentation at every boundary, oversized and unknown frames, credit overrun, property tests that a control frame waits behind at most one bulk chunk, and both watchdogs under paused time.
-- **Leases (core).** Property tests over random interleavings of code takes, commits, aborts, turn deliveries, sends and cell cancellation: every message is delivered exactly once or recorded undelivered, order per sender is kept, capacity is never exceeded, and an aborted lease restores the queue exactly.
+- **Mux.** Random interleavings, fragmentation at every boundary, oversized and unknown frames, credit overrun, property tests that a control frame waits behind at most one bulk chunk and that a backlogged bulk channel gets at least one chunk in every six, and the three watchdogs under paused time.
+- **Leases (core).** Property tests over random interleavings of code takes, commits, aborts, turn deliveries, sends and cell cancellation: every message is delivered exactly once or recorded undelivered, order per sender is kept, capacity is never exceeded, and an aborted lease restores the queue exactly. Two concurrent code takes on one mailbox, the first stalled on reply memory and then aborted, never let the second commit a sender's later envelope before the first's earlier one (the barrier). A child with more queued progress than one reply holds is drained through its notice: `result()` returns only after the notice commits, and the model is never pinged for it.
 - **Code to model regressions (core).** After code consumes a child's result, the model-facing `wait` reports it in full or as the consumed status line, never as "follows at your next turn"; `wait` without arguments does not wait for it; a turn boundary does not deliver it again.
 - **Kernel against a scripted supervisor.** A Rust harness starts a real kernel through `LocalExecutor` and drives it with scripted host requests: namespace persistence, last-value repr, trimmed tracebacks, the vars report, top-level `await`, output markers with prints, C-level writes and subprocess output, a 100 MB output flood (host memory bounded by the capture caps), user code closing fd 1, interrupt during a blocking wait and during a busy loop, a cell that swallows `Cancelled` (destroyed after the grace, status `timeout`, never `crashed`), crash by `os.kill(os.getpid(), 9)`, end of file (process killed and reaped, pumps closed), forged frames from user code (wrong scope, oversized, unknown kind), a forked child calling `kyora` (`StaleCell`), a thread from an earlier cell (`StaleCell`), and an environment without provider keys (the test sets one in kyora's environment and asserts its absence in `os.environ`).
 - **Authorization.** `agent.resolve`, `agent.status`, `agent.watch` and `agent.cancel` with unknown ids, sibling ids, ancestor ids and ids from another subtree are refused; a watch on one child never yields a record about any other node.
-- **Bounds.** 256 slow handlers with large replies stay within the response memory; a kernel that stops reading is destroyed by the progress rule while the reader keeps answering; `overloaded` consumes nothing; 17 subscriptions fail.
+- **Bounds.** 256 slow handlers of every kind (`agent.result` with large outcomes, `artifact.get`, MCP `tool.call` with 16 MiB results, `llm`) stay within the reply budgets, with the supervisor's allocations measured, not estimated; a kernel that stops reading is destroyed by the progress rule while the reader keeps answering; `overloaded` consumes nothing; 17 subscriptions fail; a repl configuration with `tool_output_chars` below 2,000 is refused.
 - **End to end with the fake provider.** `ScriptedProvider` (`crates/providers/src/fake.rs`) answers by conversation turn and is stateless, so scripts whose responses are `python` tool calls run identically however children are scheduled. Tests assert on reconstructed trees and sets of records, never on interleaving (D19), and gate children on a blocking provider, as `crates/core/tests/recursion.rs` does, instead of sleeping. Cases: the three-level recursion of section 8; cell exit with live cell-owned children; a persistent child's notice at the next turn; `map` under a small `max_agents_live`; budget exhaustion in one subtree; structured results and `SchemaError`; a staged `final` discarded on error and refused early when too large; `kyora run` printing a structured root answer; two `python` calls in one assistant message sharing `python_turn_chars`.
 - **MCP from code.** `call_tool` against the stdio test server used by the CLI tests (`crates/cli/tests/fixtures/mcp_server.py`).
-- **Executors.** A `LoopbackExecutor` runs the real relay locally over an in-memory duplex with injectable latency, bandwidth, stalls, drops, partitions, failing destroys and a lease clock, so every failure in section 6.6 is a deterministic test. The same kernel suite runs on it. Tests against real machines are `#[ignore]`d and need explicit opt-in.
+- **Executors.** A `LoopbackExecutor` runs the real relay locally over an in-memory duplex with injectable latency, bandwidth, stalls, drops, partitions, failing destroys and a lease clock, so every failure in section 6.6 is a deterministic test. The same kernel suite runs on it. Tests against real machines are `#[ignore]`d and need explicit opt-in. Lease tests drop renewal acknowledgements and check that the fence time follows the largest expiry sent, never the last one acknowledged; destroy tests hang the adapter and check that teardown reports incomplete within 12 s and that the outcome carries `teardown_complete: false`; start tests cancel a node while its eager start is in flight and check that the machine is destroyed and the start joined.
 - **Python-side test kit.** `kyora.testing.FakeHost` speaks the real protocol over a socketpair from a thread in the same interpreter and installs itself as the module's connection, with an open cell, for the duration of the `with` block, so it exercises the real client library and codec. Outside a kernel the package is imported from `crates/repl/python`, where its sources live before they are embedded:
 
   ```python
@@ -1085,14 +1117,15 @@ All tests run without network or keys, as today (`cargo test --workspace --locke
   ```
 
   kyora's own Python unit tests use it with `python3 -m unittest`, run from a Rust test so `cargo test` covers them (D19); users use it to test their programs offline.
-- **Golden output.** Cell result formatting, including section budgets at small `tool_output_chars` and a spent `python_turn_chars`, is checked against golden files.
+- **Golden output.** Cell result formatting, including section budgets at the minimum `tool_output_chars` and a spent `python_turn_chars`, is checked against golden files.
+- **JSON.** Raw values with 128 and 129 levels of nesting (accepted, refused) through the host's own depth check, large integers through `init`, and an answer over 1 MiB, which arrives as an artifact reference and is fetched whole.
 
 ## 8. Milestones
 
 Each milestone is a small set of PRs that leaves `main` working.
 
 **R0. Kernel and cells** (the smallest shippable slice).
-Scope: C1 and C2; `crates/repl`; `LocalExecutor` with confirmed destroy (kill and reap); socketpair transport, framing, handshake, token, increasing ids; the `python` tool with persistent namespace, last value, capture with markers, tracebacks, the vars report, section budgets and `python_turn_chars` (C8); cell deadline, interrupt, destroy and the status precedence of section 2.5; end of file handling; crash detection and restart notice; kernel shutdown through `Tool::shutdown` and `kill_kernels` on a second Ctrl-C; `kyora.llm`, `final` (with early checks), `budget`, `log` and the identity constants; `kernel_*` and `cell_*` records (C7, first part); response memory and the overload path; `kyora.testing.FakeHost`; the CLI adds `python` to the root's tools, with `--no-repl` to leave it out.
+Scope: C1 (retention, `start` and `shutdown` hooks with teardown reports, `NodeCtx::tools` and `NodeCtx::output_schema`), C2 and C6; `crates/repl`; `LocalExecutor` with confirmed destroy (kill and reap); socketpair transport, framing, handshake, token, increasing ids; the `python` tool with persistent namespace, last value, capture with markers, tracebacks, the vars report, section budgets and `python_turn_chars` (C8); cell deadline, interrupt, destroy and the status precedence of section 2.5; end of file handling; crash detection and restart notice; kernel shutdown through `Tool::shutdown` and `kill_kernels` on a second Ctrl-C; `kyora.llm`, `final` (early checks through `NodeCtx::output_schema`), `budget` (with the C6 counters), `log` and the identity constants; `kernel_*` and `cell_*` records (C7, first part); response memory and the overload path; `kyora.testing.FakeHost`; validation of the repl configuration (minimum caps); the CLI adds `python` to the root's tools, with `--no-repl` to leave it out.
 Acceptance:
 - `kyora run --fake-script` with a root whose first cell runs `x = [kyora.llm(f"q{i}") for i in range(3)]` and whose second runs `kyora.final({"n": len(x)})` prints `{"n":3}` and exits 0; the trace holds three leaves with `origin_cell` 1, and per-node charges sum to the session total, including a scripted failed attempt.
 - A cell printing 100 MB returns a result within `tool_output_chars` and the host's capture stays within its bounds; two cells in one assistant message together stay within `python_turn_chars` plus one `[kyora]` line.
@@ -1100,15 +1133,18 @@ Acceptance:
 - A cell that swallows `kyora.Cancelled` in a loop is destroyed after the 2 s grace and ends `timeout`, not `crashed`; the next cell runs in generation 2 with the restart notice.
 - `os.kill(os.getpid(), 9)` ends the cell `crashed`; no process of the old group remains; the next cell runs in a new generation.
 - A forged frame or a wrong token ends only the kernel; the run continues.
-- A node that ends with a live kernel writes `node_end` only after `kernel_end`.
+- A node that ends with a live kernel writes `node_end` only after `kernel_end`, with a complete teardown report.
+- A child spawned by the model with an output schema and the `python` tool gets `SchemaError` from `kyora.final` with a mismatching value, inside the cell.
+- `kyora.budget()` returns the session and subtree counters.
 
 **R1. Agents from code.**
-Scope: C3, C5, C6; `spawn` (cell-owned by default, `persistent=True`), `Agent` (`result` with `yield_after`, `status`, `done`, `cancel`), `run`, `gather`, `as_completed`, `map`, `llm_batch`, `parallel`; `kyora.aio` and top-level `await`; the cell exit sequence of section 5.4; the lease protocol of section 4.7 for `result` and `cancel`; `context` and `vars` (inline, with JSON fidelity) and the capped manifest; `agent`, `agents` and `limits` with relation checks.
+Scope: C3 (leases, the per-mailbox barrier, draining through the notice, the `consumed` map and the revised report) and C5; `spawn` (cell-owned by default, `persistent=True`), `Agent` (`result` with `yield_after`, `status`, `done`, `cancel`), `run`, `gather`, `as_completed`, `map`, `llm_batch`, `parallel`; `kyora.aio` and top-level `await`; the cell exit sequence of section 5.4; the lease protocol of section 4.7 for `result` and `cancel`; `context` and `vars` (inline, with JSON fidelity) and the capped manifest; `agent`, `agents` and `limits` with relation checks.
 Acceptance:
 - A scripted three-level recursion through Python runs end to end: the root's cell maps over 4 items, each child's cell calls `llm_batch` with 5 prompts and `run`s one grandchild; the reconstructed tree has the expected shape and per-node charges sum to the session total.
 - A cell that ends with 3 running cell-owned children returns only after their `node_end` records; its result lists them; the ledger's `reserved` is 0 at that point.
 - A persistent child spawned in cell 1 finishes after the cell; its notice reaches the model at the next turn boundary; the agent idles until it arrives. When cell 2 calls `result()` on it first, the model gets no notice, and a later model-facing `wait` reports it from the outcome.
 - `result(yield_after=0)` on a child that has ended returns its result, including a cell-owned child whose notice was not yet staged.
+- A child that sent 5 MiB of progress before ending: `result()` with the default `max_bytes` returns after two replies with every message and the outcome; the model gets no notice; a later model-facing `wait` reports the outcome from the handle (code-to-model regression).
 - A reply that cannot be written (the kernel killed between lease and write) consumes nothing: the messages reach the model at the next turn boundary.
 - `map` with `concurrency=8` under `max_agents_live = 4` completes without error.
 - Interrupting a cell blocked in `result()` ends its cell-owned children `cancelled`.
@@ -1128,8 +1164,9 @@ Acceptance:
 Scope: the `Executor` and `Instance` traits; `LocalExecutor` behind them; the relay and the mux of section 6.3; `LoopbackExecutor` with fault injection; leases, destroy results and the restart rule of section 6.5; placement (`executor=`, `--executor`, inheritance) with placement-aware tool selection; workspace snapshots and their manifests; artifacts; the first machine adapter (kyora vms).
 Acceptance:
 - The R0 to R2 kernel suites pass on `LoopbackExecutor`.
-- A partition injected mid-cell ends the cell `lost` within 35 s and calls destroy; with destroy failing and `Lease` fencing, the next kernel starts only after the lease TTL plus margin; with `None` fencing it is refused with the instance named.
-- A stdout flood over a link throttled to 1 MB/s delays no control frame by more than one 64 KiB chunk.
+- A partition injected mid-cell ends the cell `lost` within 35 s and calls destroy under its call timeout; with destroy failing and `Lease` fencing, the next kernel starts only after the largest expiry sent plus skew and margin, even when renewal acknowledgements were lost; with `None` fencing it is refused with the instance named; the child's outcome reports `teardown_complete: false` with `fenced_at`.
+- A stdout flood over a link throttled to 1 MB/s delays no control frame by more than one 64 KiB chunk, and a control flood leaves output at least a sixth of the link.
+- Cancelling a node while its eager start is in flight destroys the machine and joins the start before `node_end`.
 - Spawning onto a snapshot executor with `tools=["read_file"]` fails before admission; without `tools`, the child's frozen tools exclude `shell` and the file tools.
 - `kyora.file` on a file changed on the machine raises `InvalidRequest`; `kyora.artifact` then `kyora.fetch` in another node reproduces the file byte for byte.
 - Manually: a root on a laptop fans out 32 children with `executor="vm"`, each on its own machine, and completes; an environment dump on each machine shows no provider credential.
@@ -1174,7 +1211,7 @@ What this spec takes from the systems surveyed in research.md:
 | rlm (R§1) | `FINAL(...)` tags, then an answer dictionary | Changed: `kyora.final`, a tool-free final reply, or `submit_result`. |
 | rlm (R§1) | 20,000-character truncation of observations; worker output memory not bounded | Adopted as `tool_output_chars` (20,000), plus a per-request Python budget and bounds at capture time. |
 | Prime legacy `RLMEnv` (R§2) | FIFO worker, `llm_batch` over a host HTTP endpoint | Changed: one control channel; all calls owned by the host. |
-| Prime legacy `RLMEnv` (R§2) | Timeout recovery recreates the sandbox and resets REPL state | Adopted the recovery, made explicit: generations, a restart notice, and a restart only after the old instance is confirmed stopped. |
+| Prime legacy `RLMEnv` (R§2) | Timeout recovery recreates the sandbox and resets REPL state | Adopted the recovery, made explicit: generations, a restart notice, and a restart only after the old instance is fenced. |
 | nano-rlm (R§2) | A persistent kernel per agent | Adopted. |
 | nano-rlm (R§2) | `rlm.agent.spawn(task=..., name=..., persistent=False)` returning a handle | Adopted as `kyora.spawn(task, name=..., persistent=False)`. |
 | nano-rlm (R§2) | `child.result(yield_after=...)` | Name adopted; semantics defined here (`yield_after` covers running; `StillRunning`; the child continues). |
@@ -1209,21 +1246,27 @@ Status      = "completed" | "max_turns" | "budget_exhausted" | "timeout" | "cont
             | "cancelled" | "refused" | "failed" | "interrupted"
 Envelope    = {id: u64, from: u32, to: u32, kind: "message" | "result" | "error" | "cancelled",
                body: string, sent_at: string (RFC 3339), spawn?: u32, status?: Status}
-Outcome     = {node: u32, name: string, status: Status, answer: {text: string} | {value: Raw},
-               answer_bytes: u64, truncated: bool, turns: u32, usage_self: Usage, usage_subtree: Usage}
+Answer      = {text: string} | {value: Raw}
+            | {artifact: ArtifactRef, form: "text" | "value"}   // answers over 1 MiB, never cut
+Teardown    = {complete: bool, fenced_at?: string (RFC 3339), note?: string}
+Outcome     = {node: u32, name: string, status: Status, answer: Answer, answer_bytes: u64,
+               turns: u32, usage_self: Usage, usage_subtree: Usage, teardown: Teardown}
 Summary     = {node: u32, name: string, status: Status, turns: u32, usage_subtree: Usage, answer_bytes: u64}
 ChildStatus = {status: Status | null, turns: u32, usage_self: Usage, usage_subtree: Usage}
+FileSpec    = {path: string, format: "text" | "bytes" | "json"}          // what the kernel sends
 Origin      = {executor: string, instance: string, generation: u32}
-FileRef     = {path: string, sha256: string, bytes: u64, format: "text" | "bytes" | "json", origin: Origin}
+StampedFile = {path: string, format: "text" | "bytes" | "json", sha256: string, bytes: u64,
+               origin: Origin}                                              // stamped by the host
 ArtifactRef = {"$artifact": string ("sha256:" and 64 hex digits), name: string, bytes: u64}
-VarSource   = {json: Raw} | {file: FileRef} | {artifact: ArtifactRef}
+VarSource   = {json: Raw} | {file: FileSpec} | {artifact: ArtifactRef}     // kernel to host
+VarLoad     = {json: Raw} | {file: StampedFile} | {artifact: ArtifactRef}  // host to kernel
 Var         = {name: string, type: string, size: string}
 Counters    = {session: {agents_live: u32, agents_total: u32, llm_calls: u32},
                subtree: {agents_live: u32, agents_total: u32, llm_calls: u32}}
 Error       = {code: string, message: string, data?: object}
 ```
 
-Handshake: `hello`, `welcome` and `reject` as in section 4.2. `welcome.limits` holds every maximum the client needs: `max_depth`, `max_agents_live`, `max_agents_total`, `max_llm_calls`, `budget_limit`, `message_chars`, `mailbox_capacity`, `tool_output_chars`, `python_turn_chars`, `cell_timeout_ms`, `max_cell_timeout_ms`, `request_max`, `response_max`, `delivery_max_bytes`, `outstanding`, `outstanding_bytes`, `tool_calls`, `subscriptions` (all `u64`).
+Handshake: `hello`, `welcome` and `reject` as in section 4.2. `welcome` carries `node`, `parent`, `depth`, `generation`, `cwd`, `executor`, `instance` (the executor's instance id, shown to code; provenance is stamped by the host, not built by the kernel), `scratch`, `features`, and `limits`, which holds every maximum the client needs: `max_depth`, `max_agents_live`, `max_agents_total`, `max_llm_calls`, `budget_limit`, `message_chars`, `mailbox_capacity`, `tool_output_chars`, `python_turn_chars`, `cell_timeout_ms`, `max_cell_timeout_ms`, `request_max`, `response_max`, `delivery_max_bytes`, `outstanding`, `outstanding_bytes`, `tool_calls`, `subscriptions` (all `u64`).
 
 Host to kernel:
 
@@ -1232,7 +1275,7 @@ exec        {cell: u32, scope: string, code: string, deadline_ms: ms, marker: st
             -> {status: "ok" | "error" | "interrupted", result: string | null,
                 error: {type: string, message: string, traceback: string} | null,
                 vars: {new: [Var], rebound: [Var]}, wall_ms: ms}
-vars.set    {name: string, source: VarSource}           -> {type: string, size: string}
+vars.set    {name: string, source: VarLoad}             -> {type: string, size: string}
 vars.list   {}                                          -> [Var]
 ping        {}                                          -> {}
 shutdown    {}                                          -> {}
@@ -1253,11 +1296,12 @@ agent.spawn    {task: string, owner: "cell" | "node", name?: string, output?: ob
                 vars?: {[name: string]: VarSource}, tools?: [string], model?: string,
                 budget?: u64, timeout_ms?: ms, max_turns?: u32, executor?: string}
                -> {node: u32, name: string, executor: string, tools: [string]}
-agent.result   {node: u32, yield_after_ms?: ms, max_bytes?: u64}  -> {outcome: Outcome, messages: [Envelope]}
+agent.result   {node: u32, yield_after_ms?: ms, max_bytes?: u64}
+               -> {outcome: Outcome | null, more: bool, messages: [Envelope]}   // more: notice not yet reached
 agent.outcome  {node: u32}                                        -> Outcome
 agent.status   {node: u32}                                        -> ChildStatus
 agent.cancel   {node: u32, max_bytes?: u64}
-               -> {outcome: Outcome, already_finished: bool, messages: [Envelope]}
+               -> {outcome: Outcome | null, more: bool, already_finished: bool, messages: [Envelope]}
 agent.list     {}  -> [{node: u32, name: string, persistent: bool, cell: u32 | null, status: Status | null}]
 agent.resolve  {ref: string | u32}                                -> {node: u32, relation: "child" | "descendant"}
 agent.watch    {node: u32, kinds?: [string]}
@@ -1268,7 +1312,7 @@ agent.unwatch  {sub: u32}                                         -> {}
 msg.send       {to: string | u32, body: string}                   -> {id: u64, to: u32}
 msg.receive    {yield_after_ms: ms, max_bytes?: u64}              -> {messages: [Envelope], pending: u32}
 msg.wait       {agents?: [u32], timeout_ms?: ms, max_bytes?: u64}
-               -> {finished: [Summary], running: [u32], messages: [Envelope]}
+               -> {finished: [Summary], undrained: [u32], running: [u32], messages: [Envelope]}
 msg.pending    {}                                                 -> {pending: u32}
 budget         {}  -> {budget: {limit: u64, used: u64, reserved: u64, remaining: u64, closed: bool},
                        counters: Counters, deadline_ms: ms, cell_deadline_ms: ms}
@@ -1277,9 +1321,9 @@ tool.call      {name: string, input: object}                     -> {text: strin
 final          {value: Raw}                                       -> {}
 artifact.put   {upload?: u32, name?: string, data: string (base64, at most 512 KiB decoded), last: bool}
                -> {upload: u32} | ArtifactRef (on the last chunk)
-artifact.get   {artifact: string, offset: u64}                   -> {data: string (base64, at most 4 MiB decoded), last: bool}
+artifact.get   {artifact: string, offset: u64}                   -> {data: string (base64, at most 2 MiB decoded), last: bool}
 log            event {level: "debug" | "info" | "warning" | "error", message: string}
 display        event {bundle: {[mime: string]: string}, described: {[mime: string]: u64}}
 ```
 
-Error codes by operation, beyond `cancelled`, `stale_cell`, `overloaded`, `internal` and `unsupported`, which any request can return: `llm` adds `limit_exceeded`, `budget_exceeded`, `invalid_request`, `model_error`; `agent.spawn` adds `limit_exceeded`, `budget_exceeded`, `invalid_request`, `schema_error`, `value_too_large`; `agent.result` adds `still_running`, `invalid_request`, `value_too_large`; `msg.send` adds `mailbox_full`, `agent_finished`, `invalid_request`; `tool.call` adds `limit_exceeded`, `invalid_request`, `tool_error`, `value_too_large`; `final` adds `schema_error`, `value_too_large`; `agent.watch` adds `limit_exceeded`, `invalid_request`; every other operation that takes a node adds `invalid_request`.
+Error codes. Any request can return `cancelled`, `stale_cell`, `overloaded`, `internal`, `unsupported`, `invalid_request` (malformed or out-of-range parameters, unknown or unrelated node ids) and `value_too_large` (a reply that would exceed the response cap). Operations add: `llm`: `limit_exceeded`, `budget_exceeded`, `model_error`; `agent.spawn`: `limit_exceeded`, `budget_exceeded`, `schema_error`; `agent.result`: `still_running`; `msg.send`: `mailbox_full`, `agent_finished`; `tool.call`: `limit_exceeded`, `tool_error`; `final`: `schema_error`; `agent.watch`: `limit_exceeded`.

@@ -1115,6 +1115,7 @@ dependencies = [
 name = "kyora-mcp"
 version = "0.0.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "futures",

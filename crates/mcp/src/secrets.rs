@@ -8,6 +8,7 @@
 //! and numbers, and model-visible tool names. Not covered: other encodings such as
 //! base64 or percent-encoding inside text. docs/mcp.md states the same scope.
 use crate::{config::ServerConfig, defaults};
+use aho_corasick::AhoCorasick;
 use kyora_core::ToolOutput;
 use kyora_protocol::ToolResultPart;
 use serde_json::Value;
@@ -22,10 +23,11 @@ pub(crate) struct Secrets(Arc<Patterns>);
 
 #[derive(Default)]
 struct Patterns {
-    /// Longest first, so the longest value matching at a position wins.
-    values: Vec<String>,
-    /// Whether some value starts with this byte; most positions are skipped on it.
-    first: Vec<bool>,
+    /// Every form of every value, searched in one linear pass with overlapping
+    /// matches reported; None when nothing is to be redacted.
+    automaton: Option<AhoCorasick>,
+    /// Length in bytes of the longest form.
+    longest: usize,
     /// Variables whose values are too short to redact without shredding output.
     short: Vec<String>,
 }
@@ -76,15 +78,16 @@ impl Secrets {
             }
             values.push(value);
         }
-        values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        values.sort();
         values.dedup();
-        let mut first = vec![false; 256];
-        for value in &values {
-            first[usize::from(value.as_bytes()[0])] = true;
-        }
+        let longest = values.iter().map(String::len).max().unwrap_or(0);
+        let automaton = match values.is_empty() {
+            true => None,
+            false => Some(AhoCorasick::new(&values)?),
+        };
         Ok(Self(Arc::new(Patterns {
-            values,
-            first,
+            automaton,
+            longest,
             short,
         })))
     }
@@ -105,7 +108,7 @@ impl Secrets {
 
     /// Length in bytes of the longest value.
     pub(crate) fn longest(&self) -> usize {
-        self.0.values.first().map_or(0, String::len)
+        self.0.longest
     }
 
     /// Replaces every value in one pass over `text`. Placeholders are never scanned
@@ -122,17 +125,12 @@ impl Secrets {
         while !text.is_char_boundary(from) {
             from += 1;
         }
-        let patterns = &self.0;
-        if patterns.values.is_empty() {
+        let Some(automaton) = &self.0.automaton else {
             return text[from..].to_owned();
-        }
-        let bytes = text.as_bytes();
+        };
+        let longest = self.0.longest;
         let mut out = String::with_capacity(text.len() - from);
         let mut copied = from;
-        // Spans of matched values. Every position is tried, also inside a span, so
-        // overlapping values, as in "abcdef" and "defghi" within "abcdefghi", merge
-        // into one span instead of the second being left half visible.
-        let mut span: Option<(usize, usize)> = None;
         let emit = |(start, end): (usize, usize), out: &mut String, copied: &mut usize| {
             // Values are valid UTF-8, so spans start and end on char boundaries.
             if end > *copied {
@@ -141,30 +139,32 @@ impl Secrets {
                 *copied = end;
             }
         };
-        for at in 0..bytes.len() {
-            if !patterns.first[usize::from(bytes[at])] {
-                continue;
+        // Overlapping search reports every match, also inside another, in order of
+        // their ends, in time linear in the text plus the matches. Overlapping and
+        // adjacent matches, as "abcdef" and "defghi" within "abcdefghi", merge into
+        // one span instead of the second being left half visible.
+        let mut pending: Vec<(usize, usize)> = Vec::new();
+        for found in automaton.find_overlapping_iter(text) {
+            let (mut start, end) = (found.start(), found.end());
+            while let Some(&(earlier, last)) = pending.last()
+                && last >= start
+            {
+                start = start.min(earlier);
+                pending.pop();
             }
-            let Some(value) = patterns
-                .values
+            pending.push((start, end));
+            // A later match ends at or after `end`, so it starts at or after
+            // `end - longest`; spans ending before that are final.
+            let settled = pending
                 .iter()
-                .find(|value| bytes[at..].starts_with(value.as_bytes()))
-            else {
-                continue;
-            };
-            let end = at + value.len();
-            span = match span {
-                // Overlapping or adjacent: one placeholder covers both.
-                Some((start, last)) if at <= last => Some((start, last.max(end))),
-                Some(previous) => {
-                    emit(previous, &mut out, &mut copied);
-                    Some((at, end))
-                }
-                None => Some((at, end)),
-            };
+                .take_while(|(_, last)| *last < end.saturating_sub(longest))
+                .count();
+            for span in pending.drain(..settled) {
+                emit(span, &mut out, &mut copied);
+            }
         }
-        if let Some(last) = span {
-            emit(last, &mut out, &mut copied);
+        for span in pending {
+            emit(span, &mut out, &mut copied);
         }
         out.push_str(&text[copied..]);
         out
@@ -172,13 +172,16 @@ impl Secrets {
 
     /// Whether `text` contains a value.
     pub(crate) fn found_in(&self, text: &str) -> bool {
-        self.redact(text) != text
+        self.0
+            .automaton
+            .as_ref()
+            .is_some_and(|automaton| automaton.is_match(text))
     }
 
     /// Redacts every string in `value`, object keys included. A number whose decimal
     /// form contains a value becomes the placeholder string.
     pub(crate) fn redact_json(&self, value: &mut Value) {
-        if self.0.values.is_empty() {
+        if self.0.automaton.is_none() {
             return;
         }
         match value {
@@ -348,6 +351,24 @@ mod tests {
         let error = Secrets::resolve(&config, &long).err().unwrap().to_string();
         assert!(error.contains("LONG") && error.contains("4096"), "{error}");
         assert!(!error.contains("xxxx"), "{error}");
+    }
+
+    #[test]
+    fn a_long_repetitive_value_is_redacted_in_linear_time() {
+        // Every position of the text starts a match. Trying each value at each
+        // position took on the order of 16 MiB times 4 KiB steps; the automaton
+        // takes one pass, so even an unoptimized build finishes well within the bound.
+        let value = "a".repeat(defaults::MAX_SECRET_BYTES);
+        let secrets = secrets(&[&value]);
+        let text = "a".repeat(16 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        assert_eq!(secrets.redact(&text), REDACTED);
+        assert_eq!(secrets.redact_from(&format!("x{text}y"), 1), "[redacted]y");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

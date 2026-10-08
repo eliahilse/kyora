@@ -15,6 +15,7 @@ test = false
 doc = false
 
 [dependencies]
+aho-corasick.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true

@@ -962,23 +962,28 @@ async fn cell_owned_children_post_no_notice_and_node_owned_cancellation_is_repor
     let outcome = runtime.run(spec()).await.unwrap();
     assert_eq!((outcome.status, outcome.turns), (Status::Completed, 2));
     let live = records(rx);
-    let messages = sent(&live);
-    // The node-owned child's notice, then the one wait queued to report the
-    // cell-owned child, both taken by that wait.
+    // The node-owned child's notice and the one wait staged to report the
+    // cell-owned child, both taken by that wait. They come from different senders,
+    // so their order is not fixed.
+    let mut messages = sent(&live);
+    messages.sort_by_key(|m| m.from);
     assert_eq!(
         messages
             .iter()
             .map(|m| (m.from, m.kind, m.status))
             .collect::<Vec<_>>(),
         vec![
-            (2, MessageKind::Cancelled, Some(Status::Cancelled)),
             (1, MessageKind::Cancelled, Some(Status::Cancelled)),
+            (2, MessageKind::Cancelled, Some(Status::Cancelled)),
         ]
     );
-    assert_eq!(
-        delivered(&live),
-        vec![(0, vec![messages[0].id, messages[1].id], Delivery::Wait)]
-    );
+    let records = delivered(&live);
+    assert_eq!(records.len(), 1);
+    let (node, mut ids, via) = records[0].clone();
+    ids.sort_unstable();
+    let mut expected = messages.iter().map(|m| m.id).collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!((node, ids, via), (0, expected, Delivery::Wait));
     assert!(undelivered(&live).is_empty());
     assert_eq!(runtime.ledger().snapshot(0).reserved, 0);
 }
@@ -2956,4 +2961,106 @@ async fn repeated_outcome_reports_share_the_turn_budget() {
             ),
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reported_cell_owned_notice_waits_for_its_send_record() {
+    let (trace, acks) = Acks::new(|event| {
+        matches!(
+            event,
+            TraceEvent::MessageDelivered {
+                via: Delivery::Receive,
+                ..
+            }
+        )
+    });
+    let rx = trace.subscribe();
+    let early = Arc::new(Mutex::new(None));
+    let (seen, gate) = (early.clone(), acks.clone());
+    let python = tool(move |_, cx| {
+        let (seen, acks) = (seen.clone(), gate.clone());
+        async move {
+            let token = CancellationToken::new();
+            let child = cx
+                .node
+                .spawn_agent(
+                    ChildSpec {
+                        name: Some("cell".into()),
+                        ..ChildSpec::new("cell task")
+                    },
+                    Owner::Cell(token.clone()),
+                )
+                .unwrap();
+            eventually(&cx, "the progress and the child's end", || {
+                cx.node.pending_messages() == 1 && child.is_finished()
+            })
+            .await;
+            // This delivery's record is held, so later message records wait behind it.
+            assert_eq!(cx.node.receive(Duration::ZERO).await.unwrap().len(), 1);
+            let ready = {
+                let agents = [child.id];
+                let mut waiting = pin!(cx.node.wait(Some(&agents), None));
+                let ready = match futures::poll!(waiting.as_mut()) {
+                    Poll::Ready(waited) => {
+                        waited.unwrap();
+                        true
+                    }
+                    Poll::Pending => {
+                        // Time is paused: this sleep ends once every task is idle.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        match futures::poll!(waiting.as_mut()) {
+                            Poll::Ready(waited) => {
+                                waited.unwrap();
+                                true
+                            }
+                            Poll::Pending => false,
+                        }
+                    }
+                };
+                acks.release();
+                if !ready {
+                    tokio::time::timeout(LIMIT, waiting).await.unwrap().unwrap();
+                }
+                ready
+            };
+            *seen.lock().unwrap() = Some(ready);
+            drop(token);
+            let mut result = ToolOutput::text("ok");
+            result.final_answer = Some(Answer::Text("final".into()));
+            result
+        }
+    });
+    let provider = Gated::new(
+        vec![
+            rule("root task", 0, vec![call("python", json!({}))]),
+            rule(
+                "cell task",
+                1,
+                vec![
+                    call("send_message", json!({"to": "parent", "body": "progress"})),
+                    text("cell done"),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let runtime = setup(provider, python, Limits::default(), trace);
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    // The report was not handed over while its send record waited behind the held
+    // delivery record.
+    assert_eq!(*early.lock().unwrap(), Some(false));
+    let live = records(rx);
+    let notice = sent(&live)
+        .into_iter()
+        .find(|message| message.from == 1 && message.kind == MessageKind::Result)
+        .unwrap();
+    let recorded = position(
+        &live,
+        |event| matches!(event, TraceEvent::MessageSent { message } if message.id == notice.id),
+    );
+    let handed = position(
+        &live,
+        |event| matches!(event, TraceEvent::MessageDelivered { messages, .. } if messages.contains(&notice.id)),
+    );
+    assert!(recorded < handed);
 }

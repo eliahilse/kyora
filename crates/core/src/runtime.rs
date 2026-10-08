@@ -1716,7 +1716,20 @@ impl NodeCtx {
             |id: &NodeId| children[id].borrow().is_some() && !self.state.mailbox.is_awaiting(*id);
         loop {
             let mut changed = self.state.mailbox.subscribe();
-            self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
+            {
+                let mut work = self.state.work.lock().expect("node work mutex poisoned");
+                self.check_open(&work)?;
+                // A cell-owned child posts no notice of its own. Reporting it stages
+                // one, once, recorded before it is queued behind the child's messages;
+                // the child counts as finished only once it is queued. Its outcome then
+                // follows the same order and budget as any notice.
+                for id in &targets {
+                    let outcome = children[id].borrow().clone();
+                    if let Some(outcome) = outcome {
+                        self.stage_notice(&mut work, &outcome);
+                    }
+                }
+            }
             if targets.iter().all(finished) {
                 break;
             }
@@ -1735,22 +1748,6 @@ impl NodeCtx {
         let batch = {
             let mut work = self.state.work.lock().expect("node work mutex poisoned");
             self.check_open(&work)?;
-            // A cell-owned child posts no notice of its own. Reporting it queues one,
-            // once, behind its messages, so its outcome follows the same order and
-            // budget as any notice, and a deferred outcome is not lost.
-            for id in &done {
-                if self.state.mailbox.is_concluded(*id) {
-                    continue;
-                }
-                let outcome = children[id]
-                    .borrow()
-                    .clone()
-                    .expect("finished child has an outcome");
-                let notice = self.runtime.notice(self.id, &outcome);
-                if self.state.mailbox.conclude(notice.clone()) {
-                    self.record(&mut work, TraceEvent::MessageSent { message: notice });
-                }
-            }
             // One delivery of the finished children's messages, in arrival order. A
             // child's notice is its last message, so it never overtakes the others.
             let batch = self.state.mailbox.take(
@@ -1862,6 +1859,40 @@ impl NodeCtx {
             }
         });
         work.tasks.push(task);
+    }
+    /// Stages a terminal notice for an agent that posts none to this mailbox, unless
+    /// one was staged or queued before: owned work, after this node's earlier message
+    /// records, records it as sent and only then queues it, so it never reaches the
+    /// model before its record. Returns whether a notice was staged.
+    fn stage_notice(&self, work: &mut Work, outcome: &AgentOutcome) -> bool {
+        if !self.state.mailbox.stage(outcome.node) {
+            return false;
+        }
+        let notice = self.runtime.notice(self.id, outcome);
+        let (done, written) = watch::channel(false);
+        let mut previous = work.recorded.replace(written);
+        let runtime = self.runtime.clone();
+        let state = self.state.clone();
+        let task = tokio::spawn(async move {
+            if let Some(previous) = &mut previous {
+                while !*previous.borrow_and_update() {
+                    if previous.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = runtime
+                .emit(TraceEvent::MessageSent {
+                    message: notice.clone(),
+                })
+                .await;
+            if let Err(notice) = state.mailbox.push(notice) {
+                runtime.undelivered(notice).await;
+            }
+            done.send_replace(true);
+        });
+        self.own(work, task);
+        true
     }
     /// Records the delivery of `messages`; see `record`.
     fn record_delivery(

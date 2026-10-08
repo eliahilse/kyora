@@ -215,7 +215,8 @@ struct State {
     closed: bool,
     /// Characters of messages handed over since the agent's last model request.
     turn: usize,
-    /// Children whose terminal entry has been queued, by them or on their behalf.
+    /// Agents whose terminal entry has been queued or staged, by them or on their
+    /// behalf.
     concluded: BTreeSet<NodeId>,
 }
 /// Why a mailbox refused a plain message.
@@ -292,24 +293,20 @@ impl Mailbox {
         self.wake();
         result
     }
-    /// Whether a terminal entry for `child` has been queued.
-    pub(crate) fn is_concluded(&self, child: NodeId) -> bool {
-        self.lock().concluded.contains(&child)
-    }
-    /// Queues a terminal entry on behalf of a child that posts none of its own,
-    /// behind everything it has queued. Returns false if one was queued before or
-    /// the mailbox is closed.
-    pub(crate) fn conclude(&self, notice: Envelope) -> bool {
-        {
-            let mut state = self.lock();
-            if state.closed || !state.concluded.insert(notice.from) {
-                return false;
-            }
-            state.queue.push_back(notice);
+    /// Stages a terminal entry for an agent that posts none to this mailbox: a
+    /// cell-owned child, or a deeper descendant reported here. Until the entry is
+    /// queued the agent counts as awaited, so nothing ends or returns without it.
+    /// Returns false if one was queued or staged before, if a notice of its own is
+    /// on its way, or if the mailbox is closed.
+    pub(crate) fn stage(&self, agent: NodeId) -> bool {
+        let mut state = self.lock();
+        if state.closed || state.awaiting.contains(&agent) || !state.concluded.insert(agent) {
+            return false;
         }
-        self.wake();
+        state.awaiting.insert(agent);
         true
     }
+
     /// Charges text that reports messages outside an envelope against this turn's
     /// budget. Returns false, charging nothing, when it does not fit; the first
     /// report of a turn always fits.

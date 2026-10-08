@@ -1919,6 +1919,24 @@ impl NodeCtx {
             ),
         )
     }
+    /// Reports a finished agent's outcome to the model, charged against this turn's
+    /// delivery budget like any message. When the answer does not fit, only the
+    /// status line goes.
+    pub(crate) fn report(&self, outcome: &AgentOutcome) -> String {
+        let full = self.render_outcome(outcome);
+        let budget = self.runtime.0.config.limits.delivery_chars;
+        if self.state.mailbox.charge(full.chars().count(), budget) {
+            return full;
+        }
+        let status = messages::render(
+            MessageKind::for_status(outcome.status),
+            outcome.node,
+            &self.runtime.name(outcome.node),
+            Some(outcome.status),
+            "",
+        );
+        format!("{status}\n(answer left out: no room left in this turn's messages)")
+    }
     fn cancel_status(&self) -> Status {
         if Instant::now() >= self.deadline {
             Status::Timeout

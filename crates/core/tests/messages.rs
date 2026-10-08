@@ -2900,3 +2900,58 @@ async fn a_deferred_cell_owned_outcome_follows_its_messages() {
         vec!["[cancelled from agent 1 (cell): cancelled]"]
     );
 }
+
+#[tokio::test]
+async fn repeated_outcome_reports_share_the_turn_budget() {
+    let answer = "z".repeat(50);
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "chatty task", "name": "chatty"}),
+                    ),
+                    call("wait", json!({})),
+                    calls(vec![
+                        ("wait", json!({"agents": ["chatty"]})),
+                        ("wait", json!({"agents": ["chatty"]})),
+                    ]),
+                    text("done"),
+                ],
+            ),
+            rule("chatty task", 1, vec![text(&answer)]),
+        ],
+        vec![(at("chatty task", 0), at("root task", 1))],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 100,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    let full = format!("[result from agent 1 (chatty): completed]\n{answer}");
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![(full.clone(), false)]
+    );
+    // The result was delivered already. Reporting it again is charged against the
+    // turn's budget: once it fits, the second time only its status line does.
+    assert_eq!(
+        results(&last(&provider.request("root task", 3))),
+        vec![
+            (full, false),
+            (
+                "[result from agent 1 (chatty): completed]\n(answer left out: no room left in this turn's messages)"
+                    .into(),
+                false
+            ),
+        ]
+    );
+}

@@ -310,6 +310,17 @@ impl Mailbox {
         self.wake();
         true
     }
+    /// Charges text that reports messages outside an envelope against this turn's
+    /// budget. Returns false, charging nothing, when it does not fit; the first
+    /// report of a turn always fits.
+    pub(crate) fn charge(&self, cost: usize, budget: usize) -> bool {
+        let mut state = self.lock();
+        if state.turn > 0 && state.turn + cost > budget {
+            return false;
+        }
+        state.turn += cost;
+        true
+    }
     /// Starts a new turn's delivery budget, right before the agent's next model request.
     pub(crate) fn new_turn(&self) {
         self.lock().turn = 0;

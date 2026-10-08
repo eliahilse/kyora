@@ -223,8 +223,9 @@ impl Tool for Wait {
             Err(error) => return ToolOutput::error(error.to_string()),
         };
         // Queued messages come first, in arrival order. A finished child whose
-        // notice was delivered earlier is reported from its outcome; one whose
-        // messages did not all fit is reported as deferred.
+        // notice was delivered earlier is reported from its outcome, charged against
+        // the turn's budget; one whose messages did not all fit is reported as
+        // deferred.
         let noticed = waited
             .messages
             .iter()
@@ -243,7 +244,7 @@ impl Tool for Wait {
                         !noticed.contains(&outcome.node)
                             && !waited.deferred.contains_key(&outcome.node)
                     })
-                    .map(|outcome| cx.node.render_outcome(outcome)),
+                    .map(|outcome| cx.node.report(outcome)),
             )
             .chain(
                 waited
@@ -296,9 +297,9 @@ impl Tool for CancelAgent {
         match cancelled {
             Ok(cancelled) => {
                 // The child's unread messages and its notice, in arrival order. When
-                // no notice comes with them (a cell-owned child posts none, or it was
-                // delivered before), its outcome follows; when it did not fit, a
-                // line says it follows.
+                // no notice comes with them (it was delivered before, or the agent is
+                // a deeper descendant), its outcome follows, charged against the
+                // turn's budget; when the notice did not fit, a line says it follows.
                 let noticed = cancelled
                     .messages
                     .iter()
@@ -315,7 +316,7 @@ impl Tool for CancelAgent {
                         "notice",
                     ));
                 } else if !noticed {
-                    parts.push(cx.node.render_outcome(&cancelled.outcome));
+                    parts.push(cx.node.report(&cancelled.outcome));
                 }
                 let report = parts.join("\n\n");
                 if cancelled.already_finished {

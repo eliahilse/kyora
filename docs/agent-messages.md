@@ -49,6 +49,8 @@ One model request carries at most `Limits::delivery_chars` characters of rendere
 
 What does not fit stays queued in its place, still counts against the mailbox capacity, and goes out with a later request. The model is told how many are left: a turn boundary appends `[3 more messages waiting; they follow at your next turn]`, and `receive` ends its result with the same line, or answers `no more messages fit this turn` with the count when the turn's budget is already spent. An agent with messages still queued does not end at `end_turn`: its next turn starts with a fresh budget and the next messages, and it goes on.
 
+An outcome reported again from an agent's handle, for example by a later `wait` for a child whose result was already delivered, or by `cancel_agent` for a deeper descendant, is charged against the same budget. When its answer does not fit, only its status line goes, with `(answer left out: no room left in this turn's messages)`.
+
 `wait` and `cancel_agent` take only the finished child's messages, its notice last. When the budget cuts in between, the notice stays queued behind the messages that did not fit, and the result says so, for example `agent 3 finished, but 2 of its messages, its result last, did not fit; they follow at your next turn`. For `cancel_agent` this is the one case where the canceller later receives the child's notice as a message.
 
 ### Turn boundaries

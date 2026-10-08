@@ -122,7 +122,9 @@ Messages consume no tokens, no model slots and no agent slots by themselves. Del
 
 ## Deadlock freedom
 
-Sends never block. A wait is only ever on the waiting agent's own children, so wait edges follow the node tree. `receive` is bounded by its `yield_after`. An idle agent waits only while its own children run or a send to it is in flight. Every wait is also bounded by the node deadline.
+A send never waits for its recipient: a full mailbox refuses it at once, and nothing waits for the recipient to read it. A send does wait for its own trace record to be acknowledged, and for the sender's earlier sends, before it returns its id. A wait is only ever on the waiting agent's own children, so wait edges follow the node tree. `receive` is bounded by its `yield_after`. An idle agent waits only while its own children run or a send to it is in flight. Every wait on agents and messages is also bounded by the node deadline.
+
+These bounds assume the trace sink acknowledges every record. Message records are written by owned work that shutdown joins, and sends and turn-boundary deliveries wait for their records, so a sink that never acknowledges a record stalls the agents waiting on it and their shutdown, past any deadline. The session file and `TraceSink::with_store` acknowledge or fail every record; a custom store must do the same.
 
 ## Model-facing tools
 

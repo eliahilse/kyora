@@ -1829,10 +1829,17 @@ impl NodeCtx {
             if !task.is_finished() {
                 return true;
             }
-            if matches!(task.now_or_never(), Some(Err(_))) {
-                self.runtime.0.panicked.store(true, Ordering::SeqCst);
+            // Outside the cooperative budget a finished handle is always ready. Should
+            // it still report pending, keep it, so shutdown joins it instead.
+            match tokio::task::unconstrained(&mut *task).now_or_never() {
+                None => true,
+                Some(result) => {
+                    if result.is_err() {
+                        self.runtime.0.panicked.store(true, Ordering::SeqCst);
+                    }
+                    false
+                }
             }
-            false
         });
         work.tasks.push(task);
     }
@@ -2206,5 +2213,47 @@ mod tests {
         assert_eq!(runtime.run(spec).await.unwrap().status, Status::Completed);
         // 200 sends, each its own task; only the most recent may still be held.
         assert!(held.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn reaping_keeps_a_panic_the_cooperative_budget_hides() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::new(vec![]));
+        let runtime = Runtime::new(RuntimeConfig {
+            providers: BTreeMap::from([("fake".into(), provider)]),
+            toolsets: Arc::new(Toolset::new(vec![]).unwrap()),
+            limits: Limits::default(),
+            retry: RetryPolicy::default(),
+            llm_model: "fake/leaf".parse().unwrap(),
+            trace: TraceSink::ephemeral(),
+            session: "budget".into(),
+        })
+        .unwrap();
+        let cx = NodeCtx {
+            id: 0,
+            parent: None,
+            depth: 0,
+            cancel: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+            model: "fake/agent".parse().unwrap(),
+            runtime: runtime.clone(),
+            state: Arc::new(NodeState::default()),
+            cwd: PathBuf::new(),
+            options: RequestOptions::default(),
+            owners: Arc::new(Vec::new()),
+        };
+        let mut work = Work::default();
+        let panicked = tokio::spawn(async { panic!("owned task panicked") });
+        while !panicked.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        work.tasks.push(panicked);
+        // Spend this task's cooperative budget without yielding, so that polling a
+        // finished handle reports it as pending.
+        for _ in 0..1000 {
+            let _ = tokio::task::consume_budget().now_or_never();
+        }
+        cx.own(&mut work, tokio::spawn(async {}));
+        // The panic is either recorded now or its handle kept for shutdown to join.
+        assert!(runtime.0.panicked.load(Ordering::SeqCst) || work.tasks.len() == 2);
     }
 }

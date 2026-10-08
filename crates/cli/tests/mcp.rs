@@ -145,6 +145,34 @@ fn an_unknown_mcp_tool_is_a_usage_error_before_provider_setup() {
 }
 
 #[test]
+fn a_missing_credential_fails_before_any_server_is_launched() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_server.py");
+    // A launched server would write this marker when shut down.
+    let marker = dir.path().join("launched.pid");
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "[mcp.servers.py]\ncommand = 'python3'\nargs = ['{server}', 'linger', '{}']\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    // No fake script, no credential and no MCP tool named in --tools.
+    let output = command(&dir)
+        .args(["run", "task", "-C"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no API key"), "{stderr}");
+    assert!(!marker.exists(), "a server was launched");
+}
+
+#[test]
 fn a_second_ctrl_c_during_server_shutdown_kills_the_servers_and_exits() {
     use nix::{
         sys::signal::{Signal, kill},

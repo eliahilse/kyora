@@ -244,6 +244,24 @@ async fn execute(mut run: Run) -> u8 {
             return 2;
         }
     };
+    // When --tools names no MCP tool there is no selection to resolve against the
+    // servers, so a missing credential fails before any server is launched.
+    let mcp_selected = run
+        .tools
+        .iter()
+        .flatten()
+        .any(|name| name.starts_with("mcp__"));
+    let early = if mcp_selected {
+        None
+    } else {
+        match providers(&run, &resolved, &config, &path) {
+            Ok(providers) => Some(providers),
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                return 1;
+            }
+        }
+    };
     // Servers none of whose tools `--tools` could select are not started.
     let mcp = kyora_mcp::McpConfig {
         servers: config
@@ -286,14 +304,17 @@ async fn execute(mut run: Run) -> u8 {
     }
     let servers = Arc::new(servers);
     let toolsets = kyora_mcp::McpToolsets::new(&builtins, servers.clone());
-    // `--tools` may name MCP tools, so it is checked once the servers are up, and
-    // before providers are built, so a usage error wins over a missing credential.
+    // `--tools` may name MCP tools, so it is checked once the servers are up. When it
+    // does, providers are built only after it, so the usage error comes first.
     let selection = ToolSelection(run.tools.clone());
     let checked = toolsets
         .snapshot()
         .and_then(|tools| tools.select(&selection))
         .map_err(|error| (error, 2))
-        .and_then(|_| providers(&run, &resolved, &config, &path).map_err(|error| (error, 1)));
+        .and_then(|_| match early {
+            Some(providers) => Ok(providers),
+            None => providers(&run, &resolved, &config, &path).map_err(|error| (error, 1)),
+        });
     let code = match checked {
         Err((error, code)) => {
             eprintln!("error: {error:#}");

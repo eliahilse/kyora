@@ -98,7 +98,7 @@ impl Process {
         let tail = stderr.clone();
         // Room in front of the tail for the longest credential value, so a value cut
         // by the ring's start can still be recognized and dropped.
-        let slack = secrets.longest();
+        let slack = secrets.reach();
         let capacity = defaults::STDERR_TAIL_BYTES + slack;
         let drain = tokio::spawn(async move {
             let mut chunk = [0; 1024];

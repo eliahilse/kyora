@@ -4,9 +4,11 @@
 //! Redaction is best effort by contract. A configured server is trusted with the
 //! credentials forwarded to it, so this only keeps common echoes out of traces and
 //! model context. Covered: exact text (with overlapping matches merged), JSON string
-//! escapes including `\uXXXX` for non-ASCII characters, decoded JSON strings, keys
-//! and numbers, and model-visible tool names. Not covered: other encodings such as
-//! base64 or percent-encoding inside text. docs/mcp.md states the same scope.
+//! escapes in any spelling (text is also searched with its escapes decoded), decoded
+//! JSON strings, keys and numbers, and model-visible tool names. Not covered: other
+//! encodings such as base64 or percent-encoding inside text, and values shorter than
+//! 6 characters (characters, not bytes: "密钥值" has 9 bytes but is not redacted).
+//! docs/mcp.md states the same scope.
 use crate::{config::ServerConfig, defaults};
 use aho_corasick::AhoCorasick;
 use kyora_core::ToolOutput;
@@ -23,10 +25,10 @@ pub(crate) struct Secrets(Arc<Patterns>);
 
 #[derive(Default)]
 struct Patterns {
-    /// Every form of every value, searched in one linear pass with overlapping
-    /// matches reported; None when nothing is to be redacted.
+    /// Every value, searched in linear passes with overlapping matches reported;
+    /// None when nothing is to be redacted.
     automaton: Option<AhoCorasick>,
-    /// Length in bytes of the longest form.
+    /// Length in bytes of the longest value.
     longest: usize,
     /// Variables whose values are too short to redact without shredding output.
     short: Vec<String>,
@@ -64,18 +66,6 @@ impl Secrets {
                 }
                 continue;
             }
-            // Text that embeds JSON carries the escaped form, as in "pa\"ss".
-            let escaped = serde_json::to_string(&value).expect("strings serialize");
-            let escaped = &escaped[1..escaped.len() - 1];
-            if escaped != value {
-                values.push(escaped.to_owned());
-            }
-            // ASCII-only encoders, such as Python's json by default, write every other
-            // character as \uXXXX, in either case.
-            if !value.is_ascii() {
-                values.push(ascii_escaped(escaped, false));
-                values.push(ascii_escaped(escaped, true));
-            }
             values.push(value);
         }
         values.sort();
@@ -106,9 +96,10 @@ impl Secrets {
             .collect()
     }
 
-    /// Length in bytes of the longest value.
-    pub(crate) fn longest(&self) -> usize {
-        self.0.longest
+    /// Bytes of text a single match can span: the longest value, or six times that
+    /// when every character of it is written as a `\uXXXX` escape.
+    pub(crate) fn reach(&self) -> usize {
+        self.0.longest * ESCAPE_GROWTH
     }
 
     /// Replaces every value in one pass over `text`. Placeholders are never scanned
@@ -128,24 +119,47 @@ impl Secrets {
         let Some(automaton) = &self.0.automaton else {
             return text[from..].to_owned();
         };
-        let longest = self.0.longest;
+        let reach = self.reach();
         let mut out = String::with_capacity(text.len() - from);
         let mut copied = from;
         let emit = |(start, end): (usize, usize), out: &mut String, copied: &mut usize| {
-            // Values are valid UTF-8, so spans start and end on char boundaries.
+            // Values are valid UTF-8 and escapes map back whole, so spans start and
+            // end on char boundaries.
             if end > *copied {
                 out.push_str(&text[*copied..start.max(*copied)]);
                 out.push_str(REDACTED);
                 *copied = end;
             }
         };
-        // Overlapping search reports every match, also inside another, in order of
-        // their ends, in time linear in the text plus the matches. Overlapping and
-        // adjacent matches, as "abcdef" and "defghi" within "abcdefghi", merge into
-        // one span instead of the second being left half visible.
+        // Matches in the text itself, and in the text with its JSON escapes decoded,
+        // mapped back to the escapes they came from. Overlapping search reports every
+        // match, also inside another, in order of their ends; both streams stay in
+        // that order and are merged, all in time linear in the text plus the matches.
+        let decoded = Decoded::new(text);
+        let mut raw = automaton
+            .find_overlapping_iter(text)
+            .map(|found| (found.start(), found.end()))
+            .peekable();
+        let mut escaped = decoded
+            .iter()
+            .flat_map(|view| {
+                automaton
+                    .find_overlapping_iter(&view.text)
+                    .map(|found| view.original(found.start(), found.end()))
+            })
+            .peekable();
+        // Overlapping and adjacent matches, as "abcdef" and "defghi" within
+        // "abcdefghi", merge into one span instead of the second being left half
+        // visible.
         let mut pending: Vec<(usize, usize)> = Vec::new();
-        for found in automaton.find_overlapping_iter(text) {
-            let (mut start, end) = (found.start(), found.end());
+        loop {
+            let next = match (raw.peek(), escaped.peek()) {
+                (Some(a), Some(b)) if a.1 <= b.1 => raw.next(),
+                (_, Some(_)) => escaped.next(),
+                (Some(_), None) => raw.next(),
+                (None, None) => break,
+            };
+            let (mut start, end) = next.expect("peeked match");
             while let Some(&(earlier, last)) = pending.last()
                 && last >= start
             {
@@ -154,10 +168,10 @@ impl Secrets {
             }
             pending.push((start, end));
             // A later match ends at or after `end`, so it starts at or after
-            // `end - longest`; spans ending before that are final.
+            // `end - reach`; spans ending before that are final.
             let settled = pending
                 .iter()
-                .take_while(|(_, last)| *last < end.saturating_sub(longest))
+                .take_while(|(_, last)| *last < end.saturating_sub(reach))
                 .count();
             for span in pending.drain(..settled) {
                 emit(span, &mut out, &mut copied);
@@ -172,10 +186,10 @@ impl Secrets {
 
     /// Whether `text` contains a value.
     pub(crate) fn found_in(&self, text: &str) -> bool {
-        self.0
-            .automaton
-            .as_ref()
-            .is_some_and(|automaton| automaton.is_match(text))
+        self.0.automaton.as_ref().is_some_and(|automaton| {
+            automaton.is_match(text)
+                || Decoded::new(text).is_some_and(|view| automaton.is_match(&view.text))
+        })
     }
 
     /// Redacts every string in `value`, object keys included. A number whose decimal
@@ -215,23 +229,106 @@ impl Secrets {
     }
 }
 
-/// `escaped` with every non-ASCII character as JSON `\uXXXX` UTF-16 units.
-fn ascii_escaped(escaped: &str, upper: bool) -> String {
-    let mut out = String::with_capacity(escaped.len() * 2);
-    for c in escaped.chars() {
-        if c.is_ascii() {
-            out.push(c);
-            continue;
+/// Most text bytes per decoded byte: an ASCII character written as `\uXXXX`.
+const ESCAPE_GROWTH: usize = 6;
+
+/// `text` with its JSON string escapes decoded, `\uXXXX` in any case and surrogate
+/// pairs included, so every spelling of a value meets the same automaton. Invalid
+/// or partial escapes stay as they are.
+struct Decoded {
+    text: String,
+    /// For every decoded byte, and one past the end, the text offset of the
+    /// character or escape it came from.
+    origin: Vec<u32>,
+}
+
+impl Decoded {
+    /// None when there is nothing to decode, or the text is too large to map.
+    fn new(text: &str) -> Option<Self> {
+        if !text.contains('\\') || u32::try_from(text.len()).is_err() {
+            return None;
         }
-        for unit in c.encode_utf16(&mut [0; 2]) {
-            out.push_str(&if upper {
-                format!("\\u{unit:04X}")
-            } else {
-                format!("\\u{unit:04x}")
-            });
+        let bytes = text.as_bytes();
+        let mut decoded = String::with_capacity(text.len());
+        let mut origin = Vec::with_capacity(text.len() + 1);
+        let mut at = 0;
+        while at < text.len() {
+            let (c, used, escape) = match unescape(&bytes[at..]) {
+                Some((c, used)) => (c, used, true),
+                // Not a valid escape, a stray backslash included: copy it as it is.
+                None => {
+                    let c = text[at..].chars().next().expect("char boundary");
+                    (c, c.len_utf8(), false)
+                }
+            };
+            let start = decoded.len();
+            decoded.push(c);
+            // Bytes of an escape all map to its start; copied bytes to themselves.
+            for offset in 0..decoded.len() - start {
+                let from = if escape { at } else { at + offset };
+                origin.push(from as u32);
+            }
+            at += used;
         }
+        origin.push(text.len() as u32);
+        Some(Self {
+            text: decoded,
+            origin,
+        })
     }
-    out
+
+    /// The text range a decoded match came from. Matches start and end on decoded
+    /// char boundaries, so the range covers whole escapes.
+    fn original(&self, start: usize, end: usize) -> (usize, usize) {
+        (self.origin[start] as usize, self.origin[end] as usize)
+    }
+}
+
+/// The character an escape at the start of `bytes` stands for, and its length.
+fn unescape(bytes: &[u8]) -> Option<(char, usize)> {
+    if bytes.first() != Some(&b'\\') {
+        return None;
+    }
+    let simple = match bytes.get(1)? {
+        b'"' => '"',
+        b'\\' => '\\',
+        b'/' => '/',
+        b'b' => '\u{8}',
+        b'f' => '\u{c}',
+        b'n' => '\n',
+        b'r' => '\r',
+        b't' => '\t',
+        b'u' => return unicode(bytes),
+        _ => return None,
+    };
+    Some((simple, 2))
+}
+
+/// A `\uXXXX` escape, or a surrogate pair of two.
+fn unicode(bytes: &[u8]) -> Option<(char, usize)> {
+    let unit = hex4(bytes.get(2..6)?)?;
+    match unit {
+        0xD800..=0xDBFF => {
+            if bytes.get(6..8)? != b"\\u" {
+                return None;
+            }
+            let low = hex4(bytes.get(8..12)?)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return None;
+            }
+            let c = char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00))?;
+            Some((c, 12))
+        }
+        0xDC00..=0xDFFF => None,
+        _ => Some((char::from_u32(unit)?, 6)),
+    }
+}
+
+fn hex4(digits: &[u8]) -> Option<u32> {
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
 }
 
 #[cfg(test)]
@@ -321,6 +418,45 @@ mod tests {
             value,
             serde_json::json!({"pin": "[redacted]", "longer": "[redacted]", "small": 42})
         );
+    }
+
+    #[test]
+    fn every_spelling_of_an_escaped_value_is_redacted() {
+        let secrets = secrets(&["pässwörd", "pa/ssword", "password"]);
+        for text in [
+            // Mixed case, partly escaped, an escaped solidus, escaped ASCII letters.
+            r#"{"p":"p\u00E4ssw\u00f6rd"}"#,
+            r#"{"p":"p\u00e4sswörd"}"#,
+            r#"{"p":"pa\/ssword"}"#,
+            r#"{"p":"\u0070\u0061ssword"}"#,
+        ] {
+            assert_eq!(secrets.redact(text), r#"{"p":"[redacted]"}"#, "{text}");
+        }
+        // The span maps back to the escapes around it, multibyte text included.
+        assert_eq!(secrets.redact(r"é \u0070assword ü"), "é [redacted] ü");
+        assert!(secrets.found_in(r"\u0070assword"));
+    }
+
+    #[test]
+    fn invalid_and_partial_escapes_are_left_alone() {
+        let secrets = secrets(&["password"]);
+        for text in [
+            "\\",
+            "trailing \\",
+            "\\u00",
+            "\\uZZZZ password",
+            "\\ud83d lone high surrogate",
+            "\\udc00 lone low surrogate",
+            "\\ud83d\\u0041 unpaired",
+            "\\q unknown escape",
+            "\\u+123 sign",
+            "ü\\",
+        ] {
+            let expected = text.replace("password", REDACTED);
+            assert_eq!(secrets.redact(text), expected, "{text}");
+        }
+        // An escaped backslash ends the escape, so "\\u0070" is not a "p".
+        assert_eq!(secrets.redact("\\\\u0070assword"), "\\\\u0070assword");
     }
 
     #[test]

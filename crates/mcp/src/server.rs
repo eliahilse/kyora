@@ -316,7 +316,7 @@ impl Server {
     ) -> Result<Arc<Self>> {
         validate_name(name)?;
         config.validate()?;
-        let secrets = Secrets::resolve(config, env);
+        let secrets = Secrets::resolve(config, env)?;
         let changed = Arc::new(Notify::new());
         let handler = Handler {
             changed: changed.clone(),

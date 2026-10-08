@@ -24,7 +24,13 @@ struct Patterns {
 }
 
 impl Secrets {
-    pub(crate) fn resolve(config: &ServerConfig, env: &[(OsString, OsString)]) -> Self {
+    /// Collects the values to redact. A value longer than
+    /// [`defaults::MAX_SECRET_BYTES`] is refused: it could not fit in a capped error
+    /// body or stderr tail, so it could never be recognized whole.
+    pub(crate) fn resolve(
+        config: &ServerConfig,
+        env: &[(OsString, OsString)],
+    ) -> anyhow::Result<Self> {
         let mut values = Vec::new();
         let mut short = Vec::new();
         for variable in config
@@ -37,6 +43,12 @@ impl Secrets {
                 continue;
             };
             let value = value.to_string_lossy().into_owned();
+            if value.len() > defaults::MAX_SECRET_BYTES {
+                anyhow::bail!(
+                    "the value of {variable} is longer than {} bytes, too long to redact reliably",
+                    defaults::MAX_SECRET_BYTES
+                );
+            }
             if value.chars().count() < defaults::MIN_SECRET_CHARS {
                 if !value.is_empty() && !short.contains(variable) {
                     short.push(variable.clone());
@@ -63,11 +75,11 @@ impl Secrets {
         for value in &values {
             first[usize::from(value.as_bytes()[0])] = true;
         }
-        Self(Arc::new(Patterns {
+        Ok(Self(Arc::new(Patterns {
             values,
             first,
             short,
-        }))
+        })))
     }
 
     /// Notes for values that are not redacted because they are too short.
@@ -227,7 +239,7 @@ mod tests {
             env_vars: (0..values.len()).map(|i| format!("V{i}")).collect(),
             ..ServerConfig::default()
         };
-        Secrets::resolve(&config, &env)
+        Secrets::resolve(&config, &env).unwrap()
     }
 
     #[test]
@@ -311,6 +323,24 @@ mod tests {
         ] {
             assert_eq!(secrets.redact(text), r#"{"p":"[redacted]"}"#, "{text}");
         }
+    }
+
+    #[test]
+    fn values_too_long_to_redact_are_refused() {
+        let config = ServerConfig {
+            command: Some("server".into()),
+            env_vars: vec!["LONG".into()],
+            ..ServerConfig::default()
+        };
+        let fits = vec![("LONG".into(), "x".repeat(defaults::MAX_SECRET_BYTES).into())];
+        assert!(Secrets::resolve(&config, &fits).is_ok());
+        let long = vec![(
+            "LONG".into(),
+            "x".repeat(defaults::MAX_SECRET_BYTES + 1).into(),
+        )];
+        let error = Secrets::resolve(&config, &long).err().unwrap().to_string();
+        assert!(error.contains("LONG") && error.contains("4096"), "{error}");
+        assert!(!error.contains("xxxx"), "{error}");
     }
 
     #[test]

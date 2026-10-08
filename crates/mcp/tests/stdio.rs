@@ -558,6 +558,24 @@ async fn a_credential_cut_by_the_stderr_tail_is_still_redacted() {
 }
 
 #[tokio::test]
+async fn a_credential_too_long_to_redact_stops_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let config = ServerConfig {
+        env_vars: vec!["KYORA_TEST_LONG".into()],
+        ..server_config(&log, &[])
+    };
+    let mut env = environment();
+    env.push(("KYORA_TEST_LONG".into(), "z".repeat(4097).into()));
+    let failed = Server::start("fake", &config, dir.path(), &env).await;
+    let message = format!("{:#}", failed.err().expect("long value accepted"));
+    assert!(message.contains("KYORA_TEST_LONG"), "{message}");
+    assert!(!message.contains("zzzz"), "{message}");
+    // Refused before anything was spawned.
+    assert!(!log.exists());
+}
+
+#[tokio::test]
 async fn startup_failures_are_reported_and_other_servers_keep_running() {
     let dir = tempfile::tempdir().unwrap();
     let log = |name: &str| dir.path().join(format!("{name}.jsonl"));

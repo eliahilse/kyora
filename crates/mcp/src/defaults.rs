@@ -15,6 +15,9 @@ pub const CANCEL_NOTICE: Duration = Duration::from_secs(1);
 pub const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Shortest credential value that is redacted; shorter values would shred output.
 pub const MIN_SECRET_CHARS: usize = 6;
+/// Longest credential value accepted, so one always fits whole in a capped error body
+/// or stderr tail and can be redacted there.
+pub const MAX_SECRET_BYTES: usize = 4096;
 /// Bytes of server stderr kept for startup diagnostics.
 pub const STDERR_TAIL_BYTES: usize = 2048;
 /// Largest single message accepted from a server: a stdio line, an HTTP JSON body or

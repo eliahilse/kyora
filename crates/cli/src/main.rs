@@ -342,11 +342,13 @@ async fn execute(mut run: Run) -> u8 {
 /// The first Ctrl-C asks everything to stop; a second within the interrupt window
 /// kills shell and MCP server process groups and exits at once.
 async fn watch_interrupts(stop: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+    // One stream for the whole watch, so no Ctrl-C falls between two receivers.
+    let Ok(mut interrupts) = signal(SignalKind::interrupt()) else {
+        return;
+    };
     let mut last = None;
-    loop {
-        if tokio::signal::ctrl_c().await.is_err() {
-            break;
-        }
+    while interrupts.recv().await.is_some() {
         let now = tokio::time::Instant::now();
         stop.cancel();
         if last.is_some_and(|then| now.duration_since(then) <= defaults::INTERRUPT_WINDOW) {

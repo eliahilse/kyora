@@ -211,10 +211,8 @@ struct StartupGuard(Option<HttpClient>);
 impl Drop for StartupGuard {
     fn drop(&mut self) {
         if let Some(client) = self.0.take() {
-            client.cancel();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move { client.close().await });
-            }
+            // Cancels at once; the DELETE runs as its own task.
+            let _ = client.close();
         }
     }
 }
@@ -402,7 +400,7 @@ impl Server {
                 };
                 // rmcp leaves startup requests running and sessions open on failure.
                 if let Some((client, _)) = &http {
-                    client.close().await;
+                    client.close_and_wait().await;
                 }
                 let mut message = format!("{error:#}{}", limit_note(&oversized));
                 if !stderr.is_empty() {
@@ -474,7 +472,7 @@ impl Server {
             process.stop().await;
         }
         if let Some(http) = &self.http {
-            http.close().await;
+            http.close_and_wait().await;
         }
     }
 }

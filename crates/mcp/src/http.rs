@@ -62,9 +62,16 @@ struct Shared {
     auth_header: Option<String>,
     headers: HashMap<HeaderName, HeaderValue>,
     /// The session the server assigned and nobody has deleted yet.
-    session: Mutex<Option<Arc<str>>>,
+    session: Mutex<SessionSlot>,
     /// The negotiated MCP-Protocol-Version header, which every later request carries.
     version: Mutex<Option<HeaderValue>>,
+}
+
+/// The session the server assigned, and whether cleanup has already started.
+#[derive(Default)]
+struct SessionSlot {
+    session: Option<Arc<str>>,
+    closed: bool,
 }
 
 impl HttpClient {
@@ -85,7 +92,7 @@ impl HttpClient {
             uri,
             auth_header,
             headers,
-            session: Mutex::new(None),
+            session: Mutex::new(SessionSlot::default()),
             version: Mutex::new(None),
         };
         Self {
@@ -94,18 +101,28 @@ impl HttpClient {
         }
     }
 
-    /// Ends every request and stream in flight.
-    pub(crate) fn cancel(&self) {
+    /// Ends every request and stream in flight and deletes a session that is still
+    /// open, for example after a failed startup that rmcp abandoned. The DELETE runs
+    /// as its own task, so it finishes even if the caller is aborted; the handle lets
+    /// a caller wait for it. Best effort: a runtime that is shutting down may drop it.
+    pub(crate) fn close(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.shared.cancel.cancel();
+        let session = {
+            let mut slot = self.shared.session.lock().expect("session poisoned");
+            slot.closed = true;
+            slot.session.take()
+        };
+        self.spawn_delete(session?)
     }
 
-    /// Ends every request and stream in flight, then deletes a session that is still
-    /// open, for example after a failed startup that rmcp abandoned.
-    pub(crate) async fn close(&self) {
-        self.shared.cancel.cancel();
-        let Some(session) = self.take_session() else {
-            return;
-        };
+    /// [`Self::close`], waiting for the DELETE.
+    pub(crate) async fn close_and_wait(&self) {
+        if let Some(delete) = self.close() {
+            let _ = delete.await;
+        }
+    }
+
+    fn spawn_delete(&self, session: Arc<str>) -> Option<tokio::task::JoinHandle<()>> {
         let mut custom = self.shared.headers.clone();
         if let Some(version) = self
             .shared
@@ -123,11 +140,10 @@ impl HttpClient {
             self.shared.auth_header.clone(),
             custom,
         );
-        let _ = tokio::time::timeout(defaults::DELETE_TIMEOUT, request.send()).await;
-    }
-
-    fn take_session(&self) -> Option<Arc<str>> {
-        self.shared.session.lock().expect("session poisoned").take()
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        Some(runtime.spawn(async move {
+            let _ = tokio::time::timeout(defaults::DELETE_TIMEOUT, request.send()).await;
+        }))
     }
 
     /// Keeps the version rmcp sends once the handshake has negotiated it.
@@ -153,14 +169,25 @@ impl HttpClient {
         }
     }
 
+    /// Keeps the session until a DELETE answers. A session that only arrives after
+    /// cleanup started is deleted right away.
     fn remember(&self, session: &str) {
-        *self.shared.session.lock().expect("session poisoned") = Some(session.into());
+        let late = {
+            let mut slot = self.shared.session.lock().expect("session poisoned");
+            if !slot.closed {
+                slot.session = Some(session.into());
+            }
+            slot.closed
+        };
+        if late {
+            self.spawn_delete(session.into());
+        }
     }
 
     fn forget(&self, session: &str) {
-        let mut current = self.shared.session.lock().expect("session poisoned");
-        if current.as_deref() == Some(session) {
-            *current = None;
+        let mut slot = self.shared.session.lock().expect("session poisoned");
+        if slot.session.as_deref() == Some(session) {
+            slot.session = None;
         }
     }
 
@@ -606,7 +633,7 @@ mod tests {
                 while events.next().await.is_some() {}
             }
             // Cancelled before rmcp sent notifications/initialized with the header.
-            client.close().await;
+            client.close_and_wait().await;
             assert_eq!(
                 deletes(&server).await,
                 [(Some("s1".to_owned()), Some("2025-06-18".to_owned()))],
@@ -644,5 +671,55 @@ mod tests {
         let mut size = EventSize::new(20);
         assert!(size.feed(b"data: 0123456789\r"));
         assert!(!size.feed(b"\ndata: 0"));
+    }
+
+    async fn wait_for_delete(server: &MockServer, session: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if deletes(server)
+                .await
+                .iter()
+                .any(|(id, _)| id.as_deref() == Some(session))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_session_that_arrives_after_cleanup_is_still_deleted() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client(&server.uri());
+        client.close_and_wait().await;
+        // A response that was already on its way when cleanup started.
+        client.remember("late");
+        assert!(wait_for_delete(&server, "late").await);
+    }
+
+    #[tokio::test]
+    async fn cleanup_outlives_an_aborted_caller() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let client = client(&server.uri());
+        client.remember("held");
+        let (started, running) = tokio::sync::oneshot::channel();
+        let closing = client.clone();
+        let caller = tokio::spawn(async move {
+            let _ = started.send(());
+            closing.close_and_wait().await;
+        });
+        // The caller has begun cleanup and is waiting on it when it is aborted.
+        running.await.unwrap();
+        caller.abort();
+        assert!(wait_for_delete(&server, "held").await);
     }
 }

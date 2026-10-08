@@ -1,0 +1,537 @@
+#![cfg(unix)]
+use kyora_mcp::{Server, ServerConfig};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio_util::sync::CancellationToken;
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+const TOKEN: &str = "test-only-bearer-token";
+const KEY: &str = "test-only-header-key";
+const SESSION: &str = "session-1";
+
+/// A streamable HTTP MCP server: JSON replies for some requests, SSE for others.
+struct Fake;
+
+impl Respond for Fake {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match request.method.as_str() {
+            // No standalone server stream; sessions can be deleted.
+            "GET" => return ResponseTemplate::new(405),
+            "DELETE" => return ResponseTemplate::new(200),
+            _ => {}
+        }
+        let message: Value = serde_json::from_slice(&request.body).unwrap();
+        let id = message["id"].clone();
+        let params = &message["params"];
+        match message["method"].as_str().unwrap_or_default() {
+            "initialize" => json_reply(
+                &id,
+                json!({
+                    "protocolVersion": params["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "remote", "version": "1"},
+                }),
+            )
+            .insert_header("mcp-session-id", SESSION),
+            "tools/list" if params["cursor"].is_null() => json_reply(
+                &id,
+                json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}], "nextCursor": "page-2"}),
+            ),
+            "tools/list" => sse_reply(
+                &id,
+                json!({"tools": [
+                    {"name": "fail", "inputSchema": {"type": "object"}},
+                    {"name": "slow", "inputSchema": {"type": "object"}},
+                ]}),
+            ),
+            "tools/call" => match params["name"].as_str().unwrap_or_default() {
+                "echo" => sse_reply(
+                    &id,
+                    json!({"content": [{"type": "text", "text": params["arguments"]["text"]}]}),
+                ),
+                // Servers can echo credentials back in errors and results.
+                "leak" => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": format!("invalid token {TOKEN}")},
+                })),
+                "leak_result" => json_reply(
+                    &id,
+                    json!({"content": [{"type": "text", "text": format!("key {KEY} rejected")}], "isError": true}),
+                ),
+                "fail" => json_reply(
+                    &id,
+                    json!({"content": [{"type": "text", "text": "remote failure"}], "isError": true}),
+                ),
+                _ => sse_reply(&id, json!({"content": []})).set_delay(Duration::from_secs(30)),
+            },
+            _ if id.is_null() => ResponseTemplate::new(202),
+            _ => json_reply(&id, json!({})),
+        }
+    }
+}
+
+fn json_reply(id: &Value, result: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+fn sse_reply(id: &Value, result: Value) -> ResponseTemplate {
+    let message = json!({"jsonrpc": "2.0", "id": id, "result": result});
+    ResponseTemplate::new(200).set_body_raw(
+        format!("event: message\ndata: {message}\n\n"),
+        "text/event-stream",
+    )
+}
+
+fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn method(request: &Request) -> String {
+    serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|message| message["method"].as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn streamable_http_handshake_paging_calls_and_cleanup() {
+    let mock = MockServer::start().await;
+    Mock::given(wiremock::matchers::path("/mcp"))
+        .respond_with(Fake)
+        .mount(&mock)
+        .await;
+    let config = ServerConfig {
+        url: Some(format!("{}/mcp", mock.uri())),
+        bearer_token_env: Some("REMOTE_TOKEN".into()),
+        headers: BTreeMap::from([("X-Team".into(), "core".into())]),
+        env_headers: BTreeMap::from([("X-Api-Key".into(), "REMOTE_KEY".into())]),
+        tool_timeout_s: Some(0.3),
+        ..ServerConfig::default()
+    };
+    let env: Vec<(OsString, OsString)> = vec![
+        ("REMOTE_TOKEN".into(), TOKEN.into()),
+        ("REMOTE_KEY".into(), KEY.into()),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start("remote", &config, dir.path(), &env)
+        .await
+        .unwrap();
+    let names: Vec<_> = server.tools().iter().map(|tool| tool.spec().name).collect();
+    assert_eq!(
+        names,
+        [
+            "mcp__remote__echo",
+            "mcp__remote__fail",
+            "mcp__remote__slow"
+        ]
+    );
+
+    let cancel = CancellationToken::new();
+    let echoed = server
+        .call("echo", json!({"text": "over http"}), &cancel)
+        .await;
+    assert!(!echoed.is_error, "{}", echoed.text_content());
+    assert_eq!(echoed.text_content(), "over http");
+    let failed = server.call("fail", json!({}), &cancel).await;
+    assert!(failed.is_error);
+    assert_eq!(failed.text_content(), "remote failure");
+    for tool in ["leak", "leak_result"] {
+        let leaked = server.call(tool, json!({}), &cancel).await;
+        assert!(leaked.is_error);
+        let text = leaked.text_content();
+        assert!(text.contains(kyora_mcp::REDACTED), "{text}");
+        assert!(!text.contains(TOKEN) && !text.contains(KEY), "{text}");
+    }
+    let started = Instant::now();
+    let slow = server.call("slow", json!({}), &cancel).await;
+    assert!(
+        slow.text_content().starts_with("timed out"),
+        "{}",
+        slow.text_content()
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let requests = mock.received_requests().await.unwrap();
+        if requests
+            .iter()
+            .any(|request| method(request) == "notifications/cancelled")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no cancellation notice");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    server.shutdown().await;
+
+    let requests = mock.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.method.as_str() == "DELETE"
+                && header(request, "mcp-session-id") == Some(SESSION))
+    );
+    for request in &requests {
+        assert_eq!(
+            header(request, "authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+        assert_eq!(header(request, "x-team"), Some("core"));
+        assert_eq!(header(request, "x-api-key"), Some(KEY));
+        if method(request) != "initialize" {
+            assert_eq!(header(request, "mcp-session-id"), Some(SESSION));
+            assert_eq!(header(request, "mcp-protocol-version"), Some("2025-11-25"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_failures_are_startup_errors() {
+    let mock = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(401).insert_header("www-authenticate", "Bearer"))
+        .mount(&mock)
+        .await;
+    let config = ServerConfig {
+        url: Some(mock.uri()),
+        bearer_token_env: Some("REMOTE_TOKEN".into()),
+        ..ServerConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let missing = Server::start("remote", &config, dir.path(), &[]).await;
+    let message = format!("{:#}", missing.err().unwrap());
+    assert!(message.contains("REMOTE_TOKEN is not set"), "{message}");
+    let env: [(OsString, OsString); 1] = [("REMOTE_TOKEN".into(), TOKEN.into())];
+    let refused = Server::start("remote", &config, dir.path(), &env).await;
+    let message = format!("{:#}", refused.err().unwrap());
+    assert!(
+        message.contains("send initialize request: Auth required"),
+        "{message}"
+    );
+    assert!(!message.contains("rmcp::"), "{message}");
+    assert!(!message.contains(TOKEN), "{message}");
+
+    // An error body that echoes the token is redacted before it is reported.
+    let echoing = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500).set_body_string(format!("invalid token {TOKEN}")))
+        .mount(&echoing)
+        .await;
+    let config = ServerConfig {
+        url: Some(echoing.uri()),
+        ..config
+    };
+    let refused = Server::start("remote", &config, dir.path(), &env).await;
+    let message = format!("{:#}", refused.err().unwrap());
+    assert!(message.contains("HTTP 500"), "{message}");
+    assert!(message.contains(kyora_mcp::REDACTED), "{message}");
+    assert!(!message.contains(TOKEN), "{message}");
+    assert!(!message.contains(&echoing.uri()), "{message}");
+
+    // The excerpt is cut after redaction, so a value at the cut leaves nothing behind.
+    let cut = MockServer::start().await;
+    let body = format!("{}{TOKEN}", "x".repeat(190));
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500).set_body_string(body))
+        .mount(&cut)
+        .await;
+    let config = ServerConfig {
+        url: Some(cut.uri()),
+        ..config
+    };
+    let refused = Server::start("remote", &config, dir.path(), &env).await;
+    let message = format!("{:#}", refused.err().unwrap());
+    assert!(!message.contains(&TOKEN[..10]), "{message}");
+}
+
+#[tokio::test]
+async fn redirects_are_refused_so_headers_stay_with_the_configured_origin() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(Fake)
+        .mount(&elsewhere)
+        .await;
+    let origin = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/mcp", elsewhere.uri())),
+        )
+        .mount(&origin)
+        .await;
+    let config = ServerConfig {
+        url: Some(format!("{}/mcp", origin.uri())),
+        bearer_token_env: Some("REMOTE_TOKEN".into()),
+        env_headers: BTreeMap::from([("X-Api-Key".into(), "REMOTE_KEY".into())]),
+        ..ServerConfig::default()
+    };
+    let env: Vec<(OsString, OsString)> = vec![
+        ("REMOTE_TOKEN".into(), TOKEN.into()),
+        ("REMOTE_KEY".into(), KEY.into()),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let started = Server::start("remote", &config, dir.path(), &env).await;
+    assert!(started.is_err());
+    assert!(!origin.received_requests().await.unwrap().is_empty());
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn oversized_http_bodies_are_refused() {
+    let mock = MockServer::start().await;
+    let huge = "x".repeat(17 * 1024 * 1024);
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": {"name": huge, "version": "1"},
+            },
+        })))
+        .mount(&mock)
+        .await;
+    let config = ServerConfig {
+        url: Some(mock.uri()),
+        ..ServerConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let started = Server::start("remote", &config, dir.path(), &[]).await;
+    let message = format!("{:#}", started.err().expect("oversized body accepted"));
+    assert!(message.contains("exceeds 16777216 bytes"), "{message}");
+}
+
+/// Answers initialize with a session, then fails or stalls notifications/initialized.
+struct Abandoned {
+    session: &'static str,
+    stall: bool,
+}
+
+impl Respond for Abandoned {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match request.method.as_str() {
+            "GET" => return ResponseTemplate::new(405),
+            // Strict about the negotiated version, as servers may be after initialize.
+            "DELETE" if header(request, "mcp-protocol-version").is_none() => {
+                return ResponseTemplate::new(400);
+            }
+            "DELETE" => return ResponseTemplate::new(200),
+            _ => {}
+        }
+        let message: Value = serde_json::from_slice(&request.body).unwrap();
+        match message["method"].as_str().unwrap_or_default() {
+            "initialize" => json_reply(
+                &message["id"],
+                json!({
+                    "protocolVersion": message["params"]["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "remote", "version": "1"},
+                }),
+            )
+            .insert_header("mcp-session-id", self.session),
+            _ if self.stall => ResponseTemplate::new(202).set_delay(Duration::from_secs(30)),
+            _ => ResponseTemplate::new(500).set_body_string("not json"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_http_startups_delete_the_session_they_opened() {
+    for (session, stall) in [("stalled-session", true), ("failed-session", false)] {
+        let mock = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(Abandoned { session, stall })
+            .mount(&mock)
+            .await;
+        let config = ServerConfig {
+            url: Some(mock.uri()),
+            startup_timeout_s: Some(1.0),
+            ..ServerConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        assert!(
+            Server::start("remote", &config, dir.path(), &[])
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "{session}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let requests = mock.received_requests().await.unwrap();
+            if requests.iter().any(|request| {
+                request.method.as_str() == "DELETE"
+                    && header(request, "mcp-session-id") == Some(session)
+                    && header(request, "mcp-protocol-version") == Some("2025-11-25")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{session} was not deleted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// A server that answers initialize with a session over SSE and never answers
+/// notifications/initialized, so startup can only be abandoned. It records each
+/// request as "METHOD what", where what is the JSON-RPC method of a POST and the
+/// session and protocol version of a DELETE.
+async fn hanging_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(answer(stream, log.clone()));
+        }
+    });
+    (url, seen)
+}
+
+async fn answer(mut stream: tokio::net::TcpStream, log: Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    let mut chunk = [0; 4096];
+    let (head, body_start) = loop {
+        let Ok(read @ 1..) = stream.read(&mut chunk).await else {
+            return;
+        };
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break (
+                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase(),
+                end + 4,
+            );
+        }
+    };
+    let header = |name: &str| {
+        head.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+            .map(str::to_owned)
+    };
+    let length: usize = header("content-length").map_or(0, |n| n.parse().unwrap());
+    while request.len() < body_start + length {
+        let Ok(read @ 1..) = stream.read(&mut chunk).await else {
+            return;
+        };
+        request.extend_from_slice(&chunk[..read]);
+    }
+    let method = head.split(' ').next().unwrap_or_default().to_uppercase();
+    let message: Value =
+        serde_json::from_slice(&request[body_start..body_start + length]).unwrap_or_default();
+    let what = match method.as_str() {
+        "DELETE" => format!(
+            "{} {}",
+            header("mcp-session-id").unwrap_or_default(),
+            header("mcp-protocol-version").unwrap_or_default()
+        ),
+        _ => message["method"].as_str().unwrap_or_default().to_owned(),
+    };
+    log.lock().unwrap().push(format!("{method} {what}"));
+    let reply = match (method.as_str(), what.as_str()) {
+        ("POST", "initialize") => {
+            let result = json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {
+                    "protocolVersion": message["params"]["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "hanging", "version": "1"},
+                },
+            });
+            let event = format!("event: message\ndata: {result}\n\n");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: hanging\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{event}",
+                event.len()
+            )
+        }
+        ("POST", _) => {
+            // Never answer: hold the request open.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            return;
+        }
+        ("DELETE", _) => {
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+        }
+        _ => "HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_owned(),
+    };
+    let _ = stream.write_all(reply.as_bytes()).await;
+}
+
+async fn deleted(log: &Arc<Mutex<Vec<String>>>) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line == "DELETE hanging 2025-11-25")
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Waits for notifications/initialized, which the client sends only after it has
+/// read the initialize response and with it the session.
+async fn initialized_sent(log: &Arc<Mutex<Vec<String>>>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line == "POST notifications/initialized")
+    {
+        assert!(Instant::now() < deadline, "{:?}", log.lock().unwrap());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_abandoned_http_startup_deletes_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    // Cancelled through the token, as kyora run does on Ctrl-C.
+    let (url, log) = hanging_server().await;
+    let config = ServerConfig {
+        url: Some(url),
+        ..ServerConfig::default()
+    };
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let watched = log.clone();
+    tokio::spawn(async move {
+        initialized_sent(&watched).await;
+        trigger.cancel();
+    });
+    let started = Server::start_until("remote", &config, dir.path(), &[], &cancel).await;
+    assert!(format!("{:#}", started.err().unwrap()).contains("cancelled"));
+    assert!(deleted(&log).await, "{:?}", log.lock().unwrap());
+
+    // Dropped mid-startup by a caller that gives up on it.
+    let (url, log) = hanging_server().await;
+    let config = ServerConfig {
+        url: Some(url),
+        ..ServerConfig::default()
+    };
+    let path = dir.path().to_owned();
+    let starting =
+        tokio::spawn(async move { Server::start("remote", &config, &path, &[]).await.is_ok() });
+    initialized_sent(&log).await;
+    starting.abort();
+    assert!(deleted(&log).await, "{:?}", log.lock().unwrap());
+}

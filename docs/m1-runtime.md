@@ -67,6 +67,7 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn effect(&self) -> Effect;
     fn large_input(&self) -> bool;
+    fn validate_locally(&self) -> bool; // default true; MCP tools defer to their server
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput;
 }
 

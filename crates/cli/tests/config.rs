@@ -174,6 +174,25 @@ fn config_diagnostics_never_output_delimiters_or_credential_values() {
             format!("[providers.anthropic]\napi_key_env = ['{KEY}']"),
             "wrong type for providers.anthropic.api_key_env",
         ),
+        ("mcp = 12".into(), "wrong type for mcp"),
+        (format!("[mcp]\n'{KEY}' = 1"), "unknown field"),
+        (
+            format!("[mcp.servers.a]\nargs = '{KEY}'"),
+            "wrong type for mcp.servers.*.args",
+        ),
+        (
+            format!("[mcp.servers.'{KEY}']\ncommand = 1"),
+            "wrong type for mcp.servers.*.command",
+        ),
+        (
+            format!("[mcp.servers.a]\nenv = {{ A = ['{KEY}'] }}"),
+            "wrong type for mcp.servers.*.env",
+        ),
+        (
+            format!("[mcp.servers.a]\ntool_timeout_s = '{KEY}'"),
+            "wrong type for mcp.servers.*.tool_timeout_s",
+        ),
+        (format!("[mcp.servers.a]\n'{KEY}' = 'x'"), "unknown field"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let text = if setting.starts_with("[providers.anthropic]\n") {
@@ -512,4 +531,34 @@ fn live_anthropic_run_smoke() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+}
+
+#[test]
+fn mcp_validation_names_the_server_without_echoing_values() {
+    for (text, expected) in [
+        (
+            format!("[mcp.servers.a]\ncommand = 'x'\nenv = {{ GITHUB_TOKEN = '{KEY}' }}"),
+            "mcp server a: env must not hold credentials",
+        ),
+        (
+            format!(
+                "[mcp.servers.a]\nurl = 'https://example.com/'\nheaders = {{ Authorization = 'Bearer {KEY}' }}"
+            ),
+            "mcp server a: headers must not hold credentials",
+        ),
+        (
+            format!("[mcp.servers.'{KEY}__x']\ncommand = 'x'"),
+            "invalid mcp server name",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config(&dir, &text);
+        let output = command(&dir).args(["run", "task"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(&format!("invalid config {}", path.display())));
+        assert!(error.contains(expected), "{error}");
+        assert_private(&output, &dir);
+        assert!(!dir.path().join("home/sessions").exists());
+    }
 }

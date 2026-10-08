@@ -17,6 +17,7 @@ kyora-tui.workspace = true
 anyhow.workspace = true
 kyora-core.workspace = true
 kyora-tools.workspace = true
+kyora-mcp.workspace = true
 kyora-providers.workspace = true
 kyora-protocol.workspace = true
 serde_json.workspace = true

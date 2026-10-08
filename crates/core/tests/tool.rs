@@ -96,3 +96,44 @@ fn defaults_validate_and_model_refs_parse() {
         assert!(bad.parse::<ModelRef>().is_err());
     }
 }
+
+/// A tool whose schema uses constructs outside the local subset.
+struct Remote(bool);
+
+#[async_trait::async_trait]
+impl kyora_core::Tool for Remote {
+    fn spec(&self) -> kyora_protocol::ToolSpec {
+        kyora_protocol::ToolSpec {
+            name: if self.0 { "local" } else { "remote" }.into(),
+            description: String::new(),
+            input_schema: json!({"type":"object","properties":{"v":{"type":"null"}},"additionalProperties":false}),
+            large_input: false,
+        }
+    }
+    fn effect(&self) -> kyora_core::Effect {
+        kyora_core::Effect::ReadOnly
+    }
+    fn validate_locally(&self) -> bool {
+        self.0
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _cx: kyora_core::ToolCx,
+    ) -> kyora_core::ToolOutput {
+        kyora_core::ToolOutput::text("called")
+    }
+}
+
+#[test]
+fn tools_can_leave_input_validation_to_their_backend() {
+    let tools = kyora_core::Toolset::new(vec![
+        std::sync::Arc::new(Remote(true)),
+        std::sync::Arc::new(Remote(false)),
+    ])
+    .unwrap();
+    let input = json!({"v": null, "p_extra": 1});
+    assert!(tools.validate("local", &input).is_err());
+    assert!(tools.validate("remote", &input).is_ok());
+    assert!(tools.validate("missing", &input).is_err());
+}

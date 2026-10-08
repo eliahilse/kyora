@@ -85,6 +85,13 @@ pub trait Tool: Send + Sync {
     fn large_input(&self) -> bool {
         self.spec().large_input
     }
+    /// Whether the runtime checks inputs against the schema subset before calling.
+    /// Tools whose schemas are enforced elsewhere, such as MCP tools validated by
+    /// their server, return false so valid inputs outside the subset still arrive;
+    /// the runtime then only requires an object.
+    fn validate_locally(&self) -> bool {
+        true
+    }
     /// Whether the runtime cuts this tool's result to `Limits::tool_output_chars`.
     /// A tool that returns whole messages opts out and bounds its result itself.
     fn truncated(&self) -> bool {
@@ -163,13 +170,14 @@ impl Toolset {
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.entries.values().map(|(s, _)| s.clone()).collect()
     }
-    /// Validates tool existence and arguments.
+    /// Validates tool existence and, unless the tool opts out, its arguments.
     pub fn validate(&self, name: &str, input: &Value) -> Result<()> {
-        let (spec, _) = self
+        let (spec, tool) = self
             .entries
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
-        if self.own_validation.contains(name) {
+        // Tools that check their own input, or leave it to a backend, need an object.
+        if self.own_validation.contains(name) || !tool.validate_locally() {
             return validate(&serde_json::json!({"type": "object"}), input);
         }
         validate(&spec.input_schema, input)

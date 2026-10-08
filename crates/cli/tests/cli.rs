@@ -330,6 +330,20 @@ fn bad_flags_and_zero_limits_are_usage_errors() {
     }
 }
 #[test]
+fn unknown_tools_are_usage_errors_before_provider_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = command(&dir)
+        .args(["run", "task", "--tools", "missing"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: unknown tool: missing\n"
+    );
+    assert!(!dir.path().join("home").exists());
+}
+#[test]
 fn json_ndjson_event_shape_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let output = run(&dir, "final").args(["--json"]).output().unwrap();

@@ -12,6 +12,7 @@ use kyora_providers::anthropic::AnthropicProvider;
 use kyora_providers::{ModelProvider, RetryPolicy, fake::ScriptedProvider};
 use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
 
 mod config;
 
@@ -232,23 +233,151 @@ async fn execute(mut run: Run) -> u8 {
         let path = defaults::home(None)?.join(config::FILE_NAME);
         let config = config::Config::load(&path)?;
         let resolved = Resolved::new(&mut run, &config, &path)?;
-        Ok::<_, anyhow::Error>((prepare(&run)?, resolved, config, path))
+        let prepared = prepare(&run)?;
+        unknown_tools(&run, &config, &prepared.2)?;
+        Ok::<_, anyhow::Error>((prepared, resolved, config, path))
     })();
-    let ((limits, cwd, toolset), resolved, config, path) = match prepared {
+    let ((limits, cwd, builtins), resolved, config, path) = match prepared {
         Ok(p) => p,
         Err(error) => {
             eprintln!("error: {error:#}");
             return 2;
         }
     };
-    let result = execute_runtime(run, resolved, config, path, limits, cwd, toolset).await;
-    match result {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            1
+    // When --tools names no MCP tool there is no selection to resolve against the
+    // servers, so a missing credential fails before any server is launched.
+    let mcp_selected = run
+        .tools
+        .iter()
+        .flatten()
+        .any(|name| name.starts_with("mcp__"));
+    let early = if mcp_selected {
+        None
+    } else {
+        match providers(&run, &resolved, &config, &path) {
+            Ok(providers) => Some(providers),
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                return 1;
+            }
+        }
+    };
+    // Servers none of whose tools `--tools` could select are not started.
+    let mcp = kyora_mcp::McpConfig {
+        servers: config
+            .mcp
+            .servers
+            .iter()
+            .filter(|(name, server)| {
+                let prefix = format!("mcp__{name}__");
+                server.enabled
+                    && run
+                        .tools
+                        .as_ref()
+                        .is_none_or(|tools| tools.iter().any(|tool| tool.starts_with(&prefix)))
+            })
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .collect(),
+    };
+    // One watcher covers server startup, the run and server shutdown.
+    let stop = CancellationToken::new();
+    let interrupts = tokio::spawn(watch_interrupts(stop.clone()));
+    let (servers, failures) = if !mcp.servers.is_empty() {
+        // Ctrl-C stops servers still starting, after their cleanup.
+        let started = kyora_mcp::Servers::start_until(&mcp, &cwd, &stop).await;
+        if stop.is_cancelled() {
+            started.0.shutdown().await;
+            interrupts.abort();
+            return 130;
+        }
+        started
+    } else {
+        (kyora_mcp::Servers::default(), Vec::new())
+    };
+    for failure in failures {
+        eprintln!("warning: {failure:#}; continuing without its tools");
+    }
+    for server in servers.servers() {
+        for warning in server.warnings() {
+            eprintln!("warning: mcp server {}: {warning}", server.name());
         }
     }
+    let servers = Arc::new(servers);
+    let toolsets = kyora_mcp::McpToolsets::new(&builtins, servers.clone());
+    // `--tools` may name MCP tools, so it is checked once the servers are up. When it
+    // does, providers are built only after it, so the usage error comes first.
+    let selection = ToolSelection(run.tools.clone());
+    let checked = toolsets
+        .snapshot()
+        .and_then(|tools| tools.select(&selection))
+        .map_err(|error| (error, 2))
+        .and_then(|_| match early {
+            Some(providers) => Ok(providers),
+            None => providers(&run, &resolved, &config, &path).map_err(|error| (error, 1)),
+        });
+    let code = match checked {
+        Err((error, code)) => {
+            eprintln!("error: {error:#}");
+            code
+        }
+        Ok(providers) => {
+            let tools = Tools {
+                factory: toolsets,
+                selection,
+            };
+            match execute_runtime(run, resolved, providers, limits, cwd, tools, stop).await {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("error: {error:#}");
+                    1
+                }
+            }
+        }
+    };
+    servers.shutdown().await;
+    interrupts.abort();
+    let _ = interrupts.await;
+    code
+}
+/// The first Ctrl-C asks everything to stop; a second within the interrupt window
+/// kills shell and MCP server process groups and exits at once.
+async fn watch_interrupts(stop: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+    // One stream for the whole watch, so no Ctrl-C falls between two receivers.
+    let Ok(mut interrupts) = signal(SignalKind::interrupt()) else {
+        return;
+    };
+    let mut last = None;
+    while interrupts.recv().await.is_some() {
+        let now = tokio::time::Instant::now();
+        stop.cancel();
+        if last.is_some_and(|then| now.duration_since(then) <= defaults::INTERRUPT_WINDOW) {
+            kyora_tools::cancel_processes();
+            kyora_mcp::kill_servers();
+            std::process::exit(130);
+        }
+        eprintln!("cancelling; press Ctrl-C again to stop at once");
+        last = Some(now);
+    }
+}
+/// Rejects `--tools` names that neither a built-in tool nor any enabled MCP server
+/// could provide, before providers or servers are set up. Names an MCP server might
+/// offer are checked once the servers have started.
+fn unknown_tools(run: &Run, config: &config::Config, builtins: &kyora_core::Toolset) -> Result<()> {
+    for name in run.tools.iter().flatten() {
+        let from_server = config.mcp.servers.iter().any(|(server, settings)| {
+            settings.enabled && name.starts_with(&format!("mcp__{server}__"))
+        });
+        if builtins.get(name).is_none() && !from_server {
+            bail!("unknown tool: {name}");
+        }
+    }
+    Ok(())
+}
+/// The node toolset factory and the root's `--tools` selection.
+struct Tools {
+    factory: kyora_mcp::McpToolsets,
+    selection: ToolSelection,
 }
 fn prepare(run: &Run) -> Result<(Limits, PathBuf, kyora_core::Toolset)> {
     let mut limits = Limits::default();
@@ -287,19 +416,15 @@ fn prepare(run: &Run) -> Result<(Limits, PathBuf, kyora_core::Toolset)> {
         ),
         ..kyora_tools::defaults::FileConfig::default()
     };
-    let tools = kyora_tools::toolset(kyora_tools::ShellConfig::default(), files)?
-        .select(&ToolSelection(run.tools.clone()))?;
+    let tools = kyora_tools::toolset(kyora_tools::ShellConfig::default(), files)?;
     Ok((limits, cwd, tools))
 }
-async fn execute_runtime(
-    run: Run,
-    resolved: Resolved,
-    config: config::Config,
-    config_path: PathBuf,
-    limits: Limits,
-    cwd: PathBuf,
-    tools: kyora_core::Toolset,
-) -> Result<u8> {
+fn providers(
+    run: &Run,
+    resolved: &Resolved,
+    config: &config::Config,
+    config_path: &std::path::Path,
+) -> Result<BTreeMap<String, Arc<dyn ModelProvider>>> {
     let scripted: Option<Arc<dyn ModelProvider>> = run
         .fake_script
         .as_ref()
@@ -316,14 +441,25 @@ async fn execute_runtime(
                 name.clone(),
                 provider(
                     name,
-                    &config,
-                    &config_path,
+                    config,
+                    config_path,
                     run.base_url.as_deref(),
                     scripted.as_ref(),
                 )?,
             );
         }
     }
+    Ok(providers)
+}
+async fn execute_runtime(
+    run: Run,
+    resolved: Resolved,
+    providers: BTreeMap<String, Arc<dyn ModelProvider>>,
+    limits: Limits,
+    cwd: PathBuf,
+    tools: Tools,
+    interrupted: CancellationToken,
+) -> Result<u8> {
     let store = if run.no_session {
         None
     } else {
@@ -335,7 +471,7 @@ async fn execute_runtime(
     let session = store.as_ref().map_or_else(uuid_id, |s| s.id.clone());
     let runtime = Runtime::new(RuntimeConfig {
         providers,
-        toolsets: Arc::new(tools),
+        toolsets: Arc::new(tools.factory),
         limits,
         retry: RetryPolicy::default(),
         llm_model: resolved.llm_model,
@@ -353,22 +489,12 @@ async fn execute_runtime(
     ));
     let control = runtime.clone();
     let interrupt = tokio::spawn(async move {
-        let mut last = None;
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            let now = tokio::time::Instant::now();
-            control.cancel();
-            if last.is_some_and(|then| now.duration_since(then) <= defaults::INTERRUPT_WINDOW) {
-                kyora_tools::cancel_processes();
-                std::process::exit(130);
-            }
-            last = Some(now);
-        }
+        interrupted.cancelled().await;
+        control.cancel();
     });
     let mut spec = AgentSpec::new(run.task, cwd);
     spec.model = resolved.model;
+    spec.tools = tools.selection;
     spec.options = RequestOptions {
         effort: resolved.effort,
         thinking_display: Some(if run.show_thinking {

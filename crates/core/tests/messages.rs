@@ -1690,14 +1690,18 @@ async fn ending_a_turn_without_submitting_is_reminded_once_then_fails() {
         );
     }
     assert!(!provider.requested("lazy task", 2));
+    // Results come back in the order the children finished, which either may win.
+    let waited = results(&last(&provider.request("root task", 2)));
+    let mut parts = waited[0].0.split("\n\n").collect::<Vec<_>>();
+    parts.sort();
     assert_eq!(
-        results(&last(&provider.request("root task", 2))),
-        vec![(
-            "[error from agent 1 (lazy): failed]\nended without calling submit_result. Last reply: still none\n\n[result from agent 2 (late): completed]\n{\"dates\":[]}"
-                .into(),
-            false
-        )]
+        parts,
+        vec![
+            "[error from agent 1 (lazy): failed]\nended without calling submit_result. Last reply: still none",
+            "[result from agent 2 (late): completed]\n{\"dates\":[]}",
+        ]
     );
+    assert!(!waited[0].1);
     let live = records(rx);
     assert_eq!(
         (status(&live, 1), ended(&live, 1).turns),

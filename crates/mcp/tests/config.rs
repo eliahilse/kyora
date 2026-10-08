@@ -122,6 +122,14 @@ fn credentials_must_come_from_the_environment() {
         format!("[servers.a]\ncommand = 'x'\nargs = ['-secret', '{SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nargs = ['--url=https://h/mcp?token={SECRET}']"),
         format!("[servers.a]\ncommand = 'x'\nenv = {{ UPSTREAM = 'https://h/?api_key={SECRET}' }}"),
+        // Percent-encoded query keys are decoded first, as servers decode them.
+        format!(
+            "[servers.a]\ncommand = 'x'\nenv = {{ UPSTREAM = 'https://h/?api%5Fkey={SECRET}' }}"
+        ),
+        format!("[servers.a]\ncommand = 'x'\nargs = ['--url=https://h/?%74oken={SECRET}']"),
+        format!(
+            "[servers.a]\nurl = 'https://h/'\nheaders = {{ X-Upstream = 'https://h/?pass%77ord={SECRET}' }}"
+        ),
     ] {
         let message = error(&text);
         assert!(message.starts_with("mcp server a: "), "{message}");

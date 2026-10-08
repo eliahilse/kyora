@@ -245,10 +245,38 @@ fn url_credentials(value: &str) -> bool {
             .split_once('?')
             .map_or("", |(_, query)| query.split('#').next().unwrap_or_default());
         authority.contains('@')
-            || query
-                .split('&')
-                .any(|pair| credential(pair.split('=').next().unwrap_or_default()))
+            || query.split('&').any(|pair| {
+                credential(&percent_decoded(pair.split('=').next().unwrap_or_default()))
+            })
     })
+}
+
+/// A query key with `%XX` escapes and `+` decoded, as servers read it.
+fn percent_decoded(key: &str) -> String {
+    let bytes = key.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                at += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                at += 1;
+            }
+            (byte, _) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether `args` pass a credential-looking flag a literal value, as in

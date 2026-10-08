@@ -4,7 +4,11 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use kyora_protocol::{ToolResultPart, ToolSpec};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Tool effects used by cancellation and future parallel dispatch.
@@ -81,6 +85,11 @@ pub trait Tool: Send + Sync {
     fn large_input(&self) -> bool {
         self.spec().large_input
     }
+    /// Whether the runtime cuts this tool's result to `Limits::tool_output_chars`.
+    /// A tool that returns whole messages opts out and bounds its result itself.
+    fn truncated(&self) -> bool {
+        true
+    }
     /// Executes one validated call. Implementations must honor cancellation.
     /// Started mutations must finish or stop safely before returning an outcome.
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput;
@@ -92,6 +101,9 @@ pub struct ToolSelection(pub Option<Vec<String>>);
 #[derive(Clone, Default)]
 pub struct Toolset {
     entries: BTreeMap<String, (ToolSpec, Arc<dyn Tool>)>,
+    /// Tools that check their input themselves and explain a mismatch; the toolset
+    /// only requires an object for them.
+    own_validation: BTreeSet<String>,
 }
 impl Toolset {
     /// Freezes tool specifications, rejecting duplicate names.
@@ -104,7 +116,22 @@ impl Toolset {
                 bail!("duplicate tool name");
             }
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            own_validation: BTreeSet::new(),
+        })
+    }
+    /// Adds a tool that validates its own input against its spec schema.
+    pub(crate) fn with_own_validation(&self, tool: Arc<dyn Tool>) -> Result<Self> {
+        let mut spec = tool.spec();
+        spec.large_input = tool.large_input();
+        let name = spec.name.clone();
+        let mut next = self.clone();
+        if next.entries.insert(name.clone(), (spec, tool)).is_some() {
+            bail!("duplicate tool name");
+        }
+        next.own_validation.insert(name);
+        Ok(next)
     }
     /// Selects a subset, rejecting unknown requested names.
     pub fn select(&self, selection: &ToolSelection) -> Result<Self> {
@@ -121,7 +148,16 @@ impl Toolset {
                     .clone(),
             );
         }
-        Ok(Self { entries })
+        let own_validation = self
+            .own_validation
+            .iter()
+            .filter(|name| entries.contains_key(*name))
+            .cloned()
+            .collect();
+        Ok(Self {
+            entries,
+            own_validation,
+        })
     }
     /// Returns frozen specs in stable name order.
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -133,6 +169,9 @@ impl Toolset {
             .entries
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        if self.own_validation.contains(name) {
+            return validate(&serde_json::json!({"type": "object"}), input);
+        }
         validate(&spec.input_schema, input)
     }
     /// Looks up a tool after validation.
@@ -158,7 +197,12 @@ impl ToolsetFactory for Toolset {
         self.select(selection)
     }
 }
-/// Validates a small JSON-schema subset, including nested properties and items.
+/// Schema type names `validate` understands.
+const TYPES: &[&str] = &[
+    "object", "array", "string", "integer", "number", "boolean", "null",
+];
+/// Validates a small JSON-schema subset: type, enum, required, properties,
+/// additionalProperties false and items, nested. Other keywords are ignored.
 pub fn validate(schema: &Value, input: &Value) -> Result<()> {
     let valid = match schema["type"].as_str() {
         Some("object") => input.is_object(),
@@ -167,11 +211,17 @@ pub fn validate(schema: &Value, input: &Value) -> Result<()> {
         Some("integer") => input.is_i64() || input.is_u64(),
         Some("number") => input.is_number(),
         Some("boolean") => input.is_boolean(),
+        Some("null") => input.is_null(),
         None => true,
         Some(other) => bail!("unsupported schema type: {other}"),
     };
     if !valid {
         bail!("invalid input type, expected {}", schema["type"]);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array)
+        && !values.contains(input)
+    {
+        bail!("value must be one of {}", schema["enum"]);
     }
     if let Some(object) = input.as_object() {
         if let Some(required) = schema["required"].as_array() {
@@ -196,6 +246,40 @@ pub fn validate(schema: &Value, input: &Value) -> Result<()> {
         for value in array {
             validate(items, value)?;
         }
+    }
+    Ok(())
+}
+/// Checks that `validate` can enforce a schema: every `type` is a single supported
+/// name, `required` lists strings, `enum` is an array, and nested schemas agree.
+pub fn check_schema(schema: &Value) -> Result<()> {
+    let Some(object) = schema.as_object() else {
+        bail!("schema must be an object");
+    };
+    match object.get("type") {
+        None => {}
+        Some(Value::String(name)) if TYPES.contains(&name.as_str()) => {}
+        Some(other) => bail!("unsupported schema type: {other}"),
+    }
+    if object.get("required").is_some_and(|required| {
+        !required
+            .as_array()
+            .is_some_and(|names| names.iter().all(Value::is_string))
+    }) {
+        bail!("required must list property names");
+    }
+    if object.get("enum").is_some_and(|values| !values.is_array()) {
+        bail!("enum must be an array");
+    }
+    if let Some(properties) = object.get("properties") {
+        let Some(properties) = properties.as_object() else {
+            bail!("properties must be an object");
+        };
+        for property in properties.values() {
+            check_schema(property)?;
+        }
+    }
+    if let Some(items) = object.get("items") {
+        check_schema(items)?;
     }
     Ok(())
 }

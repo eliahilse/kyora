@@ -1,6 +1,6 @@
 use kyora_core::{
     Limits, ModelRef,
-    tool::{truncate, validate},
+    tool::{check_schema, truncate, validate},
 };
 use serde_json::json;
 #[test]
@@ -15,6 +15,25 @@ fn schema_subset_rejects_wrong_missing_and_unknown_properties() {
         json!({"s":"ok","nested":[1]}),
     ] {
         assert!(validate(&schema, &bad).is_err());
+    }
+}
+#[test]
+fn schema_enums_nulls_and_checked_schemas() {
+    let schema = json!({"type":"object","properties":{"kind":{"type":"string","enum":["a","b"]},"gone":{"type":"null"}}});
+    assert!(check_schema(&schema).is_ok());
+    assert!(validate(&schema, &json!({"kind":"a","gone":null})).is_ok());
+    assert!(validate(&schema, &json!({"kind":"c"})).is_err());
+    assert!(validate(&schema, &json!({"gone":1})).is_err());
+    for bad in [
+        json!("object"),
+        json!({"type":["string","null"]}),
+        json!({"type":"date"}),
+        json!({"required":"kind"}),
+        json!({"properties":[]}),
+        json!({"items":{"type":"map"}}),
+        json!({"enum":"a"}),
+    ] {
+        assert!(check_schema(&bad).is_err());
     }
 }
 #[test]

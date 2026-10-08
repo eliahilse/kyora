@@ -1298,3 +1298,56 @@ async fn total_timeout_cancels_cooperative_providers_and_retries_with_send_charg
         assert_eq!(rt.ledger().snapshot(0).used == 0, !sent);
     }
 }
+
+/// A started mutation that, once cancelled, cleans up and then commits an answer.
+struct AnswersAfterCancel {
+    entered: Arc<tokio::sync::Notify>,
+}
+#[async_trait]
+impl Tool for AnswersAfterCancel {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "test".into(),
+            input_schema: json!({"type":"object"}),
+            ..ToolSpec::default()
+        }
+    }
+    fn effect(&self) -> Effect {
+        Effect::Mutating
+    }
+    async fn call(&self, _input: Value, cx: ToolCx) -> ToolOutput {
+        self.entered.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), cx.cancel.cancelled())
+            .await
+            .unwrap();
+        let mut output = ToolOutput::text("cleaned up");
+        output.final_answer = Some(Answer::Text("late".into()));
+        output
+    }
+}
+#[tokio::test]
+async fn an_answer_committed_after_cancellation_is_refused() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let provider = FnProvider::new(|_| Ok(response(vec![call("mutate")], StopReason::ToolUse)));
+    let (rt, rx) = runtime(
+        Arc::new(provider),
+        vec![Arc::new(AnswersAfterCancel {
+            entered: entered.clone(),
+        })],
+        Limits::default(),
+    );
+    let active = rt.clone();
+    let task = tokio::spawn(async move { active.run(spec()).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    rt.cancel();
+    let outcome = task.await.unwrap();
+    assert_eq!(outcome.status, Status::Cancelled);
+    assert_ne!(outcome.answer.text(), "late");
+    assert!(drain(rx).iter().any(|event| matches!(
+        event,
+        TraceEvent::ToolResult { content, is_error: true, .. }
+            if content == "cleaned up\nfinal answer not accepted: the agent was cancelled"
+    )));
+}

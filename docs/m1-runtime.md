@@ -39,6 +39,7 @@ session::locked_file(path: &Path, create_new: bool) -> Result<File>
 session::list(home: &Path) -> Result<Vec<SessionSummary>>
 session::list_with_preview(home: &Path, preview_chars: usize) -> Result<Vec<SessionSummary>>
 TraceSink::ephemeral() -> TraceSink
+TraceSink::with_store(store: impl FnMut(TraceRecord) -> impl Future<Output = Result<()>>) -> TraceSink
 TraceSink::subscribe(&self) -> broadcast::Receiver<TraceRecord>
 TraceSink::emit(&self, event: TraceEvent) -> impl Future<Output = Result<()>>
 TraceSink::finish(&self) -> impl Future<Output = Result<()>>

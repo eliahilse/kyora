@@ -1,10 +1,14 @@
 //! Shared agent loop and node-scoped entry points for recursive work.
 use crate::{
-    AgentHandle, ChildSpec, ChildStatus, Effect, Limits, ModelRef, Owner, RecursionError, ToolCx,
-    ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink, defaults,
+    AgentHandle, CancelOutcome, ChildSpec, ChildStatus, Effect, Limits, ModelRef, Owner,
+    RecursionError, ToolCx, ToolOutput, ToolSelection, ToolsetFactory, TraceEvent, TraceSink,
+    agent_tools, defaults,
     ledger::{Charge, Ledger, NodeId, Reservation, Settlement, estimate},
+    messages::{
+        self, Batch, Delivery, Envelope, Idle, Mailbox, MessageId, MessageKind, Refusal, Waited,
+    },
     prompts,
-    tool::truncate,
+    tool::{self, truncate},
 };
 use anyhow::{Result, bail};
 use futures::{FutureExt, StreamExt};
@@ -16,15 +20,19 @@ use kyora_providers::{Accumulator, AttemptCharge, ModelProvider, ProviderError, 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
+    time::Duration,
 };
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::{Semaphore, watch},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 /// A final agent answer, text or a raw JSON value committed by a tool.
@@ -156,6 +164,17 @@ struct RuntimeInner {
     started: AtomicBool,
     panicked: AtomicBool,
     subagent_prompt: Mutex<String>,
+    agents: Mutex<BTreeMap<NodeId, AgentEntry>>,
+    messages: AtomicU64,
+}
+/// Directory entry used to address an agent and to wait for it.
+#[derive(Clone)]
+struct AgentEntry {
+    parent: Option<NodeId>,
+    name: String,
+    state: Arc<NodeState>,
+    cancel: CancellationToken,
+    outcome: Option<watch::Receiver<Option<AgentOutcome>>>,
 }
 /// Shared runtime for one invocation. `run` may be called exactly once.
 #[derive(Clone)]
@@ -164,18 +183,24 @@ pub struct Runtime(Arc<RuntimeInner>);
 struct Work {
     closed: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Turns true once this node's latest message record is written.
+    recorded: Option<watch::Receiver<bool>>,
+    /// Turns true once this node's latest accepted send is queued or refused.
+    sent: Option<watch::Receiver<bool>>,
 }
 #[derive(Default)]
 struct NodeState {
     work: Mutex<Work>,
     tools: OnceLock<Vec<String>>,
     turns: AtomicU32,
+    mailbox: Mailbox,
 }
 struct AgentSettings {
     name: String,
     origin_cell: Option<u32>,
     init: Option<Arc<Value>>,
     max_turns: u32,
+    output: Option<Value>,
 }
 /// Node-scoped entry point for child agents and leaf completions.
 #[derive(Clone)]
@@ -260,6 +285,8 @@ impl Runtime {
             started: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
             subagent_prompt: Mutex::new(prompts::SUBAGENT.into()),
+            agents: Mutex::new(BTreeMap::new()),
+            messages: AtomicU64::new(0),
         })))
     }
     /// Overrides the default child system prompt before the invocation starts.
@@ -318,6 +345,14 @@ impl Runtime {
             options: spec.options.clone(),
             owners: Arc::new(Vec::new()),
         };
+        self.register(
+            0,
+            None,
+            "root".into(),
+            cx.state.clone(),
+            cx.cancel.clone(),
+            None,
+        );
         self.emit(TraceEvent::SessionStart {
             session: self.0.config.session.clone(),
             cwd: spec.cwd.clone(),
@@ -334,6 +369,7 @@ impl Runtime {
                     origin_cell: None,
                     init: None,
                     max_turns: self.0.config.limits.max_turns,
+                    output: None,
                 },
                 None,
             )
@@ -367,6 +403,11 @@ impl Runtime {
                 self.0.panicked.store(true, Ordering::SeqCst);
                 Err(anyhow::anyhow!("agent task panicked"))
             });
+        // Refuse new messages before children are cancelled, so their notices and any
+        // late sends fail visibly instead of queueing for an agent that has ended.
+        for message in cx.state.mailbox.close() {
+            self.undelivered(message).await;
+        }
         self.join_descendants(&cx).await;
         watcher.abort();
         let _ = watcher.await;
@@ -464,6 +505,14 @@ impl Runtime {
         .unwrap_or_else(|_| {
             self.0.panicked.store(true, Ordering::SeqCst);
             Err(anyhow::anyhow!("toolset factory panicked"))
+        })
+        .and_then(|tools| match &settings.output {
+            // A child with an output contract finishes through submit_result.
+            Some(schema) => tools.with_own_validation(Arc::new(agent_tools::SubmitResult::new(
+                schema.clone(),
+                self.0.config.limits.message_chars,
+            ))),
+            None => Ok(tools),
         });
         let specs = tools
             .as_ref()
@@ -492,13 +541,21 @@ impl Runtime {
             .set(specs.iter().map(|tool| tool.name.clone()).collect())
             .expect("toolset frozen once");
         let mut history = Vec::new();
-        self.message(cx.id, &mut history, Message::user_text(spec.task))
-            .await?;
+        // Messages sent before the first request follow the task.
+        self.user_turn(
+            cx,
+            &mut history,
+            vec![ContentBlock::Text { text: spec.task }],
+            true,
+        )
+        .await?;
         let mut turns = 0;
         let mut answer = Answer::Text(String::new());
         let mut previous = None;
         let mut output_cap = self.0.config.limits.max_output_tokens;
         let mut invalid_retry = false;
+        let contract = settings.output.is_some();
+        let mut reminded = false;
         let status = loop {
             if cx.stopped() || Instant::now() >= cx.deadline {
                 break cx.cancel_status();
@@ -520,6 +577,8 @@ impl Runtime {
                 },
             };
             let sent = req.messages.len();
+            // Messages delivered from here on travel with the next request.
+            cx.state.mailbox.new_turn();
             let (mut response, mut invalid) =
                 match self.attempts(cx, &spec.model, req, previous).await {
                     Ok(r) => r,
@@ -591,6 +650,7 @@ impl Runtime {
                         .map_or_else(|| input.clone(), |raw| Value::String(raw.clone())),
                 })
                 .await?;
+                let mut whole = false;
                 let mut result = if let Some(raw) = invalid.get(id) {
                     ToolOutput::error(serde_json::json!({"INVALID_JSON": raw}).to_string())
                 } else if response.stop_reason != StopReason::ToolUse {
@@ -608,6 +668,7 @@ impl Runtime {
                     ToolOutput::error(error.to_string())
                 } else {
                     let tool = tools.get(name).expect("validated tool");
+                    whole = !tool.truncated();
                     let tool_cx = ToolCx {
                         node: cx.clone(),
                         call_id: id.into(),
@@ -628,16 +689,37 @@ impl Runtime {
                         }
                     }
                 };
-                let content = truncate(
-                    &result.text_content(),
-                    self.0.config.limits.tool_output_chars,
-                );
+                // An answer that breaks the output contract does not finish the node, and
+                // neither does one committed after the node was stopped: a tool that was
+                // cancelled while running cannot turn that into a completion.
+                if final_answer.is_none()
+                    && let Some(committed) = result.final_answer.take()
+                {
+                    let accepted = if cx.stopped() || Instant::now() >= cx.deadline {
+                        Err(match cx.cancel_status() {
+                            Status::Timeout => "the agent had timed out".to_string(),
+                            _ => "the agent was cancelled".to_string(),
+                        })
+                    } else {
+                        self.accept(settings.output.as_ref(), committed)
+                    };
+                    match accepted {
+                        Ok(committed) => final_answer = Some(committed),
+                        Err(reason) => {
+                            result.is_error = true;
+                            result.content.push(ToolResultPart::Text {
+                                text: format!("\nfinal answer not accepted: {reason}"),
+                            });
+                        }
+                    }
+                }
+                let content = match result.text_content() {
+                    text if whole => text,
+                    text => truncate(&text, self.0.config.limits.tool_output_chars),
+                };
                 result.content = vec![ToolResultPart::Text {
                     text: content.clone(),
                 }];
-                if final_answer.is_none() {
-                    final_answer = result.final_answer.take();
-                }
                 self.emit(TraceEvent::ToolResult {
                     node: cx.id,
                     call: id.into(),
@@ -653,33 +735,86 @@ impl Runtime {
             }
             let has_tools = !results.is_empty();
             if has_tools {
-                self.message(
-                    cx.id,
-                    &mut history,
-                    Message {
-                        role: Role::User,
-                        content: results,
-                    },
-                )
-                .await?;
+                // Pending messages follow all tool results, never sit between them, and
+                // are only taken when another request will carry them.
+                let continues = final_answer.is_none()
+                    && !cx.stopped()
+                    && Instant::now() < cx.deadline
+                    && turns < settings.max_turns
+                    && matches!(
+                        response.stop_reason,
+                        StopReason::ToolUse | StopReason::PauseTurn | StopReason::MaxTokens
+                    );
+                self.user_turn(cx, &mut history, results, continues).await?;
             }
-            if cx.stopped() || Instant::now() >= cx.deadline {
-                break cx.cancel_status();
-            }
+            // An accepted final answer is the terminal decision. A cancellation that
+            // arrives while its result is being recorded does not replace it.
             if let Some(value) = final_answer {
                 answer = value;
                 break Status::Completed;
+            }
+            if cx.stopped() || Instant::now() >= cx.deadline {
+                break cx.cancel_status();
             }
             match response.stop_reason {
                 StopReason::ToolUse | StopReason::PauseTurn => {}
                 StopReason::EndTurn => {
                     answer = Answer::Text(assistant.text());
-                    break Status::Completed;
+                    if turns >= settings.max_turns {
+                        // A contract child that runs out of turns has not delivered.
+                        break if contract {
+                            Status::MaxTurns
+                        } else {
+                            Status::Completed
+                        };
+                    }
+                    // With children still running or messages pending, wait for them
+                    // instead of ending; the next turn starts with whatever arrived.
+                    // A contract child keeps its mailbox open, since it may go on.
+                    match self.idle(cx, !contract).await {
+                        Some(batch) => self.deliver(cx, &mut history, Vec::new(), batch).await?,
+                        None if cx.stopped() || Instant::now() >= cx.deadline => {
+                            break cx.cancel_status();
+                        }
+                        None if !contract => break Status::Completed,
+                        None if !reminded => {
+                            reminded = true;
+                            self.user_turn(
+                                cx,
+                                &mut history,
+                                vec![ContentBlock::Text {
+                                    text: agent_tools::SUBMIT_REMINDER.into(),
+                                }],
+                                true,
+                            )
+                            .await?;
+                        }
+                        None => {
+                            let message = "ended without calling submit_result";
+                            self.emit(TraceEvent::Error {
+                                node: cx.id,
+                                message: message.into(),
+                            })
+                            .await?;
+                            answer = Answer::Text(match assistant.text() {
+                                text if text.is_empty() => format!("{message}."),
+                                text => format!("{message}. Last reply: {text}"),
+                            });
+                            break Status::Failed;
+                        }
+                    }
                 }
                 StopReason::MaxTokens => {
                     if !has_tools {
-                        self.message(cx.id, &mut history, Message::user_text("continue"))
-                            .await?;
+                        self.user_turn(
+                            cx,
+                            &mut history,
+                            vec![ContentBlock::Text {
+                                text: "continue".into(),
+                            }],
+                            turns < settings.max_turns,
+                        )
+                        .await?;
                     }
                 }
                 StopReason::ModelContextWindowExceeded => break Status::ContextExhausted,
@@ -688,6 +823,200 @@ impl Runtime {
             }
         };
         Ok(self.outcome(cx.id, status, answer, turns))
+    }
+    /// Checks a committed final answer against the node's output contract: a node
+    /// with an output schema finishes only with a JSON value that the schema accepts
+    /// and that fits one message body.
+    fn accept(
+        &self,
+        output: Option<&Value>,
+        answer: Answer,
+    ) -> std::result::Result<Answer, String> {
+        let Some(schema) = output else {
+            return Ok(answer);
+        };
+        let Answer::Value(raw) = &answer else {
+            return Err("a task with an output schema finishes only through submit_result".into());
+        };
+        let value: Value = serde_json::from_str(raw.get())
+            .map_err(|error| format!("result is not JSON: {error}"))?;
+        tool::validate(schema, &value)
+            .map_err(|error| format!("result does not match the output schema: {error}"))?;
+        let cap = self.0.config.limits.message_chars;
+        if raw.get().chars().count() > cap {
+            return Err(format!("result exceeds {cap} characters"));
+        }
+        Ok(answer)
+    }
+    /// Records a user message, appending pending messages when `deliver` is set.
+    async fn user_turn(
+        &self,
+        cx: &NodeCtx,
+        history: &mut Vec<Message>,
+        content: Vec<ContentBlock>,
+        deliver: bool,
+    ) -> Result<()> {
+        if deliver {
+            let batch = cx.state.mailbox.take(
+                self.0.config.limits.delivery_chars,
+                |_| true,
+                |message| self.size(message),
+            );
+            if !batch.taken.is_empty() || batch.queued > 0 {
+                return self.deliver(cx, history, content, batch).await;
+            }
+        }
+        self.message(
+            cx.id,
+            history,
+            Message {
+                role: Role::User,
+                content,
+            },
+        )
+        .await
+    }
+    /// Appends one delivery as text blocks after `content`, says how many messages
+    /// still wait, and records the user message.
+    async fn deliver(
+        &self,
+        cx: &NodeCtx,
+        history: &mut Vec<Message>,
+        mut content: Vec<ContentBlock>,
+        batch: Batch,
+    ) -> Result<()> {
+        // Nothing may fit when this turn's budget is spent; then only the count goes.
+        if !batch.taken.is_empty() {
+            let mut written = {
+                let mut work = cx.state.work.lock().expect("node work mutex poisoned");
+                cx.record_delivery(&mut work, &batch.taken, Delivery::Turn)
+            };
+            // The delivery record precedes the conversation record that carries the text.
+            while !*written.borrow_and_update() {
+                if written.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        content.extend(batch.taken.iter().map(|message| ContentBlock::Text {
+            text: self.render(message),
+        }));
+        if batch.queued > 0 {
+            content.push(ContentBlock::Text {
+                text: format!("[{}]", messages::more(batch.queued)),
+            });
+        }
+        self.message(
+            cx.id,
+            history,
+            Message {
+                role: Role::User,
+                content,
+            },
+        )
+        .await
+    }
+    /// Waits at the end of a turn until messages arrive or nothing more can arrive.
+    /// Returns None once nothing more can arrive or the node is cancelled.
+    async fn idle(&self, cx: &NodeCtx, close: bool) -> Option<Batch> {
+        loop {
+            let mut changed = cx.state.mailbox.subscribe();
+            let budget = self.0.config.limits.delivery_chars;
+            match cx
+                .state
+                .mailbox
+                .idle(close, budget, |message| self.size(message))
+            {
+                Idle::Deliver(batch) => return Some(batch),
+                Idle::Done => return None,
+                Idle::Wait => {}
+            }
+            tokio::select! {
+                biased;
+                _ = cx.cancel.cancelled() => return None,
+                _ = tokio::time::sleep_until(cx.deadline) => return None,
+                _ = changed.changed() => {}
+            }
+        }
+    }
+    fn register(
+        &self,
+        id: NodeId,
+        parent: Option<NodeId>,
+        name: String,
+        state: Arc<NodeState>,
+        cancel: CancellationToken,
+        outcome: Option<watch::Receiver<Option<AgentOutcome>>>,
+    ) {
+        self.agents().insert(
+            id,
+            AgentEntry {
+                parent,
+                name,
+                state,
+                cancel,
+                outcome,
+            },
+        );
+    }
+    fn agents(&self) -> std::sync::MutexGuard<'_, BTreeMap<NodeId, AgentEntry>> {
+        self.0
+            .agents
+            .lock()
+            .expect("agent directory mutex poisoned")
+    }
+    fn name(&self, id: NodeId) -> String {
+        self.agents()
+            .get(&id)
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default()
+    }
+    fn render(&self, message: &Envelope) -> String {
+        message.render(&self.name(message.from))
+    }
+    /// Size of a message as delivered, counted against `Limits::delivery_chars`.
+    fn size(&self, message: &Envelope) -> usize {
+        self.render(message).chars().count()
+    }
+    fn next_message(&self) -> MessageId {
+        self.0.messages.fetch_add(1, Ordering::SeqCst)
+    }
+    // A failed trace write also fails node_end and so surfaces there; delivery
+    // bookkeeping does not depend on message records.
+    async fn undelivered(&self, message: Envelope) {
+        let _ = self
+            .emit(TraceEvent::MessageUndelivered {
+                message,
+                reason: "recipient ended".into(),
+            })
+            .await;
+    }
+    /// Posts a node-owned child's terminal notice to its parent's mailbox.
+    async fn notify(&self, parent: NodeId, mailbox: &Mailbox, outcome: &AgentOutcome) {
+        let message = self.notice(parent, outcome);
+        if !mailbox.is_closed() {
+            let _ = self
+                .emit(TraceEvent::MessageSent {
+                    message: message.clone(),
+                })
+                .await;
+        }
+        if let Err(message) = mailbox.push(message) {
+            self.undelivered(message).await;
+        }
+    }
+    /// The terminal notice reporting a child's outcome to its parent.
+    fn notice(&self, parent: NodeId, outcome: &AgentOutcome) -> Envelope {
+        Envelope {
+            id: self.next_message(),
+            from: outcome.node,
+            to: parent,
+            kind: MessageKind::for_status(outcome.status),
+            body: truncate(&outcome.answer.text(), self.0.config.limits.message_chars),
+            sent_at: chrono::Utc::now(),
+            spawn: Some(outcome.node),
+            status: Some(outcome.status),
+        }
     }
     async fn emit_error(&self, node: NodeId, error: &CallError) -> Result<()> {
         self.emit(TraceEvent::Error {
@@ -1015,6 +1344,14 @@ impl NodeCtx {
             .ok_or_else(|| RecursionError::InvalidRequest("toolset not frozen".into()))?;
         let selection = ToolSelection(Some(match spec.tools.0 {
             Some(requested) => {
+                if requested
+                    .iter()
+                    .any(|name| name == agent_tools::SUBMIT_RESULT)
+                {
+                    return Err(RecursionError::InvalidRequest(
+                        "submit_result comes with an output schema".into(),
+                    ));
+                }
                 if let Some(name) = requested.iter().find(|name| !names.contains(name)) {
                     return Err(RecursionError::InvalidRequest(format!(
                         "tool not held by parent: {name}"
@@ -1028,6 +1365,16 @@ impl NodeCtx {
                 .map(|name| (*name).into())
                 .collect(),
         }));
+        if let Some(output) = &spec.output {
+            if output["type"] != "object" {
+                return Err(RecursionError::InvalidRequest(
+                    "output must be a JSON schema of type object".into(),
+                ));
+            }
+            tool::check_schema(output).map_err(|error| {
+                RecursionError::InvalidRequest(format!("invalid output schema: {error}"))
+            })?;
+        }
         let owner_token = match owner {
             Owner::Node => None,
             Owner::Cell(token) => {
@@ -1082,6 +1429,7 @@ impl NodeCtx {
             max_turns: spec
                 .max_turns
                 .unwrap_or(self.runtime.0.config.limits.subagent_max_turns),
+            output: spec.output,
         };
         let (tx, outcome) = tokio::sync::watch::channel(None);
         let handle = AgentHandle {
@@ -1089,8 +1437,24 @@ impl NodeCtx {
             node: Arc::new(cx.clone()),
             outcome,
         };
+        // A node-owned child reports its ending to this agent's mailbox. The result of a
+        // cell-owned child belongs to the cell that owns it, so no notice is posted.
+        let notify = owner_token.is_none();
+        self.runtime.register(
+            id,
+            Some(self.id),
+            settings.name.clone(),
+            cx.state.clone(),
+            cx.cancel.clone(),
+            Some(handle.outcome.clone()),
+        );
+        if notify {
+            self.state.mailbox.expect(id);
+        }
+        let parent = self.id;
+        let parent_state = self.state.clone();
         let runtime = self.runtime.clone();
-        work.tasks.push(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let state = cx.state.clone();
             let result = runtime
                 .run_node(cx, agent_spec, settings, owner_token)
@@ -1103,9 +1467,524 @@ impl NodeCtx {
                     state.turns.load(Ordering::SeqCst),
                 )
             });
-            tx.send_replace(Some(result));
-        }));
+            tx.send_replace(Some(result.clone()));
+            // The handle resolves first, so a parent woken by the notice can read the outcome.
+            if notify {
+                runtime.notify(parent, &parent_state.mailbox, &result).await;
+            } else {
+                parent_state.mailbox.touch();
+            }
+        });
+        self.own(&mut work, task);
         Ok(handle)
+    }
+    /// Resolves an address relative to this agent: "parent", a node id such as "3"
+    /// or "#3", or the name of its parent, a child or a sibling. Ids win over names.
+    pub fn resolve(&self, address: &str) -> std::result::Result<NodeId, RecursionError> {
+        let address = address.trim();
+        let agents = self.runtime.agents();
+        let parent = agents.get(&self.id).and_then(|entry| entry.parent);
+        if address == "parent" {
+            return parent.ok_or_else(|| {
+                RecursionError::InvalidRequest("the root agent has no parent".into())
+            });
+        }
+        if let Ok(id) = address.strip_prefix('#').unwrap_or(address).parse() {
+            return Ok(id);
+        }
+        let named = agents
+            .iter()
+            .filter(|(id, entry)| {
+                **id != self.id
+                    && !entry.name.is_empty()
+                    && entry.name == address
+                    && (Some(**id) == parent
+                        || entry.parent == Some(self.id)
+                        || (parent.is_some() && entry.parent == parent))
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        match named[..] {
+            [id] => Ok(id),
+            [] => Err(RecursionError::InvalidRequest(format!(
+                "unknown agent: {address}"
+            ))),
+            _ => Err(RecursionError::InvalidRequest(format!(
+                "ambiguous agent name: {address}; use its id"
+            ))),
+        }
+    }
+    /// Returns the recipient's state and the spawn a message to it belongs to.
+    /// Addressing is limited to this agent's parent, children and siblings.
+    fn kin(
+        &self,
+        to: NodeId,
+    ) -> std::result::Result<(Arc<NodeState>, Option<NodeId>), RecursionError> {
+        let agents = self.runtime.agents();
+        let unknown = || RecursionError::InvalidRequest(format!("unknown agent: {to}"));
+        let me = agents.get(&self.id).ok_or_else(unknown)?;
+        let target = agents.get(&to).ok_or_else(unknown)?;
+        if to == self.id {
+            return Err(RecursionError::InvalidRequest(
+                "cannot send a message to yourself".into(),
+            ));
+        }
+        let spawn = if me.parent == Some(to) {
+            Some(self.id)
+        } else if target.parent == Some(self.id) {
+            Some(to)
+        } else if me.parent.is_some() && me.parent == target.parent {
+            None
+        } else {
+            return Err(RecursionError::InvalidRequest(format!(
+                "agent {to} is not this agent's parent, child or sibling"
+            )));
+        };
+        Ok((target.state.clone(), spawn))
+    }
+    /// Queues a message for the parent, a child or a sibling and returns its id
+    /// without waiting for the recipient. It is delivered at the recipient's next
+    /// turn boundary or by its receive call. A full mailbox refuses it at once.
+    pub async fn send(
+        &self,
+        to: NodeId,
+        body: impl Into<String>,
+    ) -> std::result::Result<MessageId, RecursionError> {
+        let limits = &self.runtime.0.config.limits;
+        let body = body.into();
+        if body.chars().count() > limits.message_chars {
+            return Err(RecursionError::InvalidRequest(format!(
+                "message exceeds {} characters",
+                limits.message_chars
+            )));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            self.check_open(&work)?;
+            let (recipient, spawn) = self.kin(to)?;
+            recipient
+                .mailbox
+                .reserve(limits.mailbox_capacity as usize)
+                .map_err(|refusal| match refusal {
+                    Refusal::Full => RecursionError::MailboxFull { agent: to },
+                    Refusal::Closed => RecursionError::AgentFinished { agent: to },
+                })?;
+            let message = Envelope {
+                id: self.runtime.next_message(),
+                from: self.id,
+                to,
+                kind: MessageKind::Message,
+                body,
+                sent_at: chrono::Utc::now(),
+                spawn,
+                status: None,
+            };
+            let runtime = self.runtime.clone();
+            // Each send goes after this sender's previous one, whatever order their
+            // records are acknowledged in, so a sender's messages keep their order.
+            let (done, queued) = watch::channel(false);
+            let mut previous = work.sent.replace(queued);
+            // Recording and queueing run as owned work that this node's shutdown joins,
+            // so a caller that stops waiting cannot leave an accepted send half done.
+            let task = tokio::spawn(async move {
+                if let Some(previous) = &mut previous {
+                    while !*previous.borrow_and_update() {
+                        if previous.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let id = message.id;
+                // The send record precedes any delivery record.
+                let _ = runtime
+                    .emit(TraceEvent::MessageSent {
+                        message: message.clone(),
+                    })
+                    .await;
+                let result = match recipient.mailbox.push(message) {
+                    Ok(()) => Ok(id),
+                    Err(message) => {
+                        runtime.undelivered(message).await;
+                        Err(RecursionError::AgentFinished { agent: to })
+                    }
+                };
+                done.send_replace(true);
+                let _ = tx.send(result);
+            });
+            self.own(&mut work, task);
+        }
+        rx.await.unwrap_or(Err(RecursionError::Cancelled))
+    }
+    /// Takes one delivery of pending messages: whole messages in arrival order within
+    /// what is left of this turn's `Limits::delivery_chars`, at least one if nothing
+    /// was delivered this turn. When none is pending, waits up to `yield_after` for
+    /// the first one. Returns an empty list if none arrives, or at once when messages
+    /// wait but this turn's budget is spent.
+    pub async fn receive(
+        &self,
+        yield_after: Duration,
+    ) -> std::result::Result<Vec<Envelope>, RecursionError> {
+        let until = Instant::now()
+            .checked_add(yield_after)
+            .map_or(self.deadline, |until| until.min(self.deadline));
+        loop {
+            let mut changed = self.state.mailbox.subscribe();
+            {
+                let mut work = self.state.work.lock().expect("node work mutex poisoned");
+                self.check_open(&work)?;
+                // Taking and handing over are one step without an await, so a caller
+                // that stops waiting cannot lose messages; owned work records them.
+                let batch = self.state.mailbox.take(
+                    self.runtime.0.config.limits.delivery_chars,
+                    |_| true,
+                    |message| self.runtime.size(message),
+                );
+                if !batch.taken.is_empty() {
+                    self.record_delivery(&mut work, &batch.taken, Delivery::Receive);
+                    return Ok(batch.taken);
+                }
+                // Messages are waiting, but this turn's budget is spent.
+                if batch.queued > 0 {
+                    return Ok(Vec::new());
+                }
+                if self.state.mailbox.is_closed() {
+                    return Err(RecursionError::Cancelled);
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(RecursionError::Cancelled),
+                _ = tokio::time::sleep_until(until) => return Ok(Vec::new()),
+                _ = changed.changed() => {}
+            }
+        }
+    }
+    /// Waits until the given children have finished; with None, every child whose
+    /// result has not been delivered yet. Returns early, listing the children still
+    /// running, when `timeout` passes. Takes what the finished children had queued,
+    /// their unread messages and notices in arrival order, so none of it is delivered
+    /// again at the next turn and each child's order is kept.
+    pub async fn wait(
+        &self,
+        agents: Option<&[NodeId]>,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<Waited, RecursionError> {
+        self.wait_via(agents, timeout, Delivery::Wait).await
+    }
+    async fn wait_via(
+        &self,
+        agents: Option<&[NodeId]>,
+        timeout: Option<Duration>,
+        via: Delivery,
+    ) -> std::result::Result<Waited, RecursionError> {
+        let children = self
+            .runtime
+            .agents()
+            .iter()
+            .filter(|(_, entry)| entry.parent == Some(self.id))
+            .filter_map(|(id, entry)| Some((*id, entry.outcome.clone()?)))
+            .collect::<BTreeMap<_, _>>();
+        let targets = match agents {
+            Some(agents) => agents
+                .iter()
+                .map(|id| {
+                    if children.contains_key(id) {
+                        Ok(*id)
+                    } else {
+                        Err(RecursionError::InvalidRequest(format!(
+                            "agent {id} is not a child of this agent"
+                        )))
+                    }
+                })
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?,
+            None => self
+                .state
+                .mailbox
+                .outstanding()
+                .into_iter()
+                .filter(|id| children.contains_key(id))
+                .collect(),
+        };
+        let until = timeout.map_or(self.deadline, |timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .map_or(self.deadline, |until| until.min(self.deadline))
+        });
+        // Finished means the outcome is published and any notice has been queued.
+        let finished =
+            |id: &NodeId| children[id].borrow().is_some() && !self.state.mailbox.is_awaiting(*id);
+        loop {
+            let mut changed = self.state.mailbox.subscribe();
+            {
+                let mut work = self.state.work.lock().expect("node work mutex poisoned");
+                self.check_open(&work)?;
+                // A cell-owned child posts no notice of its own. Reporting it stages
+                // one, once, recorded before it is queued behind the child's messages;
+                // the child counts as finished only once it is queued. Its outcome then
+                // follows the same order and budget as any notice.
+                for id in &targets {
+                    let outcome = children[id].borrow().clone();
+                    if let Some(outcome) = outcome {
+                        self.stage_notice(&mut work, &outcome);
+                    }
+                }
+            }
+            if targets.iter().all(finished) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(RecursionError::Cancelled),
+                _ = tokio::time::sleep_until(until) => break,
+                _ = changed.changed() => {}
+            }
+        }
+        let done = targets
+            .iter()
+            .copied()
+            .filter(finished)
+            .collect::<BTreeSet<_>>();
+        let batch = {
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            self.check_open(&work)?;
+            // One delivery of the finished children's messages, in arrival order. A
+            // child's notice is its last message, so it never overtakes the others.
+            let batch = self.state.mailbox.take(
+                self.runtime.0.config.limits.delivery_chars,
+                |message| done.contains(&message.from),
+                |message| self.runtime.size(message),
+            );
+            if !batch.taken.is_empty() {
+                self.record_delivery(&mut work, &batch.taken, via);
+            }
+            batch
+        };
+        Ok(Waited {
+            messages: batch.taken,
+            deferred: batch.left,
+            finished: done
+                .iter()
+                .map(|id| {
+                    children[id]
+                        .borrow()
+                        .clone()
+                        .expect("finished child has an outcome")
+                })
+                .collect(),
+            running: targets.difference(&done).copied().collect(),
+        })
+    }
+    /// Cancels a descendant of this agent together with its subtree, through the
+    /// ordered shutdown, and returns once it has stopped. For a direct child the
+    /// terminal notice is taken here, so the canceller gets no separate message;
+    /// a deeper descendant's notice still reaches its own parent. Cancelling an
+    /// agent that already finished only reports its outcome.
+    pub async fn cancel_agent(
+        &self,
+        agent: NodeId,
+    ) -> std::result::Result<CancelOutcome, RecursionError> {
+        self.check_open(&self.state.work.lock().expect("node work mutex poisoned"))?;
+        let (cancel, mut outcome, parent) = {
+            let agents = self.runtime.agents();
+            let target = agents
+                .get(&agent)
+                .ok_or_else(|| RecursionError::InvalidRequest(format!("unknown agent: {agent}")))?;
+            let mut ancestor = target.parent;
+            while ancestor.is_some_and(|id| id != self.id) {
+                ancestor = ancestor.and_then(|id| agents.get(&id)?.parent);
+            }
+            match (ancestor, &target.outcome) {
+                (Some(_), Some(outcome)) if agent != self.id => {
+                    (target.cancel.clone(), outcome.clone(), target.parent)
+                }
+                _ => {
+                    return Err(RecursionError::InvalidRequest(format!(
+                        "agent {agent} is not a descendant of this agent"
+                    )));
+                }
+            }
+        };
+        let already_finished = outcome.borrow().is_some();
+        cancel.cancel();
+        if parent == Some(self.id) {
+            let waited = self
+                .wait_via(Some(&[agent]), None, Delivery::Cancel)
+                .await?;
+            return match waited.finished.into_iter().next() {
+                Some(outcome) => Ok(CancelOutcome {
+                    outcome,
+                    already_finished,
+                    remaining: waited.deferred.get(&agent).copied().unwrap_or_default(),
+                    messages: waited.messages,
+                }),
+                // Only the deadline ends an untimed wait early.
+                None => Err(RecursionError::Cancelled),
+            };
+        }
+        loop {
+            if let Some(outcome) = outcome.borrow_and_update().clone() {
+                return Ok(CancelOutcome {
+                    outcome,
+                    already_finished,
+                    messages: Vec::new(),
+                    remaining: 0,
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(RecursionError::Cancelled),
+                _ = outcome.changed() => {}
+            }
+        }
+    }
+    /// Adds an owned task that this node's shutdown joins. Finished tasks are
+    /// reaped first, so a long-running node holds only the work still in flight;
+    /// a reaped task that panicked still marks the run failed.
+    fn own(&self, work: &mut Work, task: tokio::task::JoinHandle<()>) {
+        work.tasks.retain_mut(|task| {
+            if !task.is_finished() {
+                return true;
+            }
+            // Outside the cooperative budget a finished handle is always ready. Should
+            // it still report pending, keep it, so shutdown joins it instead.
+            match tokio::task::unconstrained(&mut *task).now_or_never() {
+                None => true,
+                Some(result) => {
+                    if result.is_err() {
+                        self.runtime.0.panicked.store(true, Ordering::SeqCst);
+                    }
+                    false
+                }
+            }
+        });
+        work.tasks.push(task);
+    }
+    /// Stages a terminal notice for an agent that posts none to this mailbox, unless
+    /// one was staged or queued before: owned work, after this node's earlier message
+    /// records, records it as sent and only then queues it, so it never reaches the
+    /// model before its record. Returns whether a notice was staged.
+    fn stage_notice(&self, work: &mut Work, outcome: &AgentOutcome) -> bool {
+        if !self.state.mailbox.stage(outcome.node) {
+            return false;
+        }
+        let notice = self.runtime.notice(self.id, outcome);
+        let (done, written) = watch::channel(false);
+        let mut previous = work.recorded.replace(written);
+        let runtime = self.runtime.clone();
+        let state = self.state.clone();
+        let task = tokio::spawn(async move {
+            if let Some(previous) = &mut previous {
+                while !*previous.borrow_and_update() {
+                    if previous.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = runtime
+                .emit(TraceEvent::MessageSent {
+                    message: notice.clone(),
+                })
+                .await;
+            if let Err(notice) = state.mailbox.push(notice) {
+                runtime.undelivered(notice).await;
+            }
+            done.send_replace(true);
+        });
+        self.own(work, task);
+        true
+    }
+    /// Records the delivery of `messages`; see `record`.
+    fn record_delivery(
+        &self,
+        work: &mut Work,
+        messages: &[Envelope],
+        via: Delivery,
+    ) -> watch::Receiver<bool> {
+        let event = TraceEvent::MessageDelivered {
+            node: self.id,
+            messages: messages.iter().map(|message| message.id).collect(),
+            via,
+        };
+        self.record(work, event)
+    }
+    /// Writes a message record as owned work that this node's shutdown joins, after
+    /// the node's earlier message records. The receiver turns true once it is written.
+    fn record(&self, work: &mut Work, event: TraceEvent) -> watch::Receiver<bool> {
+        let (done, written) = watch::channel(false);
+        let mut previous = work.recorded.replace(written.clone());
+        let runtime = self.runtime.clone();
+        let task = tokio::spawn(async move {
+            if let Some(previous) = &mut previous {
+                while !*previous.borrow_and_update() {
+                    if previous.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // A failed trace write is latched by the sink and fails the run.
+            let _ = runtime.emit(event).await;
+            done.send_replace(true);
+        });
+        self.own(work, task);
+        written
+    }
+    /// Number of messages waiting in this agent's mailbox.
+    pub fn pending_messages(&self) -> usize {
+        self.state.mailbox.len()
+    }
+    /// Formats a message the way the runtime shows it to a model.
+    pub fn render(&self, message: &Envelope) -> String {
+        self.runtime.render(message)
+    }
+    /// Formats a finished child's outcome the way its terminal notice is shown.
+    pub fn render_outcome(&self, outcome: &AgentOutcome) -> String {
+        messages::render(
+            MessageKind::for_status(outcome.status),
+            outcome.node,
+            &self.runtime.name(outcome.node),
+            Some(outcome.status),
+            &truncate(
+                &outcome.answer.text(),
+                self.runtime.0.config.limits.message_chars,
+            ),
+        )
+    }
+    /// Reports a finished agent's outcome to the model, charged against this turn's
+    /// delivery budget like any message. When it does not fit, a repeat of an outcome
+    /// the model was handed before shrinks to its status line, and a first report is
+    /// queued to follow at the next turn.
+    pub(crate) fn report(&self, outcome: &AgentOutcome) -> String {
+        let full = self.render_outcome(outcome);
+        let budget = self.runtime.0.config.limits.delivery_chars;
+        let mailbox = &self.state.mailbox;
+        let repeat = mailbox.has_seen(outcome.node);
+        let deferred = messages::deferred(outcome.node, 1, "result");
+        if !repeat {
+            // An outcome this model has not been handed is never trimmed: what does
+            // not fit is queued and follows at the next turn.
+            if mailbox.is_concluded(outcome.node) {
+                return deferred;
+            }
+            if mailbox.charge(full.chars().count(), budget) {
+                mailbox.saw(outcome.node);
+                return full;
+            }
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            if self.check_open(&work).is_ok() && self.stage_notice(&mut work, outcome) {
+                return deferred;
+            }
+        } else if mailbox.charge(full.chars().count(), budget) {
+            return full;
+        }
+        let status = messages::render(
+            MessageKind::for_status(outcome.status),
+            outcome.node,
+            &self.runtime.name(outcome.node),
+            Some(outcome.status),
+            "",
+        );
+        format!("{status}\n(answer left out: no room left in this turn's messages)")
     }
     fn cancel_status(&self) -> Status {
         if Instant::now() >= self.deadline {
@@ -1160,10 +2039,11 @@ impl NodeCtx {
                 owners: Arc::new(self.owners.iter().chain([&owner]).cloned().collect()),
             };
             // Own the task independently of the waiting future so settlement always completes.
-            work.tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let result = cx.llm_owned(call, owner).await;
                 let _ = tx.send(result);
-            }));
+            });
+            self.own(&mut work, task);
         }
         rx.await
             .map_err(|e| RecursionError::ModelError(e.to_string()))?
@@ -1317,5 +2197,150 @@ impl Drop for ReservationGuard<'_> {
             };
             self.ledger.settle(reservation, Charge::Failed(charge));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Tool, Toolset};
+    use async_trait::async_trait;
+    use kyora_protocol::ToolSpec;
+    use kyora_providers::fake::{Matcher, Rule, ScriptedProvider};
+    use serde_json::json;
+
+    /// Sends many messages to its parent, then records how many tasks it still owns.
+    struct Chatty(Arc<AtomicU32>);
+    #[async_trait]
+    impl Tool for Chatty {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "python".into(),
+                input_schema: json!({"type":"object"}),
+                ..ToolSpec::default()
+            }
+        }
+        fn effect(&self) -> Effect {
+            Effect::Mutating
+        }
+        async fn call(&self, _: Value, cx: ToolCx) -> ToolOutput {
+            if cx.node.depth == 0 {
+                let child = cx
+                    .node
+                    .spawn_agent(ChildSpec::new("child task"), Owner::Node)
+                    .unwrap();
+                child.result().await;
+                return ToolOutput::text("done");
+            }
+            let parent = cx.node.parent.unwrap();
+            for _ in 0..200 {
+                cx.node.send(parent, "m").await.unwrap();
+            }
+            let held = cx.node.state.work.lock().unwrap().tasks.len();
+            self.0.store(held as u32, Ordering::SeqCst);
+            ToolOutput::text("sent")
+        }
+    }
+    fn turns(task: &str, depth: u32) -> Rule {
+        let step = |content, stop_reason| ModelResponse {
+            content,
+            stop_reason,
+            usage: Usage::default(),
+            id: None,
+            model: String::new(),
+            usage_iterations: vec![],
+        };
+        Rule {
+            matcher: Some(Matcher {
+                first_user_contains: Some(task.into()),
+                depth: Some(depth),
+                ..Matcher::default()
+            }),
+            responses: vec![
+                step(
+                    vec![ContentBlock::ToolUse {
+                        id: "t0".into(),
+                        name: "python".into(),
+                        input: json!({}),
+                    }],
+                    StopReason::ToolUse,
+                ),
+                step(
+                    vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    StopReason::EndTurn,
+                ),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_message_tasks_are_reaped_as_the_node_goes() {
+        let held = Arc::new(AtomicU32::new(u32::MAX));
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::new(vec![
+            turns("root task", 0),
+            turns("child task", 1),
+        ]));
+        let runtime = Runtime::new(RuntimeConfig {
+            providers: BTreeMap::from([("fake".into(), provider)]),
+            toolsets: Arc::new(Toolset::new(vec![Arc::new(Chatty(held.clone()))]).unwrap()),
+            limits: Limits {
+                mailbox_capacity: 1000,
+                ..Limits::default()
+            },
+            retry: RetryPolicy::default(),
+            llm_model: "fake/leaf".parse().unwrap(),
+            trace: TraceSink::ephemeral(),
+            session: "reap".into(),
+        })
+        .unwrap();
+        let mut spec = AgentSpec::new("root task", std::env::current_dir().unwrap());
+        spec.model = "fake/agent".parse().unwrap();
+        assert_eq!(runtime.run(spec).await.unwrap().status, Status::Completed);
+        // 200 sends, each its own task; only the most recent may still be held.
+        assert!(held.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn reaping_keeps_a_panic_the_cooperative_budget_hides() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::new(vec![]));
+        let runtime = Runtime::new(RuntimeConfig {
+            providers: BTreeMap::from([("fake".into(), provider)]),
+            toolsets: Arc::new(Toolset::new(vec![]).unwrap()),
+            limits: Limits::default(),
+            retry: RetryPolicy::default(),
+            llm_model: "fake/leaf".parse().unwrap(),
+            trace: TraceSink::ephemeral(),
+            session: "budget".into(),
+        })
+        .unwrap();
+        let cx = NodeCtx {
+            id: 0,
+            parent: None,
+            depth: 0,
+            cancel: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+            model: "fake/agent".parse().unwrap(),
+            runtime: runtime.clone(),
+            state: Arc::new(NodeState::default()),
+            cwd: PathBuf::new(),
+            options: RequestOptions::default(),
+            owners: Arc::new(Vec::new()),
+        };
+        let mut work = Work::default();
+        let panicked = tokio::spawn(async { panic!("owned task panicked") });
+        while !panicked.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        work.tasks.push(panicked);
+        // Spend this task's cooperative budget without yielding, so that polling a
+        // finished handle reports it as pending.
+        for _ in 0..1000 {
+            let _ = tokio::task::consume_budget().now_or_never();
+        }
+        cx.own(&mut work, tokio::spawn(async {}));
+        // The panic is either recorded now or its handle kept for shutdown to join.
+        assert!(runtime.0.panicked.load(Ordering::SeqCst) || work.tasks.len() == 2);
     }
 }

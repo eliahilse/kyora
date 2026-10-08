@@ -1,7 +1,11 @@
 //! Shared persisted and live trace events. Stream events are ephemeral.
-use crate::{AgentOutcome, Limits, NodeId, Status, defaults};
+use crate::{
+    AgentOutcome, Limits, NodeId, Status, defaults,
+    messages::{Delivery, Envelope, MessageId},
+};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
+use futures::FutureExt;
 use kyora_protocol::{Message, StopReason, StreamEvent, ToolSpec, Usage};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
@@ -127,6 +131,30 @@ pub enum TraceEvent {
         /// Execution failed.
         is_error: bool,
     },
+    /// A message accepted into its recipient's mailbox, recorded before it can be delivered.
+    MessageSent {
+        /// The accepted envelope.
+        #[serde(flatten)]
+        message: Envelope,
+    },
+    /// Messages taken from an agent's mailbox, in delivery order.
+    MessageDelivered {
+        /// Recipient.
+        node: NodeId,
+        /// Delivered message ids.
+        messages: Vec<MessageId>,
+        /// Turn boundary, receive or wait.
+        via: Delivery,
+    },
+    /// A message that never reached its recipient, such as one still queued when the
+    /// recipient ended or a notice for a parent that had already ended.
+    MessageUndelivered {
+        /// The envelope, including its body.
+        #[serde(flatten)]
+        message: Envelope,
+        /// Why it was not delivered.
+        reason: String,
+    },
     /// Node shutdown and final accounting.
     NodeEnd {
         /// Final node outcome.
@@ -202,6 +230,88 @@ impl TraceSink {
             writer: None,
             join: tokio::sync::Mutex::new(None),
         }))
+    }
+    /// Creates a durable sink over caller-provided storage. `store` receives each
+    /// persistent record in sequence order and returns its acknowledgement; `emit`
+    /// for that event returns, with the acknowledgement's result, once it completes.
+    /// Acknowledgements may complete in any order, so storage can confirm records
+    /// asynchronously. Records are broadcast to subscribers as they are handed over.
+    /// The first failed acknowledgement, including a store future that panics, is
+    /// latched: later events fail without being stored, and `finish` returns it. An acknowledgement that never completes
+    /// blocks the node that emitted it, and so shutdown.
+    pub fn with_store<F, Fut>(mut store: F) -> Self
+    where
+        F: FnMut(TraceRecord) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let (live, _) = broadcast::channel(defaults::TRACE_CAPACITY);
+        let (writer, mut rx) = mpsc::channel(defaults::WRITER_CAPACITY);
+        let broadcast = live.clone();
+        let join = tokio::spawn(async move {
+            let mut seq = 0;
+            let mut acks = tokio::task::JoinSet::new();
+            let failed = Arc::new(std::sync::Mutex::new(None::<String>));
+            let latched = |failed: &std::sync::Mutex<Option<String>>| {
+                failed
+                    .lock()
+                    .expect("trace failure mutex poisoned")
+                    .clone()
+                    .map(|error| anyhow::anyhow!(error))
+            };
+            // An acknowledgement task that did not complete dropped its ack; that is a
+            // storage failure too.
+            let lost = |failed: &std::sync::Mutex<Option<String>>| {
+                failed
+                    .lock()
+                    .expect("trace failure mutex poisoned")
+                    .get_or_insert_with(|| "trace acknowledgement was lost".into());
+            };
+            while let Some(command) = rx.recv().await {
+                while let Some(joined) = acks.try_join_next() {
+                    if joined.is_err() {
+                        lost(&failed);
+                    }
+                }
+                match command {
+                    WriteCommand::Event(event, ack) => {
+                        // After a failure nothing else is stored, as with a session file.
+                        if let Some(error) = latched(&failed) {
+                            let _ = ack.send(Err(error));
+                            continue;
+                        }
+                        let record = TraceRecord::new(*event, Some(seq));
+                        seq += 1;
+                        let _ = broadcast.send(record.clone());
+                        let stored = store(record);
+                        let failed = failed.clone();
+                        acks.spawn(async move {
+                            // A store that panics has failed like one that returns an error.
+                            let result = std::panic::AssertUnwindSafe(stored)
+                                .catch_unwind()
+                                .await
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("trace store panicked")));
+                            if let Err(error) = &result {
+                                failed
+                                    .lock()
+                                    .expect("trace failure mutex poisoned")
+                                    .get_or_insert_with(|| error.to_string());
+                            }
+                            let _ = ack.send(result);
+                        });
+                    }
+                    WriteCommand::Finish(ack) => {
+                        while let Some(joined) = acks.join_next().await {
+                            if joined.is_err() {
+                                lost(&failed);
+                            }
+                        }
+                        let _ = ack.send(latched(&failed).map_or(Ok(()), Err));
+                        break;
+                    }
+                }
+            }
+        });
+        Self::writer(live, writer, join)
     }
     pub(crate) fn writer(
         live: broadcast::Sender<TraceRecord>,

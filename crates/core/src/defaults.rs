@@ -26,6 +26,12 @@ pub const INTERRUPT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Time allowed for a cancelled provider to report whether it sent the request.
 pub const PROVIDER_CANCEL_GRACE: Duration = Duration::from_millis(250);
+/// Default number of undelivered plain messages one agent's mailbox holds.
+pub const MAILBOX_CAPACITY: u32 = 64;
+/// Default message body cap in characters.
+pub const MESSAGE_CHARS: usize = 20_000;
+/// Default character budget of one delivery of messages to a model.
+pub const DELIVERY_CHARS: usize = 60_000;
 
 /// Tree and request limits. All counts and durations must be positive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +68,29 @@ pub struct Limits {
     pub llm_max_output_tokens: u32,
     /// Tool result character cap.
     pub tool_output_chars: usize,
+    /// Undelivered plain messages one agent's mailbox holds. Result notices of
+    /// children are not counted.
+    #[serde(default = "mailbox_capacity")]
+    pub mailbox_capacity: u32,
+    /// Message body character cap. Longer sends are refused; a child's answer in
+    /// its result notice is shortened to this cap.
+    #[serde(default = "message_chars")]
+    pub message_chars: usize,
+    /// Character budget for the messages one model request carries: deliveries by
+    /// tools and at the turn boundary share it. Each hands over whole messages in
+    /// arrival order until the next would exceed what is left, always at least one
+    /// when nothing was delivered yet in the turn. The rest stays queued.
+    #[serde(default = "delivery_chars")]
+    pub delivery_chars: usize,
+}
+fn mailbox_capacity() -> u32 {
+    MAILBOX_CAPACITY
+}
+fn message_chars() -> usize {
+    MESSAGE_CHARS
+}
+fn delivery_chars() -> usize {
+    DELIVERY_CHARS
 }
 impl Default for Limits {
     /// D10.1 defaults, configurable before constructing a runtime.
@@ -83,6 +112,9 @@ impl Default for Limits {
             max_output_tokens: 32_000,
             llm_max_output_tokens: 16_000,
             tool_output_chars: 20_000,
+            mailbox_capacity: MAILBOX_CAPACITY,
+            message_chars: MESSAGE_CHARS,
+            delivery_chars: DELIVERY_CHARS,
         }
     }
 }
@@ -101,6 +133,9 @@ impl Limits {
             u64::from(self.max_output_tokens),
             u64::from(self.llm_max_output_tokens),
             self.tool_output_chars as u64,
+            u64::from(self.mailbox_capacity),
+            self.message_chars as u64,
+            self.delivery_chars as u64,
         ]
         .contains(&0)
         {
@@ -172,4 +207,12 @@ pub fn home(explicit: Option<PathBuf>) -> Result<PathBuf> {
 
 /// Default child tools, intersected with the parent's frozen capabilities.
 /// A ChildSpec can override this rule with an explicit ToolSelection.
-pub const SUBAGENT_TOOLS: &[&str] = &["python", "read_file"];
+pub const SUBAGENT_TOOLS: &[&str] = &[
+    "python",
+    "read_file",
+    "spawn_agent",
+    "send_message",
+    "receive",
+    "wait",
+    "cancel_agent",
+];

@@ -10,8 +10,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub enum Owner {
     /// Cancel when the calling cell ends, or when the parent node ends.
+    /// The caller consumes the result through the handle; no notice is posted.
     Cell(CancellationToken),
     /// Keep running until explicitly cancelled or the parent node ends.
+    /// The child's result, error or cancellation arrives in the parent's mailbox.
     Node,
 }
 /// Optional child settings. Unspecified model and deadline inherit from the parent.
@@ -37,6 +39,9 @@ pub struct ChildSpec {
     pub preamble: Option<String>,
     /// Originating cell, recorded in the trace.
     pub origin_cell: Option<u32>,
+    /// JSON schema (type object) for a structured result. The child gets a
+    /// `submit_result` tool with this input schema; a valid submission ends it.
+    pub output: Option<serde_json::Value>,
 }
 impl ChildSpec {
     /// Creates a task using inherited settings and the default child tool rule.
@@ -68,6 +73,33 @@ pub enum RecursionError {
     /// A leaf provider failed or refused the request.
     #[error("model error: {0}")]
     ModelError(String),
+    /// The recipient's mailbox already holds its capacity of undelivered messages.
+    #[error("mailbox of agent {agent} is full")]
+    MailboxFull {
+        /// Recipient.
+        agent: NodeId,
+    },
+    /// The recipient has finished and accepts no further messages.
+    #[error("agent {agent} has finished")]
+    AgentFinished {
+        /// Recipient.
+        agent: NodeId,
+    },
+}
+/// How an agent stopped after `NodeCtx::cancel_agent`.
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    /// Final outcome. An agent that finished before the cancellation reached it
+    /// keeps its own status.
+    pub outcome: AgentOutcome,
+    /// The agent had already finished when it was cancelled.
+    pub already_finished: bool,
+    /// For a direct child, what it had queued for the caller: its unread messages
+    /// and its terminal notice, in arrival order, within one delivery budget.
+    pub messages: Vec<crate::Envelope>,
+    /// For a direct child, how many of its messages did not fit the delivery budget
+    /// and stay queued; its notice is the last of them. They follow at the next turn.
+    pub remaining: usize,
 }
 /// Live counters for a child; status is absent until shutdown completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]

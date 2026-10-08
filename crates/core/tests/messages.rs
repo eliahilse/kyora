@@ -3064,3 +3064,77 @@ async fn a_reported_cell_owned_notice_waits_for_its_send_record() {
     );
     assert!(recorded < handed);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_first_report_that_does_not_fit_follows_instead_of_being_trimmed() {
+    let big = "b".repeat(80);
+    let provider = Gated::new(
+        vec![
+            rule(
+                "root task",
+                0,
+                vec![
+                    call(
+                        "spawn_agent",
+                        json!({"task": "worker task", "name": "worker"}),
+                    ),
+                    // The receive spends the turn's budget; the grandchild's answer
+                    // has never been shown to this agent.
+                    calls(vec![
+                        ("receive", json!({"yield_after": 30})),
+                        ("cancel_agent", json!({"to": "2"})),
+                    ]),
+                    call("receive", json!({"yield_after": 30})),
+                    call("cancel_agent", json!({"to": "worker"})),
+                    text("done"),
+                ],
+            ),
+            rule(
+                "worker task",
+                1,
+                vec![
+                    calls(vec![
+                        ("spawn_agent", json!({"task": "deep task", "name": "deep"})),
+                        ("send_message", json!({"to": "parent", "body": big})),
+                    ]),
+                    text("waiting"),
+                ],
+            ),
+            rule("deep task", 2, vec![text("deep answer")]),
+        ],
+        vec![
+            (at("worker task", 0), at("root task", 1)),
+            // The root's turn starts once the grandchild's result reached the worker.
+            (at("root task", 1), at("worker task", 2)),
+            (at("worker task", 2), never()),
+        ],
+    );
+    let runtime = setup(
+        provider.clone(),
+        idle_tool(),
+        Limits {
+            delivery_chars: 100,
+            ..Limits::default()
+        },
+        TraceSink::ephemeral(),
+    );
+    assert_eq!(runtime.run(spec()).await.unwrap().status, Status::Completed);
+    assert_eq!(
+        results(&last(&provider.request("root task", 2))),
+        vec![
+            (format!("[message from agent 1 (worker)]\n{big}"), false),
+            (
+                "agent 2 had already finished\nagent 2 finished, but its result did not fit; it follows at your next turn"
+                    .into(),
+                false
+            ),
+        ]
+    );
+    assert_eq!(
+        results(&last(&provider.request("root task", 3))),
+        vec![(
+            "[result from agent 2 (deep): completed]\ndeep answer".into(),
+            false
+        )]
+    );
+}

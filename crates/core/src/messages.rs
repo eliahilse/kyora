@@ -169,6 +169,11 @@ fn take(
     }
     state.queue = rest;
     state.turn = used;
+    for envelope in &taken {
+        if envelope.kind != MessageKind::Message {
+            state.seen.insert(envelope.from);
+        }
+    }
     state.plain -= taken
         .iter()
         .filter(|envelope| envelope.kind == MessageKind::Message)
@@ -218,6 +223,8 @@ struct State {
     /// Agents whose terminal entry has been queued or staged, by them or on their
     /// behalf.
     concluded: BTreeSet<NodeId>,
+    /// Agents whose outcome this agent's model has been handed.
+    seen: BTreeSet<NodeId>,
 }
 /// Why a mailbox refused a plain message.
 pub(crate) enum Refusal {
@@ -293,6 +300,10 @@ impl Mailbox {
         self.wake();
         result
     }
+    /// Whether a terminal entry for `child` has been queued.
+    pub(crate) fn is_concluded(&self, child: NodeId) -> bool {
+        self.lock().concluded.contains(&child)
+    }
     /// Stages a terminal entry for an agent that posts none to this mailbox: a
     /// cell-owned child, or a deeper descendant reported here. Until the entry is
     /// queued the agent counts as awaited, so nothing ends or returns without it.
@@ -306,7 +317,14 @@ impl Mailbox {
         state.awaiting.insert(agent);
         true
     }
-
+    /// Whether this agent's model has been handed `agent`'s outcome.
+    pub(crate) fn has_seen(&self, agent: NodeId) -> bool {
+        self.lock().seen.contains(&agent)
+    }
+    /// Notes that this agent's model was handed `agent`'s outcome in a report.
+    pub(crate) fn saw(&self, agent: NodeId) {
+        self.lock().seen.insert(agent);
+    }
     /// Charges text that reports messages outside an envelope against this turn's
     /// budget. Returns false, charging nothing, when it does not fit; the first
     /// report of a turn always fits.

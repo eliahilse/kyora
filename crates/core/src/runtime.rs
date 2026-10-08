@@ -1951,12 +1951,30 @@ impl NodeCtx {
         )
     }
     /// Reports a finished agent's outcome to the model, charged against this turn's
-    /// delivery budget like any message. When the answer does not fit, only the
-    /// status line goes.
+    /// delivery budget like any message. When it does not fit, a repeat of an outcome
+    /// the model was handed before shrinks to its status line, and a first report is
+    /// queued to follow at the next turn.
     pub(crate) fn report(&self, outcome: &AgentOutcome) -> String {
         let full = self.render_outcome(outcome);
         let budget = self.runtime.0.config.limits.delivery_chars;
-        if self.state.mailbox.charge(full.chars().count(), budget) {
+        let mailbox = &self.state.mailbox;
+        let repeat = mailbox.has_seen(outcome.node);
+        let deferred = messages::deferred(outcome.node, 1, "result");
+        if !repeat {
+            // An outcome this model has not been handed is never trimmed: what does
+            // not fit is queued and follows at the next turn.
+            if mailbox.is_concluded(outcome.node) {
+                return deferred;
+            }
+            if mailbox.charge(full.chars().count(), budget) {
+                mailbox.saw(outcome.node);
+                return full;
+            }
+            let mut work = self.state.work.lock().expect("node work mutex poisoned");
+            if self.check_open(&work).is_ok() && self.stage_notice(&mut work, outcome) {
+                return deferred;
+            }
+        } else if mailbox.charge(full.chars().count(), budget) {
             return full;
         }
         let status = messages::render(

@@ -2542,7 +2542,7 @@ async fn cancel_agent_defers_a_notice_that_does_not_fit() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_senders_messages_are_queued_in_send_order() {
     let (trace, acks) = Acks::new(
         |event| matches!(event, TraceEvent::MessageSent { message } if message.body == "A"),
@@ -2560,13 +2560,15 @@ async fn a_senders_messages_are_queued_in_send_order() {
                     assert!(futures::poll!(a.as_mut()).is_pending());
                 }
                 let mut b = pin!(cx.node.send(parent, "B"));
-                // Give B every chance to overtake A while A's record is held.
-                let early = tokio::time::timeout(Duration::from_millis(100), b.as_mut()).await;
+                assert!(futures::poll!(b.as_mut()).is_pending());
+                // Time is paused, so this sleep ends only once every task has run as far
+                // as it can. B has then either been queued, overtaking A, or waits for A.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let overtook = futures::poll!(b.as_mut()).is_ready();
                 acks.release();
-                match early {
-                    Ok(sent) => sent.unwrap(),
-                    Err(_) => tokio::time::timeout(LIMIT, b).await.unwrap().unwrap(),
-                };
+                if !overtook {
+                    tokio::time::timeout(LIMIT, b).await.unwrap().unwrap();
+                }
                 return ToolOutput::text("sent");
             }
             cx.node

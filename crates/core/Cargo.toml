@@ -24,5 +24,7 @@ sha2.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+# Paused time lets tests wait until every task is idle instead of guessing a delay.
+tokio = { workspace = true, features = ["test-util"] }
 [lints]
 workspace = true

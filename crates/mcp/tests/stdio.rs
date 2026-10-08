@@ -45,6 +45,7 @@ fn environment() -> Vec<(OsString, OsString)> {
         ("KYORA_TEST_SHORT", "abc"),
         ("KYORA_TEST_QUOTED", QUOTED_SECRET),
         ("KYORA_TEST_NUMBER", "12345678"),
+        ("KYORA_TEST_NAMED", "secret_value"),
     ] {
         env.push((name.into(), value.into()));
     }
@@ -395,6 +396,21 @@ async fn a_tool_named_with_a_credential_is_left_out() {
     let warnings = server.warnings();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("left out") && !warnings[0].contains("forwarded"));
+    server.shutdown().await;
+
+    // The raw name differs, but the model-visible name would carry the value.
+    let mut config = server_config(
+        &dir.path().join("named.jsonl"),
+        &[("KYORA_MCP_TEST_EXTRA_TOOL", "secret.value")],
+    );
+    config.env_vars = vec!["KYORA_TEST_NAMED".into()];
+    let server = start(dir.path(), &config).await;
+    let names: Vec<_> = server.tools().iter().map(|tool| tool.spec().name).collect();
+    assert!(
+        names.iter().all(|name| !name.contains("secret_value")),
+        "{names:?}"
+    );
+    assert_eq!(server.warnings().len(), 1, "{:?}", server.warnings());
     server.shutdown().await;
 }
 

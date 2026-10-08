@@ -5,7 +5,7 @@ use crate::{
     http::HttpClient,
     process::Process,
     secrets::Secrets,
-    tool::{McpTool, render_result},
+    tool::{McpTool, render_result, tool_name},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use kyora_core::{Tool, ToolOutput, ToolSelection, Toolset, ToolsetFactory, runtime::NodeInfo};
@@ -596,8 +596,11 @@ async fn list(
                     .filter(|tool| config.exposes(&tool.name))
                     .filter(|tool| {
                         // A renamed tool would be confusing; one that cannot be named
-                        // without the credential is left out.
-                        let hidden = secrets.found_in(&tool.name);
+                        // without the credential is left out. The model sees the
+                        // normalized name, so it is checked too: "secret.value" becomes
+                        // "secret_value".
+                        let hidden = secrets.found_in(&tool.name)
+                            || secrets.found_in(&tool_name(connection.server(), &tool.name));
                         if hidden {
                             warnings.push(format!(
                                 "tool {} is left out because its name contains a credential value",

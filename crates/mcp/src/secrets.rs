@@ -1,5 +1,12 @@
 //! Credential values resolved from the environment, removed from everything a server
-//! connection reports: startup errors, warnings and tool output.
+//! connection reports: startup errors, warnings, tool specs and tool output.
+//!
+//! Redaction is best effort by contract. A configured server is trusted with the
+//! credentials forwarded to it, so this only keeps common echoes out of traces and
+//! model context. Covered: exact text (with overlapping matches merged), JSON string
+//! escapes including `\uXXXX` for non-ASCII characters, decoded JSON strings, keys
+//! and numbers, and model-visible tool names. Not covered: other encodings such as
+//! base64 or percent-encoding inside text. docs/mcp.md states the same scope.
 use crate::{config::ServerConfig, defaults};
 use kyora_core::ToolOutput;
 use kyora_protocol::ToolResultPart;

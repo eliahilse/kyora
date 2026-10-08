@@ -39,3 +39,11 @@ pub const MAX_SERVER_NAME: usize = 32;
 pub const ENV_ALLOWLIST: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ",
 ];
+
+/// The instant `after` from now, or a far future one when that would overflow, so a
+/// timeout can never panic while a deadline is built.
+pub(crate) fn deadline_after(after: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(after)
+        .unwrap_or_else(|| now + Duration::from_secs(30 * 365 * 24 * 60 * 60))
+}

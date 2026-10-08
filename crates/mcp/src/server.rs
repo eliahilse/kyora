@@ -372,7 +372,7 @@ impl Server {
             let listing = if info.capabilities.tools.is_some() {
                 // The startup timeout bounds this too; the deadline lets the listing
                 // cancel itself on the server first.
-                let deadline = Instant::now() + startup;
+                let deadline = defaults::deadline_after(startup);
                 list(&connection, config, &CancellationToken::new(), deadline).await?
             } else {
                 Listing {
@@ -457,7 +457,7 @@ impl Server {
 
     /// Calls a tool by its server-side name with the configured timeout.
     pub async fn call(&self, tool: &str, input: Value, cancel: &CancellationToken) -> ToolOutput {
-        let deadline = Instant::now() + self.connection.timeout;
+        let deadline = defaults::deadline_after(self.connection.timeout);
         self.connection.call(tool, input, cancel, deadline).await
     }
 
@@ -499,7 +499,7 @@ async fn refresh(
             _ = closed.cancelled() => return,
             _ = changed.notified() => {}
         }
-        let deadline = Instant::now() + config.startup_timeout();
+        let deadline = defaults::deadline_after(config.startup_timeout());
         let Ok(listing) = list(&connection, &config, &closed, deadline).await else {
             continue;
         };

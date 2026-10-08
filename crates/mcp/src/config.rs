@@ -152,8 +152,11 @@ impl ServerConfig {
             .into_iter()
             .flatten()
         {
-            if seconds <= 0.0 || Duration::try_from_secs_f64(seconds).is_err() {
-                bail!("timeouts must be positive numbers of seconds");
+            // Deadlines are now plus the timeout, so it must fit an Instant as well.
+            let fits = Duration::try_from_secs_f64(seconds)
+                .is_ok_and(|timeout| std::time::Instant::now().checked_add(timeout).is_some());
+            if seconds <= 0.0 || !fits {
+                bail!("timeouts must be positive numbers of seconds that fit a deadline");
             }
         }
         Ok(())

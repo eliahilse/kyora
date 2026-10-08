@@ -6,7 +6,6 @@ use kyora_protocol::ToolSpec;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::time::Instant;
 
 /// One tool of one server, exposed under its namespaced name.
 pub struct McpTool {
@@ -83,7 +82,7 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, input: Value, cx: ToolCx) -> ToolOutput {
-        let deadline = (Instant::now() + self.connection.timeout()).min(cx.node.deadline);
+        let deadline = defaults::deadline_after(self.connection.timeout()).min(cx.node.deadline);
         self.connection
             .call(&self.remote, input, &cx.cancel, deadline)
             .await

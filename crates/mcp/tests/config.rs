@@ -66,6 +66,13 @@ fn transports_must_be_unambiguous() {
     assert!(error("[servers.a]\nurl = 'not a url'").contains("not valid"));
     assert!(error("[servers.a]\ncommand = 'x'\ntool_timeout_s = 0").contains("positive"));
     assert!(error("[servers.a]\ncommand = 'x'\nstartup_timeout_s = -1").contains("positive"));
+    // Accepted by Duration, but now plus it overflows an Instant.
+    assert!(
+        error("[servers.a]\ncommand = 'x'\ntool_timeout_s = 1.0e19").contains("fit a deadline")
+    );
+    assert!(
+        error("[servers.a]\ncommand = 'x'\nstartup_timeout_s = 1.0e19").contains("fit a deadline")
+    );
 }
 
 #[test]
